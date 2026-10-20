@@ -813,7 +813,7 @@ impl Gpu {
 
 impl Tela {
     fn resize(&mut self, g: &Gpu, w: u32, h: u32) {
-        if w > 0 && h > 0 {
+        if w > 0 && h > 0 && (w, h) != (self.config.width, self.config.height) {
             self.config.width = w;
             self.config.height = h;
             self.surface.configure(&g.device, &self.config);
@@ -823,17 +823,19 @@ impl Tela {
     /// `false` se o quadro não chegou à tela e vale tentar de novo (só na primeira falha seguida).
     fn present(&mut self, g: &Gpu, pm: &tiny_skia::Pixmap, linhas: Option<(u32, u32)>) -> bool {
         let (w, h) = (pm.width(), pm.height());
-        if (w, h) != (self.config.width, self.config.height) {
-            self.resize(g, w, h);
-        }
+        self.resize(g, w, h);
         let extent = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+        // A textura cresce em degraus de 256 px: arrastar a borda não cria uma por quadro (o shader
+        // lê pixel a pixel, então sobra não aparece).
+        let degrau = |n: u32| n.div_ceil(256) * 256;
+        let capacidade = wgpu::Extent3d { width: degrau(w), height: degrau(h), depth_or_array_layers: 1 };
         // Textura nova (ou quadro anterior perdido) precisa do quadro todo; senão só as linhas que mudaram.
         let mut linhas = linhas.filter(|_| !self.falhou).unwrap_or((0, h));
-        if self.textura.as_ref().map_or(true, |(t, _)| t.size() != extent) {
+        if self.textura.as_ref().map_or(true, |(t, _)| t.size() != capacidade) {
             linhas = (0, h);
             let t = g.device.create_texture(&wgpu::TextureDescriptor {
                 label: None,
-                size: extent,
+                size: capacidade,
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -877,6 +879,9 @@ impl Tela {
         }
         g.queue.submit([enc.finish()]);
         frame.present();
+        // Sem isso o wgpu só solta as texturas velhas (de cada tamanho da janela) quando quer: a
+        // memória de vídeo crescia a cada redimensionar.
+        g.device.poll(wgpu::Maintain::Poll);
         self.falhou = false;
         true
     }
