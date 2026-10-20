@@ -305,6 +305,16 @@ fn wrap_quebra_a_linha_quando_nao_cabe() {
 }
 
 #[test]
+fn espaco_que_enche_respeita_a_altura_fixa_da_coluna() {
+    let mut h = H::new();
+    let el: Element<()> = column![Space::new(10.0, 50.0), vertical_space(), Space::new(10.0, 30.0)].height(200.0).into();
+    let n = h.node(&el);
+    assert_eq!(n.rect.height, 200.0);
+    // O último encosta no fundo da coluna, não da tela (300).
+    assert_eq!(n.children[2].rect.y + n.children[2].rect.height, 200.0);
+}
+
+#[test]
 fn alinhamento_no_centro_e_no_fim() {
     let mut h = H::new();
     let el: Element<()> = container(Space::new(100.0, 50.0)).width(400.0).height(300.0).align_x(Align::End).align_y(Align::Center).into();

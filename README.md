@@ -32,7 +32,10 @@ personalizar — a ideia é chegar perto do que HTML + CSS permitem.
 ```sh
 cargo run --example vitrine                      # abre a janela (F12 = inspetor)
 cargo run --example vitrine -- --capturar a.png  # só gera o PNG
+cargo run --example xadrez                       # xadrez com temas (Clássico, Verde, Vidro)
 ```
+
+![xadrez](docs/xadrez-vidro.png)
 
 ## Como funciona
 

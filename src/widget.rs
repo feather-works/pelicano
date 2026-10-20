@@ -732,6 +732,8 @@ impl<M> Widget<M> for Flex<'_, M> {
         let pad_main = if self.axis == Axis::Row { p.horizontal() } else { p.vertical() };
         let pad_cross = if self.axis == Axis::Row { p.vertical() } else { p.horizontal() };
         let (max_main, max_cross) = self.split(l.max);
+        // A altura (ou largura) fixa da própria linha/coluna é o espaço que os filhos dividem.
+        let max_main = Limits::resolve(self.main_len((self.width, self.height)), max_main, max_main);
         let max_cross_in = (Limits::resolve(if self.axis == Axis::Row { self.height } else { self.width }, max_cross, max_cross) - pad_cross).max(0.0);
         let gaps = self.spacing * self.children.len().saturating_sub(1) as f32;
         let mut sobra = (max_main - pad_main - gaps).max(0.0);
