@@ -10,7 +10,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::{Window, WindowId};
+use winit::window::{Icon, Window, WindowId};
 
 /// Um aplicativo: estado, como ele muda (`update`) e como aparece (`view`).
 pub trait App: Sized + 'static {
@@ -41,13 +41,15 @@ pub struct Settings {
     pub close_on_request: bool,
     /// Nome da janela para o sistema (Linux: casa com o arquivo .desktop).
     pub app_id: Option<String>,
+    /// Ícone da janela e da barra de tarefas (Windows e X11; no Wayland vem do .desktop do `app_id`).
+    pub icon: Option<Icon>,
     /// Libera o inspetor de layout no F12. Desligado por padrão; `PELICANO_DEBUG=1` também libera (e já abre ligado).
     pub debug: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { title: "Pelicano".into(), size: Size::new(1024.0, 720.0), min_size: None, decorations: true, transparent: false, blur: false, resizable: true, close_on_request: true, app_id: None, debug: false }
+        Settings { title: "Pelicano".into(), size: Size::new(1024.0, 720.0), min_size: None, decorations: true, transparent: false, blur: false, resizable: true, close_on_request: true, app_id: None, icon: None, debug: false }
     }
 }
 
@@ -170,7 +172,7 @@ pub fn run<A: App>(settings: Settings, init: impl FnOnce() -> (A, Task<A::Msg>))
     let event_loop = EventLoop::<A::Msg>::with_user_event().build().map_err(Error::EventLoop)?;
     let pool = futures::executor::ThreadPool::new().map_err(|e| Error::Window(e.to_string()))?;
     let (app, task) = init();
-    let mut rt = Runtime { app, settings, proxy: event_loop.create_proxy(), pool, window: None, gpu: None, renderer: Renderer::new(), states: States::default(), cursor: None, modifiers: Modifiers::empty(), icon: CursorIcon::Default, pendentes: Vec::new(), erro: None, sair: false, inspecionar: false, tudo: true, mover: false, ultimo_mover: std::time::Instant::now(), intervalo: None };
+    let mut rt = Runtime { app, settings, proxy: event_loop.create_proxy(), pool, clipboard: Box::new(widget::MemoryClipboard::default()), window: None, gpu: None, renderer: Renderer::new(), states: States::default(), cursor: None, modifiers: Modifiers::empty(), icon: CursorIcon::Default, pendentes: Vec::new(), erro: None, sair: false, inspecionar: false, tudo: true, mover: false, ultimo_mover: std::time::Instant::now(), intervalo: None };
     if std::env::var_os("PELICANO_DEBUG").is_some_and(|v| v != "0") {
         rt.settings.debug = true;
         rt.inspecionar = true;
@@ -185,6 +187,8 @@ struct Runtime<A: App> {
     settings: Settings,
     proxy: EventLoopProxy<A::Msg>,
     pool: futures::executor::ThreadPool,
+    /// A do sistema, ligada quando a janela abre (antes disso, na memória).
+    clipboard: Box<dyn widget::Clipboard>,
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     renderer: Renderer,
@@ -274,7 +278,7 @@ impl<A: App> Runtime<A> {
         let redraw = {
             let el = self.app.view();
             let node = widget::layout(&el, size, &mut self.renderer, &self.states, &theme);
-            let mut cx = EventCx { renderer: &mut self.renderer, states: &mut self.states, cursor: self.cursor, messages: &mut msgs, window: &mut cmds, redraw: false };
+            let mut cx = EventCx { renderer: &mut self.renderer, states: &mut self.states, cursor: self.cursor, messages: &mut msgs, window: &mut cmds, redraw: false, clipboard: &mut *self.clipboard };
             widget::dispatch(&el, &node, &ev, &mut cx);
             cx.redraw
         };
@@ -355,7 +359,8 @@ impl<A: App> ApplicationHandler<A::Msg> for Runtime<A> {
             .with_decorations(s.decorations)
             .with_transparent(s.transparent)
             .with_blur(s.blur)
-            .with_resizable(s.resizable);
+            .with_resizable(s.resizable)
+            .with_window_icon(s.icon.clone());
         if let Some(m) = s.min_size {
             attrs = attrs.with_min_inner_size(LogicalSize::new(m.width, m.height));
         }
@@ -377,6 +382,11 @@ impl<A: App> ApplicationHandler<A::Msg> for Runtime<A> {
                 self.erro = Some(Error::Gpu(e));
                 return el.exit();
             }
+        }
+        // SAFETY: a conexão com o display vive até o loop acabar; o `exiting` solta a área de
+        // transferência antes disso.
+        if let Ok(c) = unsafe { window_clipboard::Clipboard::connect(&*w) } {
+            self.clipboard = Box::new(Sistema(c));
         }
         self.window = Some(w);
         for c in std::mem::take(&mut self.pendentes) {
@@ -405,6 +415,10 @@ impl<A: App> ApplicationHandler<A::Msg> for Runtime<A> {
         if self.sair {
             el.exit();
         }
+    }
+
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        self.clipboard = Box::new(widget::MemoryClipboard::default());
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, m: A::Msg) {
@@ -476,6 +490,17 @@ impl<A: App> ApplicationHandler<A::Msg> for Runtime<A> {
         if self.sair {
             el.exit();
         }
+    }
+}
+
+struct Sistema(window_clipboard::Clipboard);
+
+impl widget::Clipboard for Sistema {
+    fn read(&mut self) -> Option<String> {
+        self.0.read().ok()
+    }
+    fn write(&mut self, s: String) {
+        let _ = self.0.write(s);
     }
 }
 

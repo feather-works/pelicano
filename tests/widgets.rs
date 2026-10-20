@@ -8,11 +8,12 @@ const TELA: Size = Size::new(400.0, 300.0);
 struct H {
     r: Renderer,
     st: States,
+    area: MemoryClipboard,
 }
 
 impl H {
     fn new() -> Self {
-        H { r: Renderer::new(), st: States::default() }
+        H { r: Renderer::new(), st: States::default(), area: MemoryClipboard::default() }
     }
     fn node<M>(&mut self, el: &Element<'_, M>) -> Node {
         self.r.begin(TELA, 1.0, Color::TRANSPARENT);
@@ -21,7 +22,7 @@ impl H {
     fn ev<M>(&mut self, el: &Element<'_, M>, p: Point, ev: Event) -> (Vec<M>, Captured) {
         let n = self.node(el);
         let mut msgs = Vec::new();
-        let mut cx = EventCx { renderer: &mut self.r, states: &mut self.st, cursor: Some(p), messages: &mut msgs, window: &mut Vec::new(), redraw: false };
+        let mut cx = EventCx { renderer: &mut self.r, states: &mut self.st, cursor: Some(p), messages: &mut msgs, window: &mut Vec::new(), redraw: false, clipboard: &mut self.area };
         let c = dispatch(el, &n, &ev, &mut cx);
         (msgs, c)
     }
@@ -190,6 +191,12 @@ impl Campo {
         drop(el);
         self.aplicar(m)
     }
+    fn ctrl(&mut self, letra: &str) -> Vec<M> {
+        let el = Campo::el(&self.valor);
+        let m = self.h.ev(&el, Point::ORIGIN, Event::Key { key: Key::Character(letra.into()), text: Some(letra.into()), modifiers: Modifiers::CONTROL, pressed: true }).0;
+        drop(el);
+        self.aplicar(m)
+    }
     fn digitar(&mut self, t: &str) -> Vec<M> {
         self.tecla(Key::Character(t.into()), Some(t))
     }
@@ -231,6 +238,39 @@ fn campo_edita_navega_envia_e_perde_o_foco() {
     c.click(Point::new(5.0, campo.y + campo.height + 50.0));
     assert_eq!(c.digitar("x"), vec![]);
     assert_eq!(c.valor, "Xb");
+}
+
+#[test]
+fn campo_copia_cola_e_recorta() {
+    let mut c = Campo { h: H::new(), valor: "abc".into() };
+    let campo = c.h.node(&Campo::el("abc")).children[0].rect;
+    c.click(Point::new(campo.x + 150.0, campo.y + 5.0));
+    // Copiar não muda o campo; colar entra no cursor.
+    assert_eq!(c.ctrl("c"), vec![]);
+    assert_eq!(c.h.area.0.as_deref(), Some("abc"));
+    c.tecla(nomeada(NamedKey::Home), None);
+    assert_eq!(c.ctrl("v"), vec![M::Texto("abcabc".into())]);
+    // O cursor ficou depois do colado.
+    assert_eq!(c.digitar("-"), vec![M::Texto("abc-abc".into())]);
+    // Quebra de linha colada vira espaço; Ctrl+V maiúsculo (Caps Lock) também cola.
+    c.h.area.0 = Some("x\ny".into());
+    c.tecla(nomeada(NamedKey::End), None);
+    assert_eq!(c.ctrl("V"), vec![M::Texto("abc-abcx y".into())]);
+    // Recortar leva tudo e esvazia.
+    assert_eq!(c.ctrl("x"), vec![M::Texto(String::new())]);
+    assert_eq!(c.h.area.0.as_deref(), Some("abc-abcx y"));
+}
+
+#[test]
+fn senha_nao_vai_para_a_area_de_transferencia() {
+    let mut h = H::new();
+    let el: Element<M> = text_input("", "segredo").secure(true).on_input(M::Texto).width(200.0).into();
+    let campo = h.node(&el).rect;
+    h.click(&el, Point::new(campo.x + 10.0, campo.y + 5.0));
+    for k in ["c", "x"] {
+        h.ev(&el, Point::ORIGIN, Event::Key { key: Key::Character(k.into()), text: Some(k.into()), modifiers: Modifiers::CONTROL, pressed: true });
+    }
+    assert_eq!(h.area.0, None);
 }
 
 #[test]

@@ -38,7 +38,7 @@ fn botao_publica_no_clique_e_campo_edita() {
     let mut msgs = Vec::new();
     let mut clicar = |p: Point, evs: &[Event], msgs: &mut Vec<M>, st: &mut States| {
         for ev in evs {
-            let mut cx = EventCx { renderer: &mut r, states: st, cursor: Some(p), messages: msgs, window: &mut Vec::new(), redraw: false };
+            let mut cx = EventCx { renderer: &mut r, states: st, cursor: Some(p), messages: msgs, window: &mut Vec::new(), redraw: false, clipboard: &mut MemoryClipboard::default() };
             dispatch(&el, &n, ev, &mut cx);
         }
     };

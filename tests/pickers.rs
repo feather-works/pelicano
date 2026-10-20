@@ -20,7 +20,7 @@ impl H {
     fn ev<M>(&mut self, el: &Element<'_, M>, p: Point, ev: Event) -> Vec<M> {
         let n = self.node(el);
         let mut msgs = Vec::new();
-        let mut cx = EventCx { renderer: &mut self.r, states: &mut self.st, cursor: Some(p), messages: &mut msgs, window: &mut Vec::new(), redraw: false };
+        let mut cx = EventCx { renderer: &mut self.r, states: &mut self.st, cursor: Some(p), messages: &mut msgs, window: &mut Vec::new(), redraw: false, clipboard: &mut MemoryClipboard::default() };
         dispatch(el, &n, &ev, &mut cx);
         msgs
     }

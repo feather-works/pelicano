@@ -24,7 +24,7 @@ pub use controls::*;
 pub use pickers::*;
 pub use widget::*;
 pub use winit::keyboard::{Key, ModifiersState as Modifiers, NamedKey};
-pub use winit::window::ResizeDirection;
+pub use winit::window::{Icon, ResizeDirection};
 
 use std::any::Any;
 use std::collections::HashMap;

@@ -114,6 +114,26 @@ pub struct EventCx<'a, M> {
     pub window: &'a mut Vec<WindowCmd>,
     /// Algum estado visual mudou sem mensagem (rolagem, cursor do campo): redesenhar.
     pub redraw: bool,
+    pub clipboard: &'a mut dyn Clipboard,
+}
+
+/// A área de transferência (Ctrl+C / Ctrl+V nos campos).
+pub trait Clipboard {
+    fn read(&mut self) -> Option<String>;
+    fn write(&mut self, s: String);
+}
+
+/// Sem sistema por trás (testes, antes da janela abrir): guarda na memória.
+#[derive(Default)]
+pub struct MemoryClipboard(pub Option<String>);
+
+impl Clipboard for MemoryClipboard {
+    fn read(&mut self) -> Option<String> {
+        self.0.clone()
+    }
+    fn write(&mut self, s: String) {
+        self.0 = Some(s);
+    }
 }
 
 impl<M> EventCx<'_, M> {
@@ -172,7 +192,7 @@ impl<M, N> Widget<N> for Map<'_, M, N> {
     }
     fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<N>) -> Captured {
         let mut msgs = Vec::new();
-        let mut sub = EventCx { renderer: cx.renderer, states: cx.states, cursor: cx.cursor, messages: &mut msgs, window: cx.window, redraw: false };
+        let mut sub = EventCx { renderer: cx.renderer, states: cx.states, cursor: cx.cursor, messages: &mut msgs, window: cx.window, redraw: false, clipboard: &mut *cx.clipboard };
         let c = self.inner.0.event(n, ev, &mut sub);
         cx.redraw |= sub.redraw;
         cx.messages.extend(msgs.into_iter().map(&self.f));
@@ -1410,6 +1430,24 @@ impl<M: Clone> Widget<M> for TextInput<'_, M> {
                         }
                     }
                     Key::Named(NamedKey::Escape) => cx.states.focus = None,
+                    // shortcut: sem seleção ainda, copiar e recortar pegam o campo inteiro; com Shift+setas e arrastar, só o trecho.
+                    Key::Character(k) if modifiers.control_key() && k.eq_ignore_ascii_case("v") => {
+                        // Uma linha só: quebras de linha coladas viram espaço.
+                        let t: String = cx.clipboard.read().unwrap_or_default().chars().map(|ch| if ch == '\n' || ch == '\r' || ch == '\t' { ' ' } else { ch }).filter(|ch| !ch.is_control()).collect();
+                        if !t.is_empty() {
+                            novo = Some(format!("{}{}{}", &v[..c], t, &v[c..]));
+                            c += t.len();
+                        }
+                    }
+                    Key::Character(k) if modifiers.control_key() && !self.secure && (k.eq_ignore_ascii_case("c") || k.eq_ignore_ascii_case("x")) => {
+                        if !v.is_empty() {
+                            cx.clipboard.write(v.to_string());
+                            if k.eq_ignore_ascii_case("x") {
+                                novo = Some(String::new());
+                                c = 0;
+                            }
+                        }
+                    }
                     _ => match text.as_deref().filter(|t| !modifiers.control_key() && t.chars().all(|ch| !ch.is_control())) {
                         Some(t) if !t.is_empty() => {
                             novo = Some(format!("{}{}{}", &v[..c], t, &v[c..]));
