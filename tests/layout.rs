@@ -18,6 +18,16 @@ fn fill_divide_a_sobra_pela_proporcao() {
 }
 
 #[test]
+fn coluna_sem_largura_herda_fill_do_filho() {
+    // Abas do monitor: [botão + traço FILL] ×3. Antes a primeira tomava tudo e as outras ficavam com 0.
+    let aba = || column![Space::new(60.0, 30.0), container(Space::new(Length::FILL, 3.0)).width(Length::FILL)];
+    let el: Element<()> = row![aba(), aba(), aba()].spacing(10).into();
+    let n = montar(&el, Size::new(320.0, 100.0), &mut Renderer::new(), &States::default());
+    let w: Vec<f32> = n.children.iter().map(|c| c.rect.width).collect();
+    assert_eq!(w, vec![100.0, 100.0, 100.0]);
+}
+
+#[test]
 fn margem_fica_fora_do_padding() {
     let el: Element<()> = container(Space::new(50.0, 20.0)).padding(4.0).margin([10u16, 20]).into();
     let n = montar(&el, Size::new(500.0, 500.0), &mut Renderer::new(), &States::default());

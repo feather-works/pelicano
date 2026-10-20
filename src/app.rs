@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::raw_window_handle::RawWindowHandle;
 use winit::window::{Icon, Window, WindowLevel};
 
 /// Um aplicativo: estado, como ele muda (`update`) e como aparece (`view`).
@@ -32,6 +33,12 @@ pub trait App: Sized + 'static {
     }
     /// Todo evento da janela passa aqui também (atalhos, fechar, redimensionar).
     fn on_event(&self, _ev: &Event) -> Option<Self::Msg> {
+        None
+    }
+    /// Como `on_window_event`, mas só com o que nenhum widget usou: atalhos globais que não
+    /// disparam enquanto se digita num campo.
+    fn on_unhandled_event(&self, id: WindowId, ev: &Event) -> Option<Self::Msg> {
+        let _ = (id, ev);
         None
     }
     /// O que aparece numa janela aberta com [`Task::open_window`] (a principal usa `view`).
@@ -121,13 +128,35 @@ pub enum WindowCmd {
     /// Traz para a frente (e tira do minimizado).
     /// shortcut: no Wayland o compositor só obedece com um token de ativação; sem ele a janela só pisca na barra.
     Focus,
+    /// Tela cheia (`true`) ou janela (`false`), sem alternar.
+    Fullscreen(bool),
+    Maximize(bool),
+    /// Põe o canto da janela em `p` (lógico, na área de trabalho).
+    /// shortcut: o Wayland ignora, como em `Settings::position`.
+    Move(Point),
 }
+
+/// Ordens para um widget, pelo `id` dele.
+#[derive(Clone, Copy)]
+pub(crate) enum Op {
+    Focus(u64),
+    /// Deslocamento absoluto, ou relativo (0 a 1) quando o `bool` diz.
+    Scroll(u64, Point, bool),
+}
+
+type Leitura<M> = Box<dyn FnOnce(Option<String>) -> M + Send>;
+type Alca<M> = Box<dyn FnOnce(RawWindowHandle) -> M + Send>;
 
 enum Action<M> {
     Future(BoxFuture<'static, M>),
     Stream(BoxStream<'static, M>),
     Window(WindowId, WindowCmd),
     Open(WindowId, Settings),
+    Widget(Op),
+    Copiar(String),
+    Colar(Leitura<M>),
+    Alca(WindowId, Alca<M>),
+    Evento(WindowId, Event),
 }
 
 /// Trabalho que o `update` devolve: futuros, fluxos e ordens para a janela.
@@ -165,10 +194,40 @@ impl<M: Send + 'static> Task<M> {
     pub fn window_of(id: WindowId, cmd: WindowCmd) -> Self {
         Task(vec![Action::Window(id, cmd)])
     }
-    /// Abre outra janela; ela mostra o [`App::view_window`] de `id`. Fechar a principal fecha todas.
-    // shortcut: o app acaba quando a principal fecha; deixar as outras vivas quando alguém pedir (post-it sem o bloco aberto).
+    /// Abre outra janela; ela mostra o [`App::view_window`] de `id`. Sem
+    /// [`Settings::run_in_background`], fechar a principal fecha todas.
     pub fn open_window(id: WindowId, settings: Settings) -> Self {
         Task(vec![Action::Open(id, settings)])
+    }
+    /// Rola o `scrollable(..).id(id)` até o deslocamento `offset` (lógico; `f32::INFINITY` = o fim).
+    pub fn scroll_to(id: impl Hash, offset: Point) -> Self {
+        Task(vec![Action::Widget(Op::Scroll(crate::id_hash(&id), offset, false))])
+    }
+    /// Rola até a fração `rel` (0 = começo, 1 = fim) de cada eixo.
+    pub fn snap_to(id: impl Hash, rel: Point) -> Self {
+        Task(vec![Action::Widget(Op::Scroll(crate::id_hash(&id), rel, true))])
+    }
+    /// Põe o foco no campo `.id(id)` (já desenhado).
+    pub fn focus(id: impl Hash) -> Self {
+        Task(vec![Action::Widget(Op::Focus(crate::id_hash(&id)))])
+    }
+    /// Copia `texto` para a área de transferência.
+    pub fn write_clipboard(texto: impl Into<String>) -> Self {
+        Task(vec![Action::Copiar(texto.into())])
+    }
+    /// Lê a área de transferência e manda `f(texto)`.
+    pub fn read_clipboard(f: impl FnOnce(Option<String>) -> M + Send + 'static) -> Self {
+        Task(vec![Action::Colar(Box::new(f))])
+    }
+    /// Chama `f` na thread da janela `id` com a alça crua dela (o `run_with_handle` do Iced):
+    /// ligar leitura da caneta, subclasse no Windows, o id X11. Antes de ela abrir, espera.
+    pub fn window_handle(id: WindowId, f: impl FnOnce(RawWindowHandle) -> M + Send + 'static) -> Self {
+        Task(vec![Action::Alca(id, Box::new(f))])
+    }
+    /// Passa `ev` pela árvore da janela `id` como se viesse do sistema (entrada sintética,
+    /// automação). `Event::CursorMoved` também move o cursor que os widgets veem.
+    pub fn window_event(id: WindowId, ev: Event) -> Self {
+        Task(vec![Action::Evento(id, ev)])
     }
     pub fn batch(tasks: impl IntoIterator<Item = Task<M>>) -> Self {
         Task(tasks.into_iter().flat_map(|t| t.0).collect())
@@ -189,6 +248,17 @@ impl<M: Send + 'static> Task<M> {
                     }
                     Action::Window(id, c) => Action::Window(id, c),
                     Action::Open(id, s) => Action::Open(id, s),
+                    Action::Widget(o) => Action::Widget(o),
+                    Action::Copiar(t) => Action::Copiar(t),
+                    Action::Colar(g) => {
+                        let f = f.clone();
+                        Action::Colar(Box::new(move |t| f(g(t))))
+                    }
+                    Action::Alca(id, g) => {
+                        let f = f.clone();
+                        Action::Alca(id, Box::new(move |h| f(g(h))))
+                    }
+                    Action::Evento(id, e) => Action::Evento(id, e),
                 })
                 .collect(),
         )
@@ -217,6 +287,7 @@ impl<M: Send + 'static> Task<M> {
 /// O que chega ao laço de fora da janela: as mensagens das tarefas e os pedidos do leitor de tela.
 enum Evento<M> {
     App(M),
+    Janela(WindowId, Event),
     Acesso(accesskit_winit::Event),
 }
 
@@ -247,7 +318,10 @@ impl<M: Send + 'static> Subscription<M> {
     }
     /// Converte as mensagens. O id passa a contar também o tipo de `f`: o mesmo relógio
     /// mapeado para duas mensagens diferentes vira dois.
+    /// `f` não pode capturar nada: com o mesmo id ela não é trocada, e o valor capturado ficaria
+    /// o da primeira vez. O que muda vai no id ([`run_with_id`](Self::run_with_id)).
     pub fn map<N: Send + 'static, F: Fn(M) -> N + Send + Sync + 'static>(self, f: F) -> Subscription<N> {
+        debug_assert_eq!(std::mem::size_of::<F>(), 0, "Subscription::map: a closure não pode capturar nada (ficaria com o valor velho); ponha o dado no id");
         let f = Arc::new(f);
         Subscription(
             self.0
@@ -309,7 +383,7 @@ pub fn run<A: App>(settings: Settings, init: impl FnOnce() -> (A, Task<A::Msg>))
     };
     let tokio = tokio::runtime::Builder::new_multi_thread().thread_name("pelicano").enable_all().build().map_err(|e| Error::Window(e.to_string()))?;
     let (app, task) = init();
-    let mut rt = Runtime { app, settings, proxy: event_loop.create_proxy(), tokio: tokio.handle().clone(), assinaturas: HashMap::new(), clipboard: Box::new(widget::MemoryClipboard::default()), janelas: Vec::new(), gpu: None, renderer: Renderer::new(), modifiers: Modifiers::empty(), abrir: Vec::new(), pendentes: Vec::new(), erro: None, sair: false, iniciou: false, inspecionar: false, intervalo: None };
+    let mut rt = Runtime { app, settings, proxy: event_loop.create_proxy(), tokio: tokio.handle().clone(), assinaturas: HashMap::new(), clipboard: Box::new(widget::MemoryClipboard::default()), janelas: Vec::new(), gpu: None, renderer: Renderer::new(), modifiers: Modifiers::empty(), abrir: Vec::new(), pendentes: Vec::new(), alcas: Vec::new(), erro: None, sair: false, iniciou: false, inspecionar: false, intervalo: None };
     if std::env::var_os("PELICANO_DEBUG").is_some_and(|v| v != "0") {
         rt.settings.debug = true;
         rt.inspecionar = true;
@@ -318,8 +392,8 @@ pub fn run<A: App>(settings: Settings, init: impl FnOnce() -> (A, Task<A::Msg>))
     rt.assinar();
     let fim = event_loop.run_app(&mut rt);
     rt.parar_assinaturas();
-    // Não espera tarefa nenhuma acabar: a janela já fechou.
-    tokio.shutdown_background();
+    // A janela já fechou: as tarefas têm um segundo para soltar o que seguram.
+    tokio.shutdown_timeout(Duration::from_secs(1));
     fim.map_err(Error::EventLoop)?;
     rt.erro.map_or(Ok(()), Err)
 }
@@ -343,6 +417,8 @@ struct Runtime<A: App> {
     abrir: Vec<(WindowId, Settings)>,
     /// Ordens para janelas que ainda não abriram.
     pendentes: Vec<(WindowId, WindowCmd)>,
+    /// Pedidos de alça ([`Task::window_handle`]) para janelas que ainda não abriram.
+    alcas: Vec<(WindowId, Alca<A::Msg>)>,
     erro: Option<Error>,
     sair: bool,
     /// O `resumed` já abriu (ou deixou fechada) a principal.
@@ -372,11 +448,17 @@ struct Janela {
     ultimo_mover: std::time::Instant,
     /// Uma animação pediu o próximo quadro: quando ele vem.
     proximo: Option<std::time::Instant>,
+    /// A roda ainda não entregue, somada. O touchpad manda dezenas por quadro, e cada entrega
+    /// monta a árvore de novo: sem somar, a rolagem ficava atrás do dedo (a barra, que vem pelo
+    /// `mover`, já era uma por quadro).
+    roda: Option<Event>,
     acesso: accesskit_winit::Adapter,
     /// Um leitor de tela pediu a árvore: cada quadro manda a dele (se mudou).
     leitor: bool,
     /// A última árvore mandada: não repetir a mesma, e achar onde fica o alvo de uma ação.
     arvore: Option<accesskit::TreeUpdate>,
+    /// O dedo que está fazendo as vezes de mouse ([`mouse_do_dedo`]).
+    dedo: Option<u64>,
 }
 
 impl<A: App> Runtime<A> {
@@ -389,12 +471,35 @@ impl<A: App> Runtime<A> {
                 })),
                 Action::Stream(s) => drop(self.espalhar(s)),
                 Action::Window(id, c) => self.window_cmd(id, c),
+                Action::Widget(o) => self.widget_op(o),
+                Action::Copiar(t) => self.clipboard.write(t),
+                Action::Colar(f) => {
+                    let m = f(self.clipboard.read());
+                    let _ = self.proxy.send_event(Evento::App(m));
+                }
+                Action::Alca(id, f) => self.alca(id, f),
+                // Pelo laço, não aqui dentro: o evento chega depois do `update` que o pediu.
+                Action::Evento(id, ev) => drop(self.proxy.send_event(Evento::Janela(id, ev))),
                 Action::Open(id, s) => {
                     if !self.janelas.iter().any(|j| j.id == id) && !self.abrir.iter().any(|(i, _)| *i == id) {
                         self.abrir.push((id, s));
                     }
                 }
             }
+        }
+    }
+
+    fn alca(&mut self, id: WindowId, f: Alca<A::Msg>) {
+        use winit::raw_window_handle::HasWindowHandle;
+        let Some(j) = self.janelas.iter().find(|j| j.id == id) else {
+            if id == WindowId::MAIN || self.abrir.iter().any(|(a, _)| *a == id) {
+                self.alcas.push((id, f));
+            }
+            return;
+        };
+        if let Ok(h) = j.w.window_handle() {
+            let m = f(h.as_raw());
+            let _ = self.proxy.send_event(Evento::App(m));
         }
     }
 
@@ -426,6 +531,23 @@ impl<A: App> Runtime<A> {
                 w.set_minimized(false);
                 w.focus_window();
             }
+            WindowCmd::Fullscreen(f) => w.set_fullscreen(f.then_some(winit::window::Fullscreen::Borderless(None))),
+            WindowCmd::Maximize(m) => w.set_maximized(m),
+            WindowCmd::Move(p) => w.set_outer_position(winit::dpi::LogicalPosition::new(p.x, p.y)),
+        }
+    }
+
+    fn widget_op(&mut self, o: Op) {
+        for j in &mut self.janelas {
+            let id = match o {
+                Op::Focus(id) | Op::Scroll(id, ..) => id,
+            };
+            let Some(key) = j.states.ids.borrow().get(&id).copied() else { continue };
+            match o {
+                Op::Focus(_) => j.states.focus = Some(key),
+                Op::Scroll(_, p, rel) => widget::rolar(&mut j.states, key, p, rel),
+            }
+            j.w.request_redraw();
         }
     }
 
@@ -535,11 +657,19 @@ impl<A: App> Runtime<A> {
             }
             w.set_visible(true);
             w.request_redraw();
-            self.janelas.push(Janela { id, w, tela, quadro: Quadro::default(), states: States::default(), cursor: None, icon: CursorIcon::Default, transparente: s.transparent, fechar_ao_pedir: s.close_on_request, tudo: true, mover: false, ultimo_mover: std::time::Instant::now(), proximo: None, acesso, leitor: false, arvore: None });
+            self.janelas.push(Janela { id, w, tela, quadro: Quadro::default(), states: States::default(), cursor: None, icon: CursorIcon::Default, transparente: s.transparent, fechar_ao_pedir: s.close_on_request, tudo: true, mover: false, ultimo_mover: std::time::Instant::now(), proximo: None, roda: None, acesso, leitor: false, arvore: None, dedo: None });
+            let escala = self.janelas.last().map_or(1.0, |j| j.w.scale_factor() as f32);
+            let m: Vec<_> = self.app.on_window_event(id, &Event::ScaleChanged(escala)).into_iter().collect();
+            self.update(m);
             let (dela, outras) = std::mem::take(&mut self.pendentes).into_iter().partition(|(i, _)| *i == id);
             self.pendentes = outras;
             for (i, c) in dela {
                 self.window_cmd(i, c);
+            }
+            let (dela, outras) = std::mem::take(&mut self.alcas).into_iter().partition(|(i, _)| *i == id);
+            self.alcas = outras;
+            for (i, f) in dela {
+                self.alca(i, f);
             }
         }
     }
@@ -560,26 +690,46 @@ impl<A: App> Runtime<A> {
         let (id, size) = (j.id, Self::logical_size(&j.w));
         let mut msgs = Vec::new();
         let mut cmds = Vec::new();
-        let redraw = {
+        let (redraw, pegou) = {
             let el = self.app.view_window(id);
             let node = widget::layout(&el, size, &mut self.renderer, &j.states, &theme);
             let mut cx = EventCx { renderer: &mut self.renderer, states: &mut j.states, cursor: j.cursor, messages: &mut msgs, window: &mut cmds, redraw: false, clipboard: &mut *self.clipboard };
-            widget::dispatch(&el, &node, &ev, &mut cx);
-            cx.redraw
+            let pegou = widget::dispatch(&el, &node, &ev, &mut cx);
+            (cx.redraw, pegou)
         };
+        if pegou == crate::Captured::No {
+            msgs.extend(self.app.on_unhandled_event(id, &ev));
+        }
         // O mouse andou: o quadro é gravado e comparado; se nada mudou, nem pinta.
         let mexeu = matches!(ev, Event::CursorMoved(_) | Event::CursorLeft);
         msgs.extend(self.app.on_window_event(id, &ev));
         for c in cmds {
             self.window_cmd(id, c);
         }
-        if !msgs.is_empty() || redraw || mexeu || matches!(ev, Event::Resized(_)) {
+        if !msgs.is_empty() {
             self.update(msgs);
+        } else if redraw || mexeu || matches!(ev, Event::Resized(_)) {
+            // Sem mensagem o estado do app não mudou: só esta janela pinta de novo.
+            if let Some(i) = self.indice(id) {
+                self.janelas[i].w.request_redraw();
+            }
+        }
+        let Some(j) = self.indice(id).map(|i| &mut self.janelas[i]) else { return };
+        for e in mouse_do_dedo(&mut j.dedo, &ev, pegou == crate::Captured::Yes) {
+            // O evento anterior pode ter fechado janelas: o índice muda.
+            let Some(i) = self.indice(id) else { return };
+            let j = &mut self.janelas[i];
+            match e {
+                Event::CursorMoved(p) => j.cursor = Some(p),
+                Event::CursorLeft => j.cursor = None,
+                _ => {}
+            }
+            self.event(i, e);
         }
     }
 
-    /// Os pedidos do leitor de tela. Clicar e focar viram um clique no meio do widget: cada um
-    /// já sabe o que fazer com o clique.
+    /// Os pedidos do leitor de tela. Clicar vira um clique no meio do widget (cada um já sabe o que
+    /// fazer com ele); focar só põe o foco (os nós têm a chave do widget).
     fn acessibilidade(&mut self, e: accesskit_winit::Event) {
         let Some(i) = self.janelas.iter().position(|j| j.w.id() == e.window_id) else { return };
         let j = &mut self.janelas[i];
@@ -594,19 +744,23 @@ impl<A: App> Runtime<A> {
                 j.arvore = None;
             }
             accesskit_winit::WindowEvent::ActionRequested(pedido) => {
-                use accesskit::Action;
-                if !matches!(pedido.action, Action::Click | Action::Focus) {
-                    return;
+                match pedido_do_leitor(pedido.action) {
+                    Some(Pedido::Focar) => {
+                        j.states.focus = Some(pedido.target_node.0);
+                        return j.w.request_redraw();
+                    }
+                    Some(Pedido::Clicar) => {}
+                    None => return,
                 }
                 let alvo = j.arvore.as_ref().and_then(|t| t.nodes.iter().find(|(id, _)| *id == pedido.target_node)).and_then(|(_, n)| n.bounds());
                 let Some(b) = alvo else { return };
                 let meio = Point::new(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
-                let antes = j.cursor.replace(meio);
+                let (id, antes) = (j.id, j.cursor.replace(meio));
                 self.event(i, Event::MousePressed(crate::MouseButton::Left));
-                if i < self.janelas.len() {
+                if let Some(i) = self.indice(id) {
                     self.event(i, Event::MouseReleased(crate::MouseButton::Left));
                 }
-                if let Some(j) = self.janelas.get_mut(i) {
+                if let Some(j) = self.indice(id).map(|i| &mut self.janelas[i]) {
                     j.cursor = antes;
                     j.w.request_redraw();
                 }
@@ -614,7 +768,26 @@ impl<A: App> Runtime<A> {
         }
     }
 
-    fn entregar_mover(&mut self, i: usize) {
+    /// Onde está a janela `id` agora: um `update` no meio pode ter fechado outras.
+    fn indice(&self, id: WindowId) -> Option<usize> {
+        self.janelas.iter().position(|j| j.id == id)
+    }
+
+    /// A roda que espera (com o mouse antes dela) chega à janela `id`.
+    fn entregar_roda(&mut self, id: WindowId) {
+        let Some(i) = self.indice(id) else { return };
+        let j = &mut self.janelas[i];
+        if let Some(ev) = j.roda.take() {
+            j.ultimo_mover = std::time::Instant::now();
+            self.entregar_mover(id);
+            if let Some(i) = self.indice(id) {
+                self.event(i, ev);
+            }
+        }
+    }
+
+    fn entregar_mover(&mut self, id: WindowId) {
+        let Some(i) = self.indice(id) else { return };
         let j = &mut self.janelas[i];
         if std::mem::take(&mut j.mover) {
             j.ultimo_mover = std::time::Instant::now();
@@ -754,7 +927,7 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
                 None => {}
             }
         }
-        if !self.janelas.iter().any(|j| j.mover) {
+        if !self.janelas.iter().any(|j| j.mover || j.roda.is_some()) {
             return el.set_control_flow(prox.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
         }
         let janela = self.janelas.first().map(|j| j.w.clone());
@@ -762,18 +935,20 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
             let hz = janela.and_then(|w| w.current_monitor()).and_then(|m| m.refresh_rate_millihertz()).unwrap_or(60_000);
             std::time::Duration::from_micros(1_000_000_000 / hz.max(1000) as u64)
         });
-        let mut i = 0;
-        while i < self.janelas.len() {
-            let j = &self.janelas[i];
-            if j.mover {
-                let quando = j.ultimo_mover + intervalo;
-                if agora >= quando {
-                    self.entregar_mover(i);
-                } else {
-                    prox = Some(prox.map_or(quando, |p| p.min(quando)));
+        // Pelos ids: entregar pode fechar janelas.
+        let ids: Vec<_> = self.janelas.iter().map(|j| j.id).collect();
+        for id in ids {
+            let Some(j) = self.indice(id).map(|i| &self.janelas[i]) else { continue };
+            // Mouse e roda: no máximo uma entrega por quadro; o resto soma até lá.
+            if j.mover || j.roda.is_some() {
+                match esperar_entrega(j.ultimo_mover, intervalo, agora) {
+                    None => {
+                        self.entregar_mover(id);
+                        self.entregar_roda(id);
+                    }
+                    Some(quando) => prox = Some(prox.map_or(quando, |p| p.min(quando))),
                 }
             }
-            i += 1;
         }
         self.abrir_janelas(el);
         el.set_control_flow(prox.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
@@ -789,6 +964,14 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
     fn user_event(&mut self, el: &ActiveEventLoop, e: Evento<A::Msg>) {
         match e {
             Evento::App(m) => self.update(vec![m]),
+            Evento::Janela(id, ev) => {
+                if let Some(i) = self.janelas.iter().position(|j| j.id == id) {
+                    if let Event::CursorMoved(p) = ev {
+                        self.janelas[i].cursor = Some(p);
+                    }
+                    self.event(i, ev);
+                }
+            }
             Evento::Acesso(a) => self.acessibilidade(a),
         }
         self.abrir_janelas(el);
@@ -801,13 +984,12 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
         let Some(i) = self.janelas.iter().position(|j| j.w.id() == wid) else { return };
         let j = &mut self.janelas[i];
         j.acesso.process_event(&j.w, &we);
-        let escala = j.w.scale_factor();
+        let (id, escala) = (j.id, j.w.scale_factor());
         let ev = match we {
             WindowEvent::RedrawRequested => return self.redraw(i),
             WindowEvent::CloseRequested => {
                 if j.fechar_ao_pedir {
                     // Avisa o app antes de a janela sumir.
-                    let id = j.id;
                     let m = self.app.on_window_event(id, &Event::CloseRequested);
                     self.fechar(i);
                     self.update(m.into_iter().collect());
@@ -820,9 +1002,7 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
                 Some(Event::CloseRequested)
             }
             WindowEvent::Resized(s) => {
-                if let Some(g) = &self.gpu {
-                    j.tela.resize(g, s.width, s.height);
-                }
+                // A superfície muda de tamanho no `present`, uma vez por quadro.
                 j.tudo = true;
                 let l = s.to_logical::<f32>(escala);
                 Some(Event::Resized(Size::new(l.width, l.height)))
@@ -845,39 +1025,127 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
                 ElementState::Pressed => Event::MousePressed(button),
                 ElementState::Released => Event::MouseReleased(button),
             }),
-            WindowEvent::MouseWheel { delta, .. } => Some(match delta {
-                MouseScrollDelta::LineDelta(x, y) => Event::Wheel { dx: x * 48.0, dy: y * 48.0, modifiers: self.modifiers },
-                MouseScrollDelta::PixelDelta(p) => Event::Wheel { dx: (p.x / escala) as f32, dy: (p.y / escala) as f32, modifiers: self.modifiers },
-            }),
-            WindowEvent::ModifiersChanged(m) => {
-                self.modifiers = m.state();
+            WindowEvent::MouseWheel { delta, .. } => {
+                let ev = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => Event::Wheel { dx: x * 48.0, dy: y * 48.0, modifiers: self.modifiers },
+                    MouseScrollDelta::PixelDelta(p) => Event::Wheel { dx: (p.x / escala) as f32, dy: (p.y / escala) as f32, modifiers: self.modifiers },
+                };
+                // Soma com a que espera; vai uma por quadro no `about_to_wait`, como o mouse.
+                // Modificador mudou no meio: a de antes vai já, a nova fica esperando.
+                if let Some(antes) = juntar_roda(&mut j.roda, ev) {
+                    let nova = j.roda.replace(antes);
+                    self.entregar_roda(id);
+                    if let Some(i) = self.indice(id) {
+                        self.janelas[i].roda = nova;
+                    }
+                }
                 None
             }
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+                Some(Event::ModifiersChanged(self.modifiers))
+            }
+            WindowEvent::DroppedFile(p) => Some(Event::FileDropped(p)),
+            WindowEvent::HoveredFile(p) => Some(Event::FileHovered(p)),
+            WindowEvent::HoveredFileCancelled => Some(Event::FileHoverCancelled),
             WindowEvent::KeyboardInput { event, .. } => Some(Event::Key { key: event.logical_key.clone(), text: event.text.map(|t| t.to_string()), modifiers: self.modifiers, pressed: event.state.is_pressed() }),
             WindowEvent::Focused(f) => Some(Event::Focused(f)),
-            WindowEvent::ScaleFactorChanged { .. } => {
+            WindowEvent::Touch(t) => Some(toque(t.phase, t.id, t.location, escala)),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 j.tudo = true;
                 self.intervalo = None;
                 j.w.request_redraw();
-                None
+                Some(Event::ScaleChanged(scale_factor as f32))
             }
             _ => None,
         };
         if let Some(ev) = ev {
-            // Clique e tecla veem o mouse onde ele está.
-            self.entregar_mover(i);
+            // Clique e tecla veem o mouse onde ele está, e a rolagem que veio antes deles.
+            self.entregar_mover(id);
+            self.entregar_roda(id);
+            let Some(i) = self.indice(id) else { return };
             // Com o modo debug, o que chega da janela vai para o stderr (para achar tecla ou clique perdido).
             if self.settings.debug && !matches!(ev, Event::CursorMoved(_)) {
-                eprintln!("[pelicano] {ev:?} cursor={:?}", self.janelas.get(i).and_then(|j| j.cursor));
+                eprintln!("[pelicano] {ev:?} cursor={:?}", self.janelas[i].cursor);
             }
-            if i < self.janelas.len() {
-                self.event(i, ev);
-            }
+            self.event(i, ev);
         }
         self.abrir_janelas(el);
         if self.sair {
             el.exit();
         }
+    }
+}
+
+/// O que um pedido do leitor de tela vira.
+#[derive(Debug, PartialEq)]
+enum Pedido {
+    Clicar,
+    Focar,
+}
+
+fn pedido_do_leitor(a: accesskit::Action) -> Option<Pedido> {
+    match a {
+        accesskit::Action::Click => Some(Pedido::Clicar),
+        accesskit::Action::Focus => Some(Pedido::Focar),
+        _ => None,
+    }
+}
+
+/// Mouse e roda vão no máximo uma vez por quadro: `None` entrega já, senão a hora de entregar.
+fn esperar_entrega(ultimo: std::time::Instant, intervalo: std::time::Duration, agora: std::time::Instant) -> Option<std::time::Instant> {
+    let quando = ultimo + intervalo;
+    (agora < quando).then_some(quando)
+}
+
+/// Soma a roda `nova` à que espera entrega. Com outros modificadores não dá para somar: devolve a
+/// que esperava (a entregar já) e guarda a nova.
+fn juntar_roda(pendente: &mut Option<Event>, nova: Event) -> Option<Event> {
+    match (pendente.as_mut(), &nova) {
+        (Some(Event::Wheel { dx, dy, modifiers }), Event::Wheel { dx: x, dy: y, modifiers: m }) if modifiers == m => {
+            *dx += x;
+            *dy += y;
+            None
+        }
+        _ => pendente.replace(nova),
+    }
+}
+
+/// O toque do winit em pixels lógicos.
+fn toque(fase: TouchPhase, id: u64, p: winit::dpi::PhysicalPosition<f64>, escala: f64) -> Event {
+    let p = p.to_logical::<f32>(escala);
+    let position = Point::new(p.x, p.y);
+    match fase {
+        TouchPhase::Started => Event::FingerPressed { id, position },
+        TouchPhase::Moved => Event::FingerMoved { id, position },
+        TouchPhase::Ended => Event::FingerLifted { id, position },
+        TouchPhase::Cancelled => Event::FingerLost { id, position },
+    }
+}
+
+/// O mouse que um toque vira: o winit quase nunca o simula, e sem isso botão, lista e campo
+/// não sentem o dedo. Só o primeiro dedo, e só se ninguém `pegou` o toque ao encostar (a tela de
+/// desenho que trata o dedo não recebe o mesmo traço outra vez como mouse). Depois de encostar,
+/// o dedo segue como mouse até sair, para o botão não ficar apertado.
+fn mouse_do_dedo(dedo: &mut Option<u64>, ev: &Event, pegou: bool) -> Vec<Event> {
+    use crate::MouseButton::Left;
+    match *ev {
+        Event::FingerPressed { id, position } if !pegou && dedo.is_none() => {
+            *dedo = Some(id);
+            vec![Event::CursorMoved(position), Event::MousePressed(Left)]
+        }
+        Event::FingerMoved { id, position } if *dedo == Some(id) => vec![Event::CursorMoved(position)],
+        // Sai da janela depois de soltar: no toque não há "mouse em cima" que fique.
+        Event::FingerLifted { id, position } if *dedo == Some(id) => {
+            *dedo = None;
+            vec![Event::CursorMoved(position), Event::MouseReleased(Left), Event::CursorLeft]
+        }
+        // Cancelado: solta fora, para não virar clique.
+        Event::FingerLost { id, .. } if *dedo == Some(id) => {
+            *dedo = None;
+            vec![Event::CursorLeft, Event::MouseReleased(Left)]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -1139,6 +1407,27 @@ mod testes {
     use super::*;
 
     #[test]
+    fn leitor_focar_nao_clica() {
+        assert_eq!(pedido_do_leitor(accesskit::Action::Focus), Some(Pedido::Focar));
+        assert_eq!(pedido_do_leitor(accesskit::Action::Click), Some(Pedido::Clicar));
+        assert_eq!(pedido_do_leitor(accesskit::Action::ScrollDown), None);
+    }
+
+    #[test]
+    fn mouse_e_roda_uma_vez_por_quadro() {
+        let (t0, q) = (std::time::Instant::now(), Duration::from_millis(16));
+        assert_eq!(esperar_entrega(t0, q, t0), Some(t0 + q));
+        assert_eq!(esperar_entrega(t0, q, t0 + q), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "não pode capturar")]
+    fn map_de_assinatura_recusa_closure_que_captura() {
+        let x = 3u8;
+        let _ = Subscription::every(Duration::from_millis(5)).map(move |_| x);
+    }
+
+    #[test]
     fn assinatura_tem_identidade_e_o_relogio_bate() {
         let id = |s: Subscription<Instant>| s.0[0].0;
         let ms = Duration::from_millis(5);
@@ -1152,5 +1441,47 @@ mod testes {
         let n = rt.block_on(Subscription::every(ms).0.remove(0).1.take(3).count());
         assert_eq!(n, 3);
         assert!(t0.elapsed() >= ms * 3);
+    }
+
+    #[test]
+    fn alca_da_janela_passa_pelo_map() {
+        let t = Task::window_handle(WindowId(3), |h| matches!(h, RawWindowHandle::Xcb(_))).map(|x11| if x11 { 7u8 } else { 0 });
+        let Some(Action::Alca(id, f)) = t.0.into_iter().next() else { panic!("alça") };
+        let h = winit::raw_window_handle::XcbWindowHandle::new(std::num::NonZeroU32::new(5).unwrap());
+        assert_eq!((id, f(RawWindowHandle::Xcb(h))), (WindowId(3), 7));
+    }
+
+    #[test]
+    fn rodas_da_mesma_fila_viram_uma_entrega() {
+        let roda = |dy: f32, modifiers: crate::Modifiers| Event::Wheel { dx: 0.0, dy, modifiers };
+        let mut pendente = None;
+        // 30 eventos do touchpad entre dois quadros: uma entrega só, com a soma.
+        for _ in 0..30 {
+            assert!(super::juntar_roda(&mut pendente, roda(-4.0, crate::Modifiers::empty())).is_none());
+        }
+        assert_eq!(pendente, Some(roda(-120.0, crate::Modifiers::empty())));
+        // Shift no meio (vira horizontal): a de antes sai inteira, a nova espera.
+        let antes = super::juntar_roda(&mut pendente, roda(-4.0, crate::Modifiers::SHIFT));
+        assert_eq!(antes, Some(roda(-120.0, crate::Modifiers::empty())));
+        assert_eq!(pendente, Some(roda(-4.0, crate::Modifiers::SHIFT)));
+    }
+
+    #[test]
+    fn toque_em_pixels_logicos_e_vira_mouse_so_se_ninguem_pegou() {
+        let p = Point::new(10.0, 20.0);
+        let ev = toque(TouchPhase::Started, 7, winit::dpi::PhysicalPosition::new(20.0, 40.0), 2.0);
+        assert_eq!(ev, Event::FingerPressed { id: 7, position: p });
+        assert_eq!(toque(TouchPhase::Cancelled, 7, winit::dpi::PhysicalPosition::new(20.0, 40.0), 2.0), Event::FingerLost { id: 7, position: p });
+        use crate::MouseButton::Left;
+        let mut dedo = None;
+        assert!(mouse_do_dedo(&mut dedo, &ev, true).is_empty(), "pegou: não vira mouse");
+        assert!(mouse_do_dedo(&mut dedo, &Event::FingerMoved { id: 7, position: p }, false).is_empty());
+        assert_eq!(mouse_do_dedo(&mut dedo, &ev, false), vec![Event::CursorMoved(p), Event::MousePressed(Left)]);
+        assert!(mouse_do_dedo(&mut dedo, &Event::FingerPressed { id: 8, position: p }, false).is_empty(), "segundo dedo não");
+        assert_eq!(mouse_do_dedo(&mut dedo, &Event::FingerMoved { id: 7, position: p }, true), vec![Event::CursorMoved(p)]);
+        assert_eq!(mouse_do_dedo(&mut dedo, &Event::FingerLifted { id: 7, position: p }, false), vec![Event::CursorMoved(p), Event::MouseReleased(Left), Event::CursorLeft]);
+        assert_eq!(dedo, None);
+        mouse_do_dedo(&mut dedo, &ev, false);
+        assert_eq!(mouse_do_dedo(&mut dedo, &Event::FingerLost { id: 7, position: p }, false), vec![Event::CursorLeft, Event::MouseReleased(Left)]);
     }
 }

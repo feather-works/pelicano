@@ -32,8 +32,9 @@ personalizar — a ideia é chegar perto do que HTML + CSS permitem.
 ## Exemplo
 
 ```sh
-cargo run --example vitrine                      # abre a janela (F12 = inspetor)
-cargo run --example vitrine -- --capturar a.png  # só gera o PNG
+cargo run --example vitrine --features terminal,highlighter   # tudo o que o pelicano faz, por seção (F12 = inspetor)
+cargo run --example vitrine --features terminal,highlighter -- --capturar pasta/   # só gera os PNGs
+cargo run --example explorer --features terminal   # gerenciador de arquivos com terminal e monitor do sistema
 cargo run --example xadrez                       # xadrez com temas (Clássico, Verde, Vidro)
 ```
 
@@ -50,4 +51,4 @@ pré-multiplicado — é isso que dá a transparência no Wayland.
 Seleção no `text_input`, navegação por Tab, assinaturas de tempo (`every`),
 executor tokio (para `reqwest`) e grid.
 
-Licença GPL-3.0-only.
+Licença MIT.

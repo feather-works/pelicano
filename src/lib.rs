@@ -19,6 +19,10 @@ mod controls;
 mod editor;
 mod pickers;
 mod render;
+mod markdown;
+mod rich;
+#[cfg(feature = "terminal")]
+mod terminal;
 pub mod widget;
 
 pub use access::{accesskit, Access};
@@ -28,10 +32,17 @@ pub use anim::{animate, Animate, Easing, Keyframe, Lerp, Repeat, Transition};
 pub use app::{run, App, Error, Handle, Settings, Subscription, Task, WindowCmd, WindowId};
 /// Canais e fluxos para as tarefas ([`Task::run`]).
 pub use futures;
-pub use render::{Changes, Font, Image, Renderer, Svg};
+/// A alça crua da janela ([`Task::window_handle`]).
+pub use winit::raw_window_handle;
+pub use render::vetor::{FillRule, LineCap, LineJoin, Path, PathBuilder, Segment, Stroke, Transform};
+pub use render::{load_font, Changes, Font, Image, Renderer, Svg};
 pub use controls::*;
 pub use editor::{is_invisible, text_editor, Content, TextEditor};
 pub use pickers::*;
+pub use markdown::markdown;
+#[cfg(feature = "terminal")]
+pub use terminal::{terminal, Terminal, TerminalEvent, TerminalSettings, TerminalView};
+pub use rich::{rich_text, span, RichText, Span};
 pub use widget::*;
 pub use winit::keyboard::{Key, ModifiersState as Modifiers, NamedKey};
 pub use winit::window::{Icon, ResizeDirection, WindowLevel};
@@ -340,6 +351,22 @@ pub enum Event {
     Moved(Point),
     CloseRequested,
     Focused(bool),
+    /// Um arquivo arrastado de fora foi solto na janela (um evento por arquivo).
+    FileDropped(std::path::PathBuf),
+    /// Um arquivo arrastado está em cima da janela (para mostrar onde vai cair).
+    FileHovered(std::path::PathBuf),
+    /// O arrasto saiu da janela sem soltar.
+    FileHoverCancelled,
+    ModifiersChanged(Modifiers),
+    /// A escala da tela (1.0, 1.25, 2.0…): na abertura da janela e quando muda de monitor.
+    ScaleChanged(f32),
+    /// Toque na tela (o `touch::Event` do Iced). `id` separa os dedos. O primeiro dedo que nenhum
+    /// widget pegar também chega como mouse (andar + botão esquerdo), para botão e cia. funcionarem.
+    FingerPressed { id: u64, position: Point },
+    FingerMoved { id: u64, position: Point },
+    FingerLifted { id: u64, position: Point },
+    /// O sistema cancelou o toque (virou gesto, a janela perdeu o foco).
+    FingerLost { id: u64, position: Point },
 }
 
 pub use winit::event::MouseButton;
@@ -365,7 +392,8 @@ pub enum Status {
 /// guardado pelo caminho do widget na árvore.
 #[derive(Default)]
 pub struct States {
-    map: HashMap<u64, Box<dyn Any>>,
+    /// Por widget e tipo: o mesmo widget guarda mais de um estado (foco e cursor, por exemplo).
+    map: HashMap<(u64, TypeId), Box<dyn Any>>,
     pub focus: Option<u64>,
     /// A hora do quadro. `None` (capturas e testes sem [`tick`](Self::tick)): toda transição já está no fim.
     pub(crate) agora: Option<Instant>,
@@ -379,6 +407,22 @@ pub struct States {
     pub(crate) popups: RefCell<Vec<Rect>>,
     /// O mouse sobre um popup: só o dono dele vê ([`DrawCx::popup_cursor`]).
     pub(crate) sob_popup: Cell<Option<Point>>,
+    /// Os widgets com `.id(..)` do último quadro: id → chave. É por aqui que um [`Task`] acha
+    /// o campo a focar ou a rolagem a mexer.
+    pub(crate) ids: RefCell<HashMap<u64, u64>>,
+}
+
+/// O sistema está no tema escuro? (GNOME/KDE pelo portal, Windows e macOS pelas preferências.)
+/// Sem como saber, `false`.
+pub fn system_dark() -> bool {
+    matches!(dark_light::detect(), dark_light::Mode::Dark)
+}
+
+pub(crate) fn id_hash(id: &impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut h);
+    h.finish()
 }
 
 impl States {
@@ -388,20 +432,21 @@ impl States {
         self.agora = Some(now);
         self.quadro += 1;
         self.animando.set(false);
+        self.ids.get_mut().clear();
     }
     /// Alguma transição do último quadro ainda não chegou ao fim: a janela pede outro quadro.
     pub fn animating(&self) -> bool {
         self.animando.get()
     }
     pub fn get<T: 'static>(&self, key: u64) -> Option<&T> {
-        self.map.get(&key)?.downcast_ref()
+        self.map.get(&(key, TypeId::of::<T>()))?.downcast_ref()
     }
     /// shortcut: o caminho muda se a árvore muda de forma; o widget recebe o estado padrão de novo. Um `.id()` estável resolve se incomodar.
     pub fn get_mut<T: Default + 'static>(&mut self, key: u64) -> &mut T {
-        let e = self.map.entry(key).or_insert_with(|| Box::new(T::default()));
-        if !e.is::<T>() {
-            *e = Box::new(T::default());
-        }
-        e.downcast_mut().expect("tipo conferido acima")
+        self.map
+            .entry((key, TypeId::of::<T>()))
+            .or_insert_with(|| Box::new(T::default()))
+            .downcast_mut()
+            .expect("a chave leva o tipo")
     }
 }

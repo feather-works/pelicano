@@ -3,6 +3,7 @@ use crate::{Background, Border, Color, Point, Rect, Shadow, Size};
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use std::collections::HashMap;
 use std::sync::Arc;
+pub(crate) mod vetor;
 use tiny_skia::{FillRule, FilterQuality, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, SpreadMode, Transform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -10,15 +11,48 @@ pub struct Font {
     /// `None` = sem serifa do sistema.
     pub family: Option<&'static str>,
     pub weight: u16,
+    pub italic: bool,
 }
 
 impl Font {
-    pub const DEFAULT: Font = Font { family: None, weight: 400 };
-    pub const MEDIUM: Font = Font { family: None, weight: 500 };
-    pub const SEMIBOLD: Font = Font { family: None, weight: 600 };
-    pub const BOLD: Font = Font { family: None, weight: 700 };
-    pub const MONO: Font = Font { family: Some("monospace"), weight: 400 };
-    pub const SERIF: Font = Font { family: Some("serif"), weight: 400 };
+    pub const DEFAULT: Font = Font { family: None, weight: 400, italic: false };
+    pub const MEDIUM: Font = Font { family: None, weight: 500, italic: false };
+    pub const SEMIBOLD: Font = Font { family: None, weight: 600, italic: false };
+    pub const BOLD: Font = Font { family: None, weight: 700, italic: false };
+    pub const MONO: Font = Font { family: Some("monospace"), weight: 400, italic: false };
+    pub const SERIF: Font = Font { family: Some("serif"), weight: 400, italic: false };
+
+    /// A família pelo nome (do sistema ou carregada com [`load_font`]).
+    pub const fn with_name(nome: &'static str) -> Font {
+        Font { family: Some(nome), weight: 400, italic: false }
+    }
+    pub const fn weight(mut self, w: u16) -> Font {
+        self.weight = w;
+        self
+    }
+    pub const fn italic(mut self) -> Font {
+        self.italic = true;
+        self
+    }
+}
+
+/// O jeito do cosmic-text de pedir esta fonte.
+pub(crate) fn attrs(f: Font) -> Attrs<'static> {
+    let familia = match f.family {
+        None => Family::SansSerif,
+        Some("monospace") => Family::Monospace,
+        Some("serif") => Family::Serif,
+        Some(nome) => Family::Name(nome),
+    };
+    Attrs::new().weight(Weight(f.weight)).family(familia).style(if f.italic { cosmic_text::Style::Italic } else { cosmic_text::Style::Normal })
+}
+
+static FONTES_EXTRA: std::sync::Mutex<Vec<Arc<Vec<u8>>>> = std::sync::Mutex::new(Vec::new());
+
+/// Registra uma fonte (TTF/OTF, ou coleção) para todas as janelas; depois é só pedir pelo nome
+/// da família com [`Font::with_name`]. Vale do próximo quadro em diante.
+pub fn load_font(bytes: impl Into<Vec<u8>>) {
+    FONTES_EXTRA.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(bytes.into()));
 }
 
 impl Default for Font {
@@ -41,7 +75,7 @@ pub struct Image(Arc<Pixmap>, u64);
 impl Image {
     /// Pixels RGBA8 sem pré-multiplicar, linha a linha. `None` se o tamanho não bate.
     pub fn from_rgba(width: u32, height: u32, mut rgba: Vec<u8>) -> Option<Self> {
-        if rgba.len() != (width * height * 4) as usize {
+        if rgba.len() as u64 != width as u64 * height as u64 * 4 {
             return None;
         }
         for p in rgba.chunks_exact_mut(4) {
@@ -74,12 +108,16 @@ impl Svg {
     }
 }
 
+/// Altura da linha padrão do texto, em múltiplos do tamanho.
+const ALTURA_LINHA: f32 = 1.3;
+
 #[derive(PartialEq, Eq, Hash)]
 struct TextKey {
     text: String,
     size: u32,
     font: Font,
     width: Option<u32>,
+    line_height: u32,
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -121,6 +159,18 @@ fn clip_mask(clips: &mut [Clip], w: u32, h: u32, s: f32, area: Option<tiny_skia:
     let n = clips.len();
     if clips[n - 1].mask.is_none() {
         let mut m = Mask::new(w, h)?;
+        if !rounded {
+            // Só retângulos: a máscara é o cruzamento deles (`r`), preenchido direto. Rasterizar
+            // cada recorte na máscara inteira custava várias passadas na tela toda por quadro.
+            let (x0, y0) = (((r.x * s).round().max(0.0) as usize).min(w as usize), ((r.y * s).round().max(0.0) as usize).min(h as usize));
+            let (x1, y1) = ((((r.x + r.width) * s).round().max(0.0) as usize).min(w as usize), (((r.y + r.height) * s).round().max(0.0) as usize).min(h as usize));
+            let dados = m.data_mut();
+            for y in y0..y1.max(y0) {
+                dados[y * w as usize + x0..y * w as usize + x1.max(x0)].fill(255);
+            }
+            clips[n - 1].mask = Some(m);
+            return clips[n - 1].mask.as_ref();
+        }
         m.data_mut().fill(255);
         for c in clips.iter() {
             match rounded_path(c.own, c.radius, s) {
@@ -139,6 +189,10 @@ pub struct Renderer {
     fonts: FontSystem,
     swash: SwashCache,
     texts: Cache<TextKey, Buffer>,
+    /// Buffers montados por quem chama (texto rico), pela chave que ele dá.
+    proprios: Cache<u64, Buffer>,
+    /// Quantas de [`load_font`] já estão no banco.
+    fontes_carregadas: usize,
     svgs: Cache<SvgKey, Pixmap>,
     shadows: Cache<ShadowKey, Pixmap>,
     imagens: Cache<(u64, u32, u32), Pixmap>,
@@ -162,6 +216,8 @@ pub struct Renderer {
     opacidade: f32,
     opacidades: Vec<f32>,
     camadas: Vec<Camada>,
+    /// As de [`Renderer::push_transform`], já compostas.
+    transformacoes: Vec<vetor::Transform>,
 }
 
 /// O que um quadro deixa para o próximo. Com várias janelas, cada uma guarda o seu e troca com
@@ -191,6 +247,8 @@ struct Camada {
     alfa: f32,
     /// Pintando: onde o pixmap dela começa no de fora (pixels) e o que estava sendo desenhado antes.
     canto: (i32, i32),
+    /// O centro da área (pixels do de fora): em volta dele gira e escala.
+    centro: (f32, f32),
     fora: Option<Fora>,
 }
 
@@ -229,6 +287,8 @@ impl Renderer {
             fonts: fontes(),
             swash: SwashCache::new(),
             texts: Cache::default(),
+            proprios: Cache::default(),
+            fontes_carregadas: 0,
             svgs: Cache::default(),
             shadows: Cache::default(),
             imagens: Cache::default(),
@@ -244,12 +304,15 @@ impl Renderer {
             opacidade: 1.0,
             opacidades: Vec::new(),
             camadas: Vec::new(),
+            transformacoes: Vec::new(),
         }
     }
 
     /// Troca o quadro guardado pelo que está aqui (veja [`Quadro`]).
     pub(crate) fn trocar(&mut self, q: &mut Quadro) {
         self.end();
+        // Antes do layout: medir já com a fonte nova.
+        self.carregar_fontes();
         std::mem::swap(&mut self.pixmap, &mut q.pixmap);
         std::mem::swap(&mut self.anterior, &mut q.anterior);
         std::mem::swap(&mut self.vidros, &mut q.vidros);
@@ -261,18 +324,21 @@ impl Renderer {
     /// Prepara um quadro novo de `size` lógico na escala `scale`, limpo com `fundo`.
     pub fn begin(&mut self, size: Size, scale: f32, fundo: Color) {
         self.end();
+        self.carregar_fontes();
         let (w, h) = (((size.width * scale).round() as u32).max(1), ((size.height * scale).round() as u32).max(1));
         if self.pixmap.width() != w || self.pixmap.height() != h {
             self.pixmap = Pixmap::new(w, h).expect("tamanho válido");
         }
         if self.scale != scale {
             self.texts.clear();
+            self.proprios.clear();
             self.svgs.clear();
         }
         // Um quadro cheio desenha tudo o que está à mostra: o que nem ele nem o layout usaram
         // (outro tamanho de janela no meio de um resize, um menu que fechou) sai do cache.
         let antes = self.svgs.bytes() + self.shadows.bytes() + self.imagens.bytes();
         self.texts.virar();
+        self.proprios.virar();
         self.svgs.virar();
         self.shadows.virar();
         self.imagens.virar();
@@ -394,15 +460,30 @@ impl Renderer {
         let caixa = Rect { x: mx - bw - 2.0, y: my - bh - 2.0, width: 2.0 * bw + 4.0, height: 2.0 * bh + 4.0 };
         let mut k = Chave::new(8);
         k.r(area).f(scale).f(rotate).f(opacity);
-        let mut c = Camada { caixa, chave: k.0.finish(), escala: scale, rotacao: rotate, alfa: opacity * self.opacidade, canto: (0, 0), fora: None };
+        let mut c = Camada { caixa, chave: k.0.finish(), escala: scale, rotacao: rotate, alfa: opacity * self.opacidade, canto: (0, 0), centro: (0.0, 0.0), fora: None };
         if self.gravando {
             self.camadas.push(c);
             return;
         }
         let (s, l) = (self.scale, self.local(area));
         let (x0, y0) = ((l.x * s).floor() as i32, (l.y * s).floor() as i32);
-        let (w, h) = ((((l.x + l.width) * s).ceil() as i32 - x0).max(1), (((l.y + l.height) * s).ceil() as i32 - y0).max(1));
-        let Some(novo) = Pixmap::new(w as u32, h as u32) else { return self.camadas.push(c) };
+        let (x1, y1) = (((l.x + l.width) * s).ceil() as i32, ((l.y + l.height) * s).ceil() as i32);
+        c.centro = ((x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0);
+        // Só a parte da camada que, girada e escalada, cai no pixmap de fora: o resto nunca aparece.
+        let (cx, cy) = c.centro;
+        let volta = Transform::from_translate(cx, cy).pre_rotate(rotate).pre_scale(scale, scale).pre_translate(-cx, -cy).invert();
+        let vista = volta.and_then(|v| tiny_skia::Rect::from_xywh(0.0, 0.0, self.pixmap.width() as f32, self.pixmap.height() as f32)?.transform(v));
+        let (x0, y0, x1, y1) = vista.map_or((0, 0, 0, 0), |b| (x0.max(b.left().floor() as i32 - 1), y0.max(b.top().floor() as i32 - 1), x1.min(b.right().ceil() as i32 + 1), y1.min(b.bottom().ceil() as i32 + 1)));
+        let (w, h) = ((x1 - x0).max(1), (y1 - y0).max(1));
+        // Nada à mostra, ou grande demais ainda (algo enorme encolhido): pinta num 1x1 que não volta.
+        let novo = if x1 > x0 && y1 > y0 && w as u64 * h as u64 <= 8192 * 8192 { Pixmap::new(w as u32, h as u32) } else { None };
+        let novo = match novo {
+            Some(p) => p,
+            None => {
+                c.alfa = 0.0;
+                Pixmap::new(1, 1).expect("1x1")
+            }
+        };
         c.canto = (x0, y0);
         c.fora = Some(Fora {
             pixmap: std::mem::replace(&mut self.pixmap, novo),
@@ -430,8 +511,8 @@ impl Renderer {
         if c.alfa <= 0.0 {
             return;
         }
-        let (w, h) = (camada.width() as f32, camada.height() as f32);
-        let t = Transform::from_translate(c.canto.0 as f32 + w / 2.0, c.canto.1 as f32 + h / 2.0).pre_rotate(c.rotacao).pre_scale(c.escala, c.escala).pre_translate(-w / 2.0, -h / 2.0);
+        let (cx, cy) = c.centro;
+        let t = Transform::from_translate(cx, cy).pre_rotate(c.rotacao).pre_scale(c.escala, c.escala).pre_translate(c.canto.0 as f32 - cx, c.canto.1 as f32 - cy);
         let tinta = PixmapPaint { opacity: c.alfa.min(1.0), quality: FilterQuality::Bilinear, ..Default::default() };
         let (pw, ph, s) = (self.pixmap.width(), self.pixmap.height(), self.scale);
         let mask = clip_mask(&mut self.clips, pw, ph, s, None);
@@ -465,7 +546,8 @@ impl Renderer {
             return false;
         }
         let mut area = crescer(area, 2.0);
-        k.f(self.opacidade);
+        // Fonte nova muda as letras de todas as janelas, sem mudar o que elas desenham.
+        k.f(self.opacidade).h(self.fontes_carregadas);
         // Dentro de uma camada o desenho aparece transformado: vale a área dela toda.
         if let Some(c) = self.camadas.first() {
             area = c.caixa;
@@ -493,22 +575,15 @@ impl Renderer {
         self.scale
     }
 
-    fn buffer(&mut self, text: &str, size: f32, font: Font, max_width: Option<f32>) -> &Buffer {
+    fn buffer(&mut self, text: &str, size: f32, font: Font, max_width: Option<f32>, lh: f32) -> &Buffer {
         let s = self.scale;
-        let key = TextKey { text: text.to_owned(), size: (size * s * 64.0) as u32, font, width: max_width.map(|w| (w * s) as u32) };
-        if self.texts.len() > 4000 {
-            self.texts.clear();
-        }
+        let key = TextKey { text: text.to_owned(), size: (size * s * 64.0) as u32, font, width: max_width.map(|w| (w * s) as u32), line_height: lh.to_bits() };
+        self.texts.aparar(self.texts.len() > 4000);
         let fonts = &mut self.fonts;
         self.texts.pegar(key, || {
-            let mut b = Buffer::new(fonts, Metrics::new(size * s, (size * 1.3 * s).ceil()));
+            let mut b = Buffer::new(fonts, Metrics::new(size * s, (size * lh * s).ceil()));
             b.set_size(fonts, max_width.map(|w| w * s), None);
-            let attrs = Attrs::new().weight(Weight(font.weight)).family(match font.family {
-                None => Family::SansSerif,
-                Some("monospace") => Family::Monospace,
-                Some("serif") => Family::Serif,
-                Some(nome) => Family::Name(nome),
-            });
+            let attrs = attrs(font);
             b.set_text(fonts, text, attrs, Shaping::Advanced);
             b
         })
@@ -516,8 +591,13 @@ impl Renderer {
 
     /// Tamanho lógico do texto; com `max_width` quebra em linhas.
     pub fn measure(&mut self, text: &str, size: f32, font: Font, max_width: Option<f32>) -> Size {
+        self.measure_lh(text, size, font, max_width, ALTURA_LINHA)
+    }
+
+    /// [`measure`](Self::measure) com a altura da linha em múltiplos do tamanho (o padrão é 1.3).
+    pub fn measure_lh(&mut self, text: &str, size: f32, font: Font, max_width: Option<f32>, lh: f32) -> Size {
         let s = self.scale;
-        let b = self.buffer(text, size, font, max_width);
+        let b = self.buffer(text, size, font, max_width, lh);
         let (mut w, mut h) = (0.0f32, 0.0f32);
         for run in b.layout_runs() {
             w = w.max(run.line_w);
@@ -529,24 +609,66 @@ impl Renderer {
     /// Início e fim (x lógico) de cada caractere da primeira linha, com o índice em bytes: o cursor do campo de texto.
     pub fn carets(&mut self, text: &str, size: f32, font: Font) -> Vec<(usize, f32, f32)> {
         let s = self.scale;
-        let b = self.buffer(text, size, font, None);
+        let b = self.buffer(text, size, font, None, ALTURA_LINHA);
         b.layout_runs().take(1).flat_map(|r| r.glyphs.iter().map(|g| (g.start, g.x / s, (g.x + g.w) / s)).collect::<Vec<_>>()).collect()
     }
 
     pub fn draw_text(&mut self, text: &str, size: f32, font: Font, color: Color, at: Point, max_width: Option<f32>) {
+        self.draw_text_lh(text, size, font, color, at, max_width, ALTURA_LINHA)
+    }
+
+    /// [`draw_text`](Self::draw_text) com a altura da linha em múltiplos do tamanho.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_lh(&mut self, text: &str, size: f32, font: Font, color: Color, at: Point, max_width: Option<f32>, lh: f32) {
         if self.gravando {
-            let m = self.measure(text, size, font, max_width);
+            let m = self.measure_lh(text, size, font, max_width, lh);
             let mut k = Chave::new(1);
-            k.h(text).f(size).h(font).c(color).f(at.x).f(at.y).h(max_width.map(f32::to_bits));
-            self.gravou(Rect::new(at, m), k);
+            k.h(text).f(size).h(font).c(color).f(at.x).f(at.y).h(max_width.map(f32::to_bits)).f(lh);
+            self.gravou(crescer(Rect::new(at, m), sobra_glifos(size, lh)), k);
             return;
         }
-        self.buffer(text, size, font, max_width);
-        let key = TextKey { text: text.to_owned(), size: (size * self.scale * 64.0) as u32, font, width: max_width.map(|w| (w * self.scale) as u32) };
+        self.buffer(text, size, font, max_width, lh);
+        let key = TextKey { text: text.to_owned(), size: (size * self.scale * 64.0) as u32, font, width: max_width.map(|w| (w * self.scale) as u32), line_height: lh.to_bits() };
         let b = self.texts.get(&key).expect("criado pelo buffer");
         let at = Point::new(at.x - self.origem.x, at.y - self.origem.y);
         let color = color.alpha(color.a * self.opacidade);
-        pintar_glifos(b, &mut self.fonts, &mut self.swash, &mut self.pixmap, &mut self.clips, self.scale, at, color);
+        pintar_glifos(b, &mut self.fonts, &mut self.swash, &mut self.pixmap, &mut self.clips, self.scale, at, color, self.opacidade);
+    }
+
+    /// Um `Buffer` montado por `montar(fontes, escala)` e guardado pela `chave` (que já conta
+    /// o conteúdo e a largura; a escala entra aqui).
+    pub(crate) fn proprio(&mut self, chave: u64, montar: impl FnOnce(&mut FontSystem, f32) -> Buffer) -> &Buffer {
+        self.proprios.aparar(self.proprios.len() > 2000);
+        let (fonts, s) = (&mut self.fonts, self.scale);
+        self.proprios.pegar(chave ^ s.to_bits() as u64, || montar(fonts, s))
+    }
+
+    /// Desenha o buffer guardado com [`Renderer::proprio`] (montado antes neste quadro).
+    pub(crate) fn draw_proprio(&mut self, chave: u64, at: Point, color: Color, area: Rect) {
+        let mut k = Chave::new(8);
+        k.h(chave).f(at.x).f(at.y).c(color);
+        if self.gravou(area, k) {
+            return;
+        }
+        let at = Point::new(at.x - self.origem.x, at.y - self.origem.y);
+        let color = self.esmaecer(color);
+        let Some(b) = self.proprios.get(&(chave ^ self.scale.to_bits() as u64)) else { return };
+        pintar_glifos(b, &mut self.fonts, &mut self.swash, &mut self.pixmap, &mut self.clips, self.scale, at, color, self.opacidade);
+    }
+
+    /// Põe no banco as fontes de [`load_font`] que ainda não estão; com fonte nova, os textos
+    /// medidos com a antiga (que caiu numa substituta) saem do cache.
+    fn carregar_fontes(&mut self) {
+        let extra = FONTES_EXTRA.lock().unwrap_or_else(|e| e.into_inner());
+        if extra.len() == self.fontes_carregadas {
+            return;
+        }
+        for f in &extra[self.fontes_carregadas..] {
+            self.fonts.db_mut().load_font_source(cosmic_text::fontdb::Source::Binary(f.clone()));
+        }
+        self.fontes_carregadas = extra.len();
+        self.texts.clear();
+        self.proprios.clear();
     }
 
     /// As fontes, para quem monta o próprio `Buffer` (o editor de texto).
@@ -565,12 +687,13 @@ impl Renderer {
         }
         let at = Point::new(at.x - self.origem.x, at.y - self.origem.y);
         let color = self.esmaecer(color);
-        pintar_glifos(b, &mut self.fonts, &mut self.swash, &mut self.pixmap, &mut self.clips, self.scale, at, color);
+        pintar_glifos(b, &mut self.fonts, &mut self.swash, &mut self.pixmap, &mut self.clips, self.scale, at, color, self.opacidade);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn pintar_glifos(b: &Buffer, fonts: &mut FontSystem, swash: &mut SwashCache, pixmap: &mut Pixmap, clips: &mut [Clip], s: f32, at: Point, color: Color) {
+/// `color` já vem esmaecida; `opac` esmaece os glifos de cor própria (`color_opt`).
+fn pintar_glifos(b: &Buffer, fonts: &mut FontSystem, swash: &mut SwashCache, pixmap: &mut Pixmap, clips: &mut [Clip], s: f32, at: Point, color: Color, opac: f32) {
     let (ox, oy) = ((at.x * s).round() as i32, (at.y * s).round() as i32);
     let clip = clips.last().map(|c| c.rect);
     let cor = cosmic_text::Color::rgba((color.r * 255.0) as u8, (color.g * 255.0) as u8, (color.b * 255.0) as u8, (color.a * 255.0) as u8);
@@ -583,8 +706,8 @@ fn pintar_glifos(b: &Buffer, fonts: &mut FontSystem, swash: &mut SwashCache, pix
     let precisa = clips.last().is_some_and(|c| c.rounded);
     let mask = if precisa { clip_mask(clips, pw, ph, s, None).map(|m| m.data()) } else { None };
     let px = pixmap.pixels_mut();
-    // O laço do `Buffer::draw`, mas pulando glifos de cor transparente (o swash ignora o alfa
-    // da cor; o Markdown esconde sinais assim) e linhas fora do recorte.
+    // O laço do `Buffer::draw`, mas pulando glifos de cor transparente (o Markdown esconde
+    // sinais assim) e linhas fora do recorte.
     for run in b.layout_runs() {
         let topo = oy + run.line_top as i32;
         if topo > cy1 || topo + run.line_height.ceil() as i32 + 1 < cy0 {
@@ -592,12 +715,14 @@ fn pintar_glifos(b: &Buffer, fonts: &mut FontSystem, swash: &mut SwashCache, pix
         }
         for g in run.glyphs {
             let cor_g = g.color_opt.unwrap_or(cor);
-            if cor_g.a() == 0 {
+            // O swash devolve só a cobertura no alfa: o alfa da cor (e a opacidade) entra aqui.
+            let fator = if g.color_opt.is_some() { (cor_g.a() as f32 * opac).round() as u32 } else { cor_g.a() as u32 };
+            if fator == 0 {
                 continue;
             }
             let fis = g.physical((0., 0.), 1.0);
             swash.with_pixels(fonts, fis.cache_key, cor_g, |x, y, c| {
-                let a = c.a() as u32;
+                let a = c.a() as u32 * fator / 255;
                 let (xx, yy) = (ox + fis.x + x, oy + run.line_y as i32 + fis.y + y);
                 if a == 0 || xx < cx0.max(0) || xx >= cx1.min(w) || yy < cy0.max(0) || yy >= cy1.min(h) {
                     return;
@@ -665,7 +790,7 @@ impl Renderer {
                     }
                 }
             };
-            self.fill_path(&path, &p);
+            self.preencher_caminho(&path, &p);
         }
         if border.width > 0.0 && border.color.a > 0.0 {
             // A borda fica do lado de dentro: o anel entre o contorno e o contorno encolhido.
@@ -728,7 +853,7 @@ impl Renderer {
         false
     }
 
-    fn fill_path(&mut self, p: &tiny_skia::Path, paint: &Paint) {
+    fn preencher_caminho(&mut self, p: &tiny_skia::Path, paint: &Paint) {
         let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
         let mask = clip_mask(&mut self.clips, pw, ph, self.scale, Some(p.bounds()));
         self.pixmap.fill_path(p, paint, FillRule::Winding, Transform::identity(), mask);
@@ -751,9 +876,7 @@ impl Renderer {
         let (w, h) = (bw + 2.0 * m, bh + 2.0 * m);
         let cor = skia_color(sh.color).to_color_u8();
         let key = ShadowKey { w: w as u32, h: h as u32, radius: radius.map(|v| (v * s) as u32), blur: m as u32, color: [cor.red(), cor.green(), cor.blue(), cor.alpha()] };
-        if self.shadows.len() > 256 || self.shadows.bytes() > 64 << 20 {
-            self.shadows.clear();
-        }
+        self.shadows.aparar(self.shadows.len() > 256 || self.shadows.bytes() > 64 << 20);
         let pm = self.shadows.pegar(key, || {
             let mut pm = Pixmap::new(w as u32, h as u32).expect("w, h >= 1");
             let caixa = Rect { x: m / s, y: m / s, width: bw / s, height: bh / s };
@@ -789,25 +912,68 @@ impl Renderer {
 
     /// Imagem esticada em `r`, já recortada pelos cantos `radius`.
     pub fn draw_image(&mut self, img: &Image, r: Rect, radius: [f32; 4]) {
+        // shortcut: transformada, a imagem perde os cantos arredondados; recortar quando um slide pedir.
+        if !self.transformacoes.last().is_none_or(|t| t.is_identity()) {
+            return self.imagem_transformada(img, r, FilterQuality::Bilinear);
+        }
         let mut k = Chave::new(3);
         k.h(img.1).r(r).h(radius.map(f32::to_bits));
         if self.gravou(r, k) {
             return;
         }
+        let tela = r;
         let r = self.local(r);
         let s = self.scale;
         let (x, y, w, h) = ((r.x * s).round() as i32, (r.y * s).round() as i32, (r.width * s).round() as u32, (r.height * s).round() as u32);
         if w == 0 || h == 0 {
             return;
         }
-        if self.imagens.len() > 32 || self.imagens.bytes() > 32 << 20 {
-            self.imagens.clear();
+        if w as u64 * h as u64 > 1 << 24 {
+            // Esticada além de 4096² (zoom): o tiny-skia pinta só a parte à mostra, sem cópia.
+            let cantos = radius.iter().any(|v| *v > 0.0);
+            if cantos {
+                self.push_clip(tela, radius);
+            }
+            self.imagem_transformada(img, tela, FilterQuality::Bilinear);
+            if cantos {
+                self.pop_clip();
+            }
+            return;
         }
-        let pm = self.imagens.pegar((img.1, w, h), || escalar(&img.0, w, h, None));
+        self.imagens.aparar(self.imagens.len() > 32 || self.imagens.bytes() > 32 << 20);
+        let pm: &Pixmap = if (w, h) == (img.0.width(), img.0.height()) { &img.0 } else { self.imagens.pegar((img.1, w, h), || escalar(&img.0, w, h, None)) };
         let forma = tiny_skia::Rect::from_xywh(x as f32, y as f32, w as f32, h as f32).map(|f| (f, radius.map(|v| v * s)));
         let (tam, amostra) = de(pm, None);
         let alfa = (self.opacidade * 255.0).round() as u32;
         compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, forma, false, false, self.parcial.is_none(), alfa, amostra);
+    }
+
+    /// Imagem sem suavizar: cada pixel dela vira um bloco (página de PDF 1:1, pixel art, zoom).
+    pub fn draw_image_nearest(&mut self, img: &Image, r: Rect) {
+        self.imagem_transformada(img, r, FilterQuality::Nearest);
+    }
+
+    /// A imagem esticada em `r` pela transformação inteira (a do usuário, a escala, a camada).
+    fn imagem_transformada(&mut self, img: &Image, r: Rect, filtro: FilterQuality) {
+        if self.gravando {
+            let mut k = Chave::new(12);
+            k.h(img.1).r(r).h(matches!(filtro, FilterQuality::Nearest));
+            let t = self.transformacoes.last().copied().unwrap_or_default();
+            let tt = t.0;
+            k.f(tt.sx).f(tt.ky).f(tt.kx).f(tt.sy).f(tt.tx).f(tt.ty);
+            let area = vetor::Path::rect(r).and_then(|p| p.transform(t)).map_or(r, |p| p.bounds());
+            self.gravou(area, k);
+            return;
+        }
+        let (iw, ih) = (img.0.width() as f32, img.0.height() as f32);
+        let s = self.scale;
+        let usuario = self.transformacoes.last().copied().unwrap_or_default().0;
+        let t = Transform::from_row(r.width / iw, 0.0, 0.0, r.height / ih, r.x, r.y).post_concat(usuario).post_translate(-self.origem.x, -self.origem.y).post_scale(s, s);
+        let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
+        let caixa = tiny_skia::Rect::from_xywh(0.0, 0.0, iw, ih).and_then(|c| c.transform(t));
+        let mask = clip_mask(&mut self.clips, pw, ph, s, caixa);
+        let pp = PixmapPaint { opacity: self.opacidade, quality: filtro, ..Default::default() };
+        self.pixmap.draw_pixmap(0, 0, img.0.as_ref().as_ref(), &pp, t, mask);
     }
 
     /// SVG em `r`; com `color`, troca a cor de tudo mantendo o alfa (ícones de um traço só).
@@ -824,14 +990,11 @@ impl Renderer {
             return;
         }
         let cor = color.map(|c| skia_color(c).to_color_u8()).map(|c| [c.red(), c.green(), c.blue(), c.alpha()]);
-        let key = SvgKey { tree: svg.1, w, h, color: cor };
-        if self.svgs.len() > 512 {
-            self.svgs.clear();
-        }
-        let pm = self.svgs.pegar(key, || {
-            let mut pm = Pixmap::new(w, h).expect("tamanho > 0");
-            let t = svg.0.size();
-            resvg::render(&svg.0, Transform::from_scale(w as f32 / t.width(), h as f32 / t.height()), &mut pm.as_mut());
+        let t = svg.0.size();
+        let escala = Transform::from_scale(w as f32 / t.width(), h as f32 / t.height());
+        let rasterizar = |pw: u32, ph: u32, t: Transform| {
+            let mut pm = Pixmap::new(pw, ph)?;
+            resvg::render(&svg.0, t, &mut pm.as_mut());
             if let Some([cr, cg, cb, ca]) = cor {
                 for p in pm.pixels_mut() {
                     let a = p.alpha() as u32 * ca as u32 / 255;
@@ -839,9 +1002,27 @@ impl Renderer {
                     *p = tiny_skia::PremultipliedColorU8::from_rgba(pre(cr), pre(cg), pre(cb), a as u8).expect("pré-multiplicado");
                 }
             }
-            pm
-        });
+            Some(pm)
+        };
         let (x, y) = ((r.x * s).round() as i32, (r.y * s).round() as i32);
+        let parte;
+        let (pm, x, y) = if w as u64 * h as u64 <= 1 << 22 {
+            let key = SvgKey { tree: svg.1, w, h, color: cor };
+            self.svgs.aparar(self.svgs.len() > 512 || self.svgs.bytes() > 64 << 20);
+            (&*self.svgs.pegar(key, || rasterizar(w, h, escala).expect("tamanho > 0")), x, y)
+        } else {
+            // Maior que 2048² (zoom): só a parte que cai no pixmap, sem cache.
+            let (x0, y0) = (x.max(0), y.max(0));
+            let x1 = (x as i64 + w as i64).min(self.pixmap.width() as i64) as i32;
+            let y1 = (y as i64 + h as i64).min(self.pixmap.height() as i64) as i32;
+            if x1 <= x0 || y1 <= y0 {
+                return;
+            }
+            let Some(p) = rasterizar((x1 - x0) as u32, (y1 - y0) as u32, escala.post_translate((x - x0) as f32, (y - y0) as f32)) else { return };
+            parte = p;
+            (&parte, x0, y0)
+        };
+        let (w, h) = (pm.width(), pm.height());
         let area = tiny_skia::Rect::from_xywh(x as f32, y as f32, w as f32, h as f32);
         let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
         let mask = clip_mask(&mut self.clips, pw, ph, s, area);
@@ -939,6 +1120,18 @@ impl Renderer {
     pub fn pop_clip(&mut self) {
         self.clips.pop();
     }
+
+    /// `r` (lógico, com `folga` em volta para sombras) cai todo fora do recorte atual: quem
+    /// desenha pode pular. Com camada ou transformação aberta, nunca (a área não bate).
+    pub fn clipped_out(&self, r: Rect, folga: f32) -> bool {
+        if !self.camadas.is_empty() || !self.transformacoes.is_empty() {
+            return false;
+        }
+        let Some(c) = self.clips.last() else { return false };
+        let r = self.local(r);
+        let c = c.rect;
+        r.x - folga >= c.x + c.width || r.y - folga >= c.y + c.height || r.x + r.width + folga <= c.x || r.y + r.height + folga <= c.y
+    }
 }
 
 impl Default for Renderer {
@@ -953,11 +1146,13 @@ impl Default for Renderer {
 struct Cache<K, V> {
     mapa: HashMap<K, (V, u64)>,
     geracao: u64,
+    /// Quantos sobraram na última virada.
+    vivos: usize,
 }
 
 impl<K, V> Default for Cache<K, V> {
     fn default() -> Self {
-        Cache { mapa: HashMap::new(), geracao: 0 }
+        Cache { mapa: HashMap::new(), geracao: 0, vivos: 0 }
     }
 }
 
@@ -981,6 +1176,14 @@ impl<K: Hash + Eq, V> Cache<K, V> {
         let g = self.geracao;
         self.mapa.retain(|_, e| e.1 == g);
         self.geracao += 1;
+        self.vivos = self.mapa.len();
+    }
+    /// `cheio`: vira no meio do quadro (os quadros parciais não viram no `begin`). Só de novo
+    /// quando dobrar: o que o quadro está usando fica, mesmo passando do limite.
+    fn aparar(&mut self, cheio: bool) {
+        if cheio && self.mapa.len() > 2 * self.vivos {
+            self.virar();
+        }
     }
 }
 
@@ -1340,7 +1543,13 @@ fn comparar(velho: &[(Rect, u64)], novo: &[(Rect, u64)], vidros: &[(Rect, f32)])
     Changes::Regions(sujos)
 }
 
-fn crescer(r: Rect, m: f32) -> Rect {
+/// Quanto as letras passam da caixa medida: com a linha baixa (`lh` < 1,4), acentos e
+/// pernas saem por cima e por baixo.
+pub(crate) fn sobra_glifos(size: f32, lh: f32) -> f32 {
+    size * ((1.4 - lh).max(0.0) / 2.0 + 0.1)
+}
+
+pub(crate) fn crescer(r: Rect, m: f32) -> Rect {
     Rect { x: r.x - m, y: r.y - m, width: r.width + 2.0 * m, height: r.height + 2.0 * m }
 }
 
@@ -1359,6 +1568,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn corte_so_fora_do_recorte_e_sem_transformacao() {
+        let mut r = Renderer::new();
+        r.begin(Size::new(200.0, 200.0), 1.0, Color::BLACK);
+        let longe = Rect::new(Point::new(0.0, 500.0), Size::new(50.0, 50.0));
+        assert!(!r.clipped_out(longe, 0.0), "sem recorte nada é cortado");
+        r.push_clip(Rect::new(Point::ORIGIN, Size::new(200.0, 200.0)), [0.0; 4]);
+        assert!(r.clipped_out(longe, 48.0));
+        assert!(!r.clipped_out(Rect::new(Point::new(0.0, 230.0), Size::new(50.0, 50.0)), 48.0), "a folga guarda a sombra");
+        r.push_transform(vetor::Transform::rotate(90.0));
+        assert!(!r.clipped_out(longe, 0.0));
+        r.pop_transform();
+        r.pop_clip();
+    }
+
+    #[test]
     fn resize_nao_acumula_cache() {
         // Foto esticada na janela, caixa com sombra e texto: cada largura gera cópias novas.
         let img = Image::from_rgba(64, 64, vec![200; 64 * 64 * 4]).expect("tamanho confere");
@@ -1375,5 +1599,25 @@ mod tests {
         assert!(r.imagens.len() <= 2, "{} imagens", r.imagens.len());
         assert!(r.texts.len() <= 2, "{} textos", r.texts.len());
         assert!(r.shadows.len() <= 2, "{} sombras", r.shadows.len());
+    }
+
+    #[test]
+    fn cache_cheio_no_meio_do_quadro_guarda_o_que_esta_em_uso() {
+        let mut r = Renderer::new();
+        r.begin(Size::new(100.0, 100.0), 1.0, Color::BLACK);
+        for i in 0..4100 {
+            r.measure(&format!("t{i}"), 12.0, Font::DEFAULT, None);
+        }
+        assert!(r.texts.len() > 4000, "{} textos: o quadro usa todos", r.texts.len());
+        // Só quadros parciais (nenhum `begin`): SVGs de 4 MB cada não passam muito do limite.
+        let svg = Svg::from_bytes(br##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="#fff"/></svg>"##).unwrap();
+        let tela = Size::new(1000.0, 1000.0);
+        r.begin(tela, 1.0, Color::BLACK);
+        for i in 0..45 {
+            assert!(r.begin_parcial(tela, 1.0, Color::BLACK, Rect::new(Point::ORIGIN, tela)));
+            r.draw_svg(&svg, Rect { x: 0.0, y: 0.0, width: 1000.0 - i as f32, height: 1000.0 }, None);
+            r.end();
+        }
+        assert!(r.svgs.bytes() < 150_000_000, "{} bytes de SVG", r.svgs.bytes());
     }
 }

@@ -4,7 +4,7 @@ version = "0.1.5"
 description = "Biblioteca de interface da suíte FeatherWorks: widgets, layout e janela próprios, sem Iced"
 authors = ["FeatherWorks"]
 edition = "2021"
-license = "GPL-3.0-only"
+license = "MIT"
 repository = "https://github.com/feather-works/pelicano"
 publish = false
 
@@ -20,14 +20,22 @@ wgpu = "0.19"
 futures = "0.3"
 # Ctrl+C / Ctrl+V: a área de transferência do sistema (no Wayland, pela conexão da janela).
 window_clipboard = "0.4"
+# Tema claro/escuro do sistema (`system_dark`), o mesmo detector do Iced.
+dark-light = "1"
 accesskit = "0.25"
 accesskit_winit = "0.34"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+# O markdown das respostas (o widget `markdown`).
+pulldown-cmark = { version = "0.13", default-features = false }
 # Cores de código no editor: as gramáticas e temas do Sublime. Pesa uns MB, por isso é opcional.
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"], optional = true }
 
+# O terminal: o motor do Alacritty e o PTY.
+alacritty_terminal = { version = "0.25", optional = true }
+
 [features]
 highlighter = ["dep:syntect"]
+terminal = ["dep:alacritty_terminal"]
 
 # O desenho é todo na CPU: sem otimizar, o tiny-skia e o texto levam centenas de ms por quadro.
 # Os apps que usarem o pelicano precisam destas mesmas linhas no Cargo.toml deles.
@@ -40,3 +48,19 @@ opt-level = 3
 # Só os exemplos: o launcher lê o fundo em JPEG pelo mesmo crate.
 [dev-dependencies]
 image = { version = "0.24", default-features = false, features = ["jpeg"] }
+
+[[example]]
+name = "terminal"
+required-features = ["terminal"]
+
+[[example]]
+name = "explorer"
+required-features = ["terminal"]
+
+[[example]]
+name = "vitrine"
+required-features = ["terminal", "highlighter"]
+
+[[example]]
+name = "caderno"
+path = "examples/caderno/main.rs"
