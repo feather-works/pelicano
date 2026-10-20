@@ -6,8 +6,11 @@ use crate::{Changes, Color, Event, Modifiers, Point, Renderer, ResizeDirection, 
 use futures::future::{AbortHandle, Abortable, BoxFuture};
 use futures::stream::BoxStream;
 use futures::{FutureExt, Stream, StreamExt};
+use std::collections::HashMap;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
@@ -19,6 +22,11 @@ pub trait App: Sized + 'static {
     type Msg: Clone + Send + 'static;
     fn update(&mut self, msg: Self::Msg) -> Task<Self::Msg>;
     fn view(&self) -> Element<'_, Self::Msg>;
+    /// O trabalho que dura enquanto o estado pedir (processo, conexão, relógio). Chamado depois
+    /// de cada `update`; veja [`Subscription`].
+    fn subscription(&self) -> Subscription<Self::Msg> {
+        Subscription::none()
+    }
     fn theme(&self) -> Theme {
         Theme::dark()
     }
@@ -218,6 +226,55 @@ impl<M> From<accesskit_winit::Event> for Evento<M> {
     }
 }
 
+/// Fluxos com identidade (o `Subscription` do Iced). Cada um roda enquanto o
+/// [`App::subscription`] devolver o mesmo id: quando o id some, o fluxo é derrubado, e o que
+/// ele segura cai junto (um processo com `kill_on_drop`, uma conexão); outro id começa outro.
+/// Tudo roda no tokio: `tokio::process`, `tokio::time` e cia. funcionam dentro dele.
+pub struct Subscription<M>(Vec<(u64, BoxStream<'static, M>)>);
+
+impl<M: Send + 'static> Subscription<M> {
+    pub fn none() -> Self {
+        Subscription(Vec::new())
+    }
+    /// `stream` só é usado na primeira vez que o id aparece; nas outras ele é descartado sem rodar.
+    pub fn run_with_id(id: impl Hash, stream: impl Stream<Item = M> + Send + 'static) -> Self {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        id.hash(&mut h);
+        Subscription(vec![(h.finish(), stream.boxed())])
+    }
+    pub fn batch(subs: impl IntoIterator<Item = Subscription<M>>) -> Self {
+        Subscription(subs.into_iter().flat_map(|s| s.0).collect())
+    }
+    /// Converte as mensagens. O id passa a contar também o tipo de `f`: o mesmo relógio
+    /// mapeado para duas mensagens diferentes vira dois.
+    pub fn map<N: Send + 'static, F: Fn(M) -> N + Send + Sync + 'static>(self, f: F) -> Subscription<N> {
+        let f = Arc::new(f);
+        Subscription(
+            self.0
+                .into_iter()
+                .map(|(id, s)| {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (id, std::any::TypeId::of::<F>()).hash(&mut h);
+                    let f = f.clone();
+                    (h.finish(), s.map(move |m| f(m)).boxed())
+                })
+                .collect(),
+        )
+    }
+}
+
+impl Subscription<Instant> {
+    /// A hora, a cada `intervalo` (o `time::every` do Iced).
+    pub fn every(intervalo: Duration) -> Self {
+        let primeiro = tokio::time::Instant::now() + intervalo;
+        let s = futures::stream::unfold(primeiro, move |quando| async move {
+            tokio::time::sleep_until(quando).await;
+            Some((Instant::now(), quando + intervalo))
+        });
+        Subscription::run_with_id(("pelicano::every", intervalo), s)
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     EventLoop(winit::error::EventLoopError),
@@ -250,15 +307,20 @@ pub fn run<A: App>(settings: Settings, init: impl FnOnce() -> (A, Task<A::Msg>))
         Some(el) => el,
         None => EventLoop::<Evento<A::Msg>>::with_user_event().build().map_err(Error::EventLoop)?,
     };
-    let pool = futures::executor::ThreadPool::new().map_err(|e| Error::Window(e.to_string()))?;
+    let tokio = tokio::runtime::Builder::new_multi_thread().thread_name("pelicano").enable_all().build().map_err(|e| Error::Window(e.to_string()))?;
     let (app, task) = init();
-    let mut rt = Runtime { app, settings, proxy: event_loop.create_proxy(), pool, clipboard: Box::new(widget::MemoryClipboard::default()), janelas: Vec::new(), gpu: None, renderer: Renderer::new(), modifiers: Modifiers::empty(), abrir: Vec::new(), pendentes: Vec::new(), erro: None, sair: false, iniciou: false, inspecionar: false, intervalo: None };
+    let mut rt = Runtime { app, settings, proxy: event_loop.create_proxy(), tokio: tokio.handle().clone(), assinaturas: HashMap::new(), clipboard: Box::new(widget::MemoryClipboard::default()), janelas: Vec::new(), gpu: None, renderer: Renderer::new(), modifiers: Modifiers::empty(), abrir: Vec::new(), pendentes: Vec::new(), erro: None, sair: false, iniciou: false, inspecionar: false, intervalo: None };
     if std::env::var_os("PELICANO_DEBUG").is_some_and(|v| v != "0") {
         rt.settings.debug = true;
         rt.inspecionar = true;
     }
     rt.run_task(task);
-    event_loop.run_app(&mut rt).map_err(Error::EventLoop)?;
+    rt.assinar();
+    let fim = event_loop.run_app(&mut rt);
+    rt.parar_assinaturas();
+    // Não espera tarefa nenhuma acabar: a janela já fechou.
+    tokio.shutdown_background();
+    fim.map_err(Error::EventLoop)?;
     rt.erro.map_or(Ok(()), Err)
 }
 
@@ -267,7 +329,9 @@ struct Runtime<A: App> {
     /// As da janela principal (o `debug` vale para todas).
     settings: Settings,
     proxy: EventLoopProxy<Evento<A::Msg>>,
-    pool: futures::executor::ThreadPool,
+    tokio: tokio::runtime::Handle,
+    /// As assinaturas rodando, pelo id ([`Subscription`]).
+    assinaturas: HashMap<u64, tokio::task::AbortHandle>,
     /// A do sistema, ligada quando a primeira janela abre (antes disso, na memória).
     clipboard: Box<dyn widget::Clipboard>,
     janelas: Vec<Janela>,
@@ -320,16 +384,10 @@ impl<A: App> Runtime<A> {
         for a in t.0 {
             let proxy = self.proxy.clone();
             match a {
-                Action::Future(f) => self.pool.spawn_ok(async move {
+                Action::Future(f) => drop(self.tokio.spawn(async move {
                     let _ = proxy.send_event(Evento::App(f.await));
-                }),
-                Action::Stream(mut s) => self.pool.spawn_ok(async move {
-                    while let Some(m) = s.next().await {
-                        if proxy.send_event(Evento::App(m)).is_err() {
-                            break;
-                        }
-                    }
-                }),
+                })),
+                Action::Stream(s) => drop(self.espalhar(s)),
                 Action::Window(id, c) => self.window_cmd(id, c),
                 Action::Open(id, s) => {
                     if !self.janelas.iter().any(|j| j.id == id) && !self.abrir.iter().any(|(i, _)| *i == id) {
@@ -381,10 +439,49 @@ impl<A: App> Runtime<A> {
         self.janelas.remove(i);
     }
 
+    /// Roda o fluxo no tokio, mandando cada item para o laço como mensagem.
+    fn espalhar(&self, mut s: BoxStream<'static, A::Msg>) -> tokio::task::AbortHandle {
+        let proxy = self.proxy.clone();
+        self.tokio
+            .spawn(async move {
+                while let Some(m) = s.next().await {
+                    if proxy.send_event(Evento::App(m)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .abort_handle()
+    }
+
+    /// Começa as assinaturas novas e derruba as que o app não pediu de novo.
+    fn assinar(&mut self) {
+        let mut vivas = HashMap::new();
+        for (id, s) in self.app.subscription().0 {
+            if vivas.contains_key(&id) {
+                continue;
+            }
+            let h = self.assinaturas.remove(&id).unwrap_or_else(|| self.espalhar(s));
+            vivas.insert(id, h);
+        }
+        self.parar_assinaturas();
+        self.assinaturas = vivas;
+    }
+
+    fn parar_assinaturas(&mut self) {
+        for (_, h) in self.assinaturas.drain() {
+            h.abort();
+        }
+    }
+
     fn update(&mut self, msgs: Vec<A::Msg>) {
+        let mudou = !msgs.is_empty();
         for m in msgs {
             let t = self.app.update(m);
             self.run_task(t);
+        }
+        // Só mensagem muda o estado: o mouse andando não pergunta de novo.
+        if mudou {
+            self.assinar();
         }
         // O estado é um só: toda janela pode ter mudado (as que não mudaram gravam e não pintam nada).
         for j in &self.janelas {
@@ -1034,5 +1131,26 @@ mod tests {
         let (c, px_b) = passo(&mut qb, &b);
         assert_eq!(c, Changes::None);
         assert_ne!(px_a, px_b);
+    }
+}
+
+#[cfg(test)]
+mod testes {
+    use super::*;
+
+    #[test]
+    fn assinatura_tem_identidade_e_o_relogio_bate() {
+        let id = |s: Subscription<Instant>| s.0[0].0;
+        let ms = Duration::from_millis(5);
+        assert_eq!(id(Subscription::every(ms)), id(Subscription::every(ms)), "mesmo pedido, mesma assinatura");
+        assert_ne!(id(Subscription::every(ms)), id(Subscription::every(ms * 2)));
+        let a = Subscription::every(ms).map(|_| 1u8).0[0].0;
+        let b = Subscription::every(ms).map(|_| 2u8).0[0].0;
+        assert_ne!(a, b, "mapeado para mensagens diferentes, são duas");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let t0 = Instant::now();
+        let n = rt.block_on(Subscription::every(ms).0.remove(0).1.take(3).count());
+        assert_eq!(n, 3);
+        assert!(t0.elapsed() >= ms * 3);
     }
 }

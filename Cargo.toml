@@ -17,11 +17,17 @@ cosmic-text = "0.12"
 resvg = "0.42"
 # Só apresenta o quadro pronto: é o que dá janela transparente (cantos arredondados) no Wayland.
 wgpu = "0.19"
-futures = { version = "0.3", features = ["thread-pool"] }
+futures = "0.3"
 # Ctrl+C / Ctrl+V: a área de transferência do sistema (no Wayland, pela conexão da janela).
 window_clipboard = "0.4"
 accesskit = "0.25"
 accesskit_winit = "0.34"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+# Cores de código no editor: as gramáticas e temas do Sublime. Pesa uns MB, por isso é opcional.
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"], optional = true }
+
+[features]
+highlighter = ["dep:syntect"]
 
 # O desenho é todo na CPU: sem otimizar, o tiny-skia e o texto levam centenas de ms por quadro.
 # Os apps que usarem o pelicano precisam destas mesmas linhas no Cargo.toml deles.

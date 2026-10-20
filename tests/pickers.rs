@@ -135,7 +135,7 @@ fn radio_abas_e_numero() {
     let el: Element<f64> = number_input(10.0, 0.0..=10.0, 2.0, |v| v);
     let linha = &h.node(&el).children[0];
     let mais = linha.children[2].rect;
-    assert_eq!(h.click(&el, Point::new(mais.x + 5.0, mais.y + 5.0)), vec![], "no máximo o + desabilita");
+    assert_eq!(h.click(&el, Point::new(mais.x + 5.0, mais.y + 5.0)), Vec::<f64>::new(), "no máximo o + desabilita");
 }
 
 #[test]

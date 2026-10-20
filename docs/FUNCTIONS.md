@@ -28,6 +28,7 @@ Convenções que valem para tudo:
 | `theme` | `fn theme(&self) -> Theme` | Opcional. Padrão: `Theme::dark()`. |
 | `on_event` | `fn on_event(&self, ev: &Event) -> Option<Self::Msg>` | Opcional. Vê todo evento da janela (atalhos, fechar, redimensionar). `Some(msg)` manda a mensagem. |
 | `view_window` | `fn view_window(&self, id: WindowId) -> Element<'_, Self::Msg>` | Opcional. O que aparece em cada janela aberta com `Task::open_window`. Padrão: `view()`. |
+| `subscription` | `fn subscription(&self) -> Subscription<Self::Msg>` | Opcional. O trabalho que dura enquanto o estado pedir (veja `Subscription`). Padrão: nenhum. |
 | `on_window_event` | `fn on_window_event(&self, id: WindowId, ev: &Event) -> Option<Self::Msg>` | Opcional. Os eventos de cada janela. Padrão: na principal chama `on_event`, nas outras nada. |
 
 ### Várias janelas
@@ -92,7 +93,7 @@ Variáveis de ambiente: `PELICANO_DEBUG=1` (inspetor ligado) e `PELICANO_DANO=1`
 
 ### `Task<M>`
 
-O trabalho que o `update` devolve. Futuros e fluxos rodam fora da thread da interface. Cada resultado volta como mensagem.
+O trabalho que o `update` devolve. Futuros e fluxos rodam no tokio, fora da thread da interface (`tokio::process`, `tokio::time` e cia. funcionam). Cada resultado volta como mensagem.
 
 | Função | Entrada | Saída / efeito |
 |---|---|---|
@@ -108,6 +109,28 @@ O trabalho que o `update` devolve. Futuros e fluxos rodam fora da thread da inte
 | `task.abortable()` | — | `(Task<M>, Handle)`. `handle.abort()` cancela (pausar download). |
 
 `pelicano::futures` é reexportado para criar canais e fluxos.
+
+### `Subscription<M>`
+
+Fluxos com identidade, pedidos pelo `App::subscription` (chamado de novo depois de cada `update`).
+Enquanto o mesmo id voltar, o fluxo segue rodando; quando o id some, ele é derrubado e o que segura
+cai junto (processo com `kill_on_drop`, conexão). Um id novo começa um fluxo novo.
+
+| Função | Entrada | Saída / efeito |
+|---|---|---|
+| `Subscription::none()` | — | Nada. |
+| `Subscription::run_with_id(id, stream)` | `impl Hash`, `Stream<Item = M>` | Roda `stream` enquanto `id` for pedido. Nas outras vezes o `stream` é descartado sem rodar. |
+| `Subscription::batch(subs)` | `IntoIterator<Item = Subscription<M>>` | Junta várias. |
+| `Subscription::every(intervalo)` | `Duration` | `Subscription<Instant>`: a hora, a cada intervalo. |
+| `sub.map(f)` | `Fn(M) -> N` | Converte as mensagens. |
+
+```rust
+fn subscription(&self) -> Subscription<Msg> {
+    let relogio = Subscription::every(Duration::from_secs(1)).map(|_| Msg::Tique);
+    let terminais = self.terminais.iter().map(|t| Subscription::run_with_id(t.id, t.saida()));
+    Subscription::batch(std::iter::once(relogio).chain(terminais))
+}
+```
 
 ### `WindowCmd`
 

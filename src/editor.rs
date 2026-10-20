@@ -21,8 +21,10 @@ struct Interno {
     refazer: Vec<Change>,
     /// A última mudança foi digitação: letras seguidas viram um passo só no desfazer.
     digitando: Option<std::time::Instant>,
-    /// (tamanho físico × 64, fonte, quebra) com que o buffer está montado.
-    config: Option<(u32, Font, bool)>,
+    /// (tamanho físico × 64, altura da linha × 64, fonte, quebra) com que o buffer está montado.
+    config: Option<(u32, u32, Font, bool)>,
+    #[cfg(feature = "highlighter")]
+    realce: crate::highlight::Realce,
 }
 
 impl Default for Content {
@@ -37,7 +39,7 @@ impl Content {
     }
 
     pub fn with_text(texto: &str) -> Self {
-        Content(RefCell::new(Interno { ed: None, inicial: texto.to_owned(), versao: 0, desfazer: Vec::new(), refazer: Vec::new(), digitando: None, config: None }))
+        Content(RefCell::new(Interno { ed: None, inicial: texto.to_owned(), versao: 0, desfazer: Vec::new(), refazer: Vec::new(), digitando: None, config: None, #[cfg(feature = "highlighter")] realce: Default::default() }))
     }
 
     /// O texto inteiro, com as quebras de linha que o arquivo tinha.
@@ -60,6 +62,35 @@ impl Content {
                 s
             }),
         }
+    }
+
+    /// O texto selecionado, se houver.
+    pub fn selection(&self) -> Option<String> {
+        self.0.borrow().ed.as_ref()?.copy_selection()
+    }
+
+    /// O texto da linha `linha` (contando de 1, como o [`Content::cursor`]), sem a quebra.
+    pub fn line(&self, linha: usize) -> Option<String> {
+        let i = self.0.borrow();
+        let k = linha.checked_sub(1)?;
+        match &i.ed {
+            None => i.inicial.lines().nth(k).map(str::to_owned),
+            Some(ed) => ed.with_buffer(|b| b.lines.get(k).map(|l| l.text().to_owned())),
+        }
+    }
+
+    /// Escreve `texto` no cursor, no lugar da seleção, num passo do desfazer.
+    pub fn insert(&self, texto: &str) {
+        let mut i = self.0.borrow_mut();
+        if i.ed.is_none() {
+            i.inicial.push_str(texto);
+            i.versao += 1;
+            return;
+        }
+        i.editar(false, |ed| {
+            ed.delete_selection();
+            ed.insert_string(texto, None);
+        });
     }
 
     /// Muda a cada edição (não com cursor ou rolagem).
@@ -336,9 +367,9 @@ impl Content {
 
 impl Interno {
     /// O editor montado com as fontes do renderer, na configuração pedida.
-    fn editor(&mut self, fonts: &mut FontSystem, tamanho: f32, escala: f32, fonte: Font, quebra: bool) -> &mut Editor<'static> {
-        let config = ((tamanho * escala * 64.0) as u32, fonte, quebra);
-        let metricas = Metrics::new(tamanho * escala, (tamanho * 1.45 * escala).ceil());
+    fn editor(&mut self, fonts: &mut FontSystem, tamanho: f32, altura: f32, escala: f32, fonte: Font, quebra: bool) -> &mut Editor<'static> {
+        let config = ((tamanho * escala * 64.0) as u32, (altura * escala * 64.0) as u32, fonte, quebra);
+        let metricas = Metrics::new(tamanho * escala, (altura * escala).ceil());
         let attrs = Attrs::new().weight(Weight(fonte.weight)).family(familia(fonte));
         let ed = self.ed.get_or_insert_with(|| {
             let mut b = Buffer::new(fonts, metricas);
@@ -348,7 +379,7 @@ impl Interno {
             Editor::new(b)
         });
         if self.config != Some(config) {
-            let outra_fonte = self.config.is_some_and(|(_, f, _)| f != fonte);
+            let outra_fonte = self.config.is_some_and(|(_, _, f, _)| f != fonte);
             let cursor = ed.cursor();
             ed.with_buffer_mut(|b| {
                 b.set_metrics(fonts, metricas);
@@ -634,12 +665,17 @@ pub struct TextEditor<'a, M> {
     autofocus: Option<u64>,
     invisibles: bool,
     markdown: bool,
+    line_height: Option<f32>,
+    placeholder: &'a str,
+    on_key: Option<Box<dyn Fn(&Key, crate::Modifiers) -> Option<M> + 'a>>,
+    #[cfg(feature = "highlighter")]
+    highlight: Option<(&'a str, crate::Highlight)>,
 }
 
 /// Editor de várias linhas sobre um [`Content`]. Edita o conteúdo direto e avisa com
 /// `on_change` (para o app marcar "não salvo").
 pub fn text_editor<'a, M>(content: &'a Content) -> TextEditor<'a, M> {
-    TextEditor { content, size: 15.0, font: Font::DEFAULT, wrap: true, line_numbers: false, padding: Padding::from(12.0), on_change: None, style: None, autofocus: None, invisibles: false, markdown: false }
+    TextEditor { content, size: 15.0, font: Font::DEFAULT, wrap: true, line_numbers: false, padding: Padding::from(12.0), on_change: None, style: None, autofocus: None, invisibles: false, markdown: false, line_height: None, placeholder: "", on_key: None, #[cfg(feature = "highlighter")] highlight: None }
 }
 
 impl<'a, M> TextEditor<'a, M> {
@@ -666,6 +702,31 @@ impl<'a, M> TextEditor<'a, M> {
     pub fn markdown(mut self, m: bool) -> Self {
         self.markdown = m;
         self
+    }
+    /// Altura de cada linha, em pixels lógicos. Padrão: 1,45 × o tamanho.
+    pub fn line_height(mut self, h: f32) -> Self {
+        self.line_height = Some(h);
+        self
+    }
+    /// O texto apagado que aparece com o editor vazio.
+    pub fn placeholder(mut self, p: &'a str) -> Self {
+        self.placeholder = p;
+        self
+    }
+    /// Vê cada tecla antes do editor (com foco). `Some(msg)` manda a mensagem e o editor não faz
+    /// nada com a tecla: Tab que recua, Enter que envia, atalhos do app.
+    pub fn on_key(mut self, f: impl Fn(&Key, crate::Modifiers) -> Option<M> + 'a) -> Self {
+        self.on_key = Some(Box::new(f));
+        self
+    }
+    /// Cores de código pela extensão do arquivo (`"rs"`, `"py"`, `"toml"`…). Desconhecida: sem cor.
+    #[cfg(feature = "highlighter")]
+    pub fn highlight(mut self, ext: &'a str, tema: crate::Highlight) -> Self {
+        self.highlight = Some((ext, tema));
+        self
+    }
+    fn altura(&self) -> f32 {
+        self.line_height.unwrap_or(self.size * 1.45)
     }
     pub fn line_numbers(mut self, n: bool) -> Self {
         self.line_numbers = n;
@@ -742,18 +803,30 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         let s = cx.renderer.scale();
         let mut i = self.content.0.borrow_mut();
         let versao = i.versao;
-        let ed = i.editor(cx.renderer.fonts(), self.size, s, self.font, self.wrap);
+        #[cfg(feature = "highlighter")]
+        let mut realce = std::mem::take(&mut i.realce);
+        let ed = i.editor(cx.renderer.fonts(), self.size, self.altura(), s, self.font, self.wrap);
         let fonts = cx.renderer.fonts();
+        let vazio = ed.with_buffer(|b| b.lines.len() == 1 && b.lines[0].text().is_empty());
         ed.with_buffer_mut(|b| {
             b.set_size(fonts, Some(area.width * s), Some(area.height * s));
             // Só as linhas à vista (e algumas a mais) ganham estilo; as outras quando aparecerem.
             let base = Attrs::new().weight(Weight(self.font.weight)).family(familia(self.font));
             let primeira = b.scroll().line;
-            let ultima = (primeira + (area.height / (self.size * 1.45)) as usize + 2).min(b.lines.len());
+            let ultima = (primeira + (area.height / self.altura()) as usize + 2).min(b.lines.len());
             let tons = Tons { sinal: cor_ct(cx.theme.muted), link: cor_ct(cx.theme.primary) };
             // Dentro de um bloco ``` ou não: conta as cercas desde o começo (só comparação de prefixo).
             let mut em_codigo = self.markdown && b.lines[..primeira].iter().filter(|l| l.text().trim_start().starts_with("```")).count() % 2 == 1;
             let metricas = b.metrics();
+            #[cfg(feature = "highlighter")]
+            if let Some((ext, tema)) = self.highlight.filter(|_| !self.markdown) {
+                let textos: Vec<&str> = b.lines[..ultima].iter().map(|l| l.text()).collect();
+                let cores = realce.cores(ext, tema, &textos, primeira, base);
+                for (linha, a) in b.lines[primeira..ultima].iter_mut().zip(cores) {
+                    linha.set_attrs_list(a);
+                }
+                return;
+            }
             for linha in &mut b.lines[primeira..ultima] {
                 // Os sinais ficam escondidos sempre (como no Bloco de Notas do Windows): formatar é pelos atalhos.
                 let estilos = if self.markdown { markdown(linha.text(), base, metricas, &tons, &mut em_codigo, true) } else { AttrsList::new(base) };
@@ -842,6 +915,8 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         let caret = focado.then(|| ed.cursor_position()).flatten().map(|(x, y)| Point::new(area.x + (x as f32 - rolagem.horizontal) / s, area.y + y as f32 / s));
         let mut chave = std::collections::hash_map::DefaultHasher::new();
         (versao, rolagem.line, rolagem.vertical.to_bits(), rolagem.horizontal.to_bits(), (area.width * s) as u32, (self.size * s * 64.0) as u32, self.wrap, self.invisibles, self.markdown).hash(&mut chave);
+        #[cfg(feature = "highlighter")]
+        self.highlight.hash(&mut chave);
 
         cx.renderer.push_clip(area, [0.0; 4]);
         let cor_selecao = cx.theme.primary.alpha(if focado { 0.30 } else { 0.18 });
@@ -850,6 +925,10 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         }
         let at = Point::new(area.x - rolagem.horizontal / s, area.y);
         ed.with_buffer(|b| cx.renderer.draw_buffer(b, at, cor, area, chave.finish()));
+        if vazio && !self.placeholder.is_empty() {
+            let desce = (altura_linha - cx.renderer.measure(self.placeholder, self.size, self.font, None).height) / 2.0;
+            cx.renderer.draw_text(self.placeholder, self.size, self.font, cx.theme.muted, Point::new(area.x, area.y + desce), Some(area.width));
+        }
         for &(r, tipo) in &enfeites {
             if tipo == CITACAO {
                 cx.renderer.fill_quad(Rect { x: r.x + 1.0, y: r.y + 2.0, width: 3.0, height: r.height - 4.0 }, Some(&cx.theme.primary.alpha(0.6).into()), Border::rounded(1.5), None);
@@ -887,6 +966,10 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             cx.renderer.fill_quad(Rect { x: p.x, y: p.y, width: 1.5, height: altura_linha }, Some(&cor.into()), Border::default(), None);
         }
         cx.renderer.pop_clip();
+        #[cfg(feature = "highlighter")]
+        {
+            i.realce = realce;
+        }
         drop(i);
 
         if self.line_numbers {
@@ -916,7 +999,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         let dentro = cx.cursor.is_some_and(|p| n.rect.contains(p));
         let mut i = self.content.0.borrow_mut();
         // O primeiro evento pode vir antes do primeiro desenho (testes): monta já.
-        i.editor(cx.renderer.fonts(), self.size, s, self.font, self.wrap);
+        i.editor(cx.renderer.fonts(), self.size, self.altura(), s, self.font, self.wrap);
         let antes = i.versao;
         let resultado = match ev {
             Event::MousePressed(MouseButton::Left) if dentro => {
@@ -974,6 +1057,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                 });
                 Captured::Yes
             }
+            Event::Key { key, modifiers, pressed: true, .. } if focado && self.on_key.as_ref().and_then(|f| f(key, *modifiers)).map(|m| cx.publish(m)).is_some() => Captured::Yes,
             Event::Key { key, text, modifiers, pressed: true } if focado => self.tecla(&mut i, key, text.as_deref(), *modifiers, cx),
             _ => Captured::No,
         };
@@ -1144,7 +1228,7 @@ mod testes {
         let c = Content::with_text(&texto);
         let mut i = c.0.borrow_mut();
         let montadas = |ed: &Editor<'static>| ed.with_buffer(|b| b.lines.iter().filter(|l| l.shape_opt().is_some()).count());
-        let ed = i.editor(&mut fonts, 15.0, 1.0, Font::DEFAULT, true);
+        let ed = i.editor(&mut fonts, 15.0, 15.0 * 1.45, 1.0, Font::DEFAULT, true);
         // O pico ao abrir: montar tudo e soltar depois deixa a memória presa no alocador.
         assert!(montadas(ed) < 100, "pôr o texto montou {}", montadas(ed));
         ed.with_buffer_mut(|b| b.set_size(&mut fonts, Some(600.0), Some(400.0)));
