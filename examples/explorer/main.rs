@@ -263,8 +263,9 @@ impl Explorer {
 
     fn detalhar(&mut self, e: Entrada) {
         let (previa, conteudo) = if e.pasta {
-            let (arqs, pastas, bytes, img) = sistema::resumo_pasta(&e.caminho);
-            (img.and_then(|p| sistema::carregar_imagem(&p)).map_or(Previa::Nada, Previa::Imagem), Some((arqs, pastas, bytes)))
+            // Pasta mostra só o ícone: abrir a primeira foto de dentro expunha fotos pessoais sem pedir.
+            let (arqs, pastas, bytes) = sistema::resumo_pasta(&e.caminho);
+            (Previa::Nada, Some((arqs, pastas, bytes)))
         } else if let Some(img) = sistema::carregar_imagem(&e.caminho) {
             (Previa::Imagem(img), None)
         } else {
@@ -851,7 +852,7 @@ fn main() -> Result<(), Error> {
             std::thread::sleep(Duration::from_millis(50));
             app.monitor.amostrar();
         }
-        if let Some(e) = app.entradas.iter().find(|e| e.pasta && e.nome.starts_with("Down")).cloned() {
+        if let Some(e) = app.entradas.iter().find(|e| e.pasta && e.nome.starts_with("Docu")).cloned() {
             app.detalhar(e);
         }
         app.grade = args.iter().any(|a| a == "--grade");
@@ -865,6 +866,26 @@ fn main() -> Result<(), Error> {
         let destino = args.get(i + 1).map_or("explorer.png", String::as_str);
         std::fs::write(destino, png).map_err(|e| Error::Window(e.to_string()))?;
         println!("{destino}");
+        return Ok(());
+    }
+    // `--medir [escala]`: o custo de cada quadro de redimensionar (view, layout, pintura), sem janela.
+    if let Some(i) = args.iter().position(|a| a == "--medir") {
+        let escala: f32 = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let app = Explorer::new(None);
+        let (tema, mut r, st) = (app.theme(), Renderer::new(), pelicano::States::default());
+        for passo in 0..30 {
+            let tam = Size::new(1140.0 + passo as f32 * 7.0, 760.0 + passo as f32 * 5.0);
+            let t0 = std::time::Instant::now();
+            let el = app.view();
+            let t_view = t0.elapsed();
+            let no = pelicano::layout(&el, tam, &mut r, &st, &tema);
+            let t_layout = t0.elapsed();
+            r.begin(tam, escala, tema.background);
+            pelicano::draw(&el, &no, &mut r, &st, &tema, None, false);
+            if passo % 10 == 9 {
+                eprintln!("{tam:?}: view {t_view:?} layout {t_layout:?} total {:?}", t0.elapsed());
+            }
+        }
         return Ok(());
     }
     let settings = Settings {

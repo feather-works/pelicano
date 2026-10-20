@@ -820,7 +820,9 @@ impl<A: App> Runtime<A> {
         let mut acesso = j.leitor.then(Access::default);
         let icon = widget::draw_access(&el, &node, &mut self.renderer, states, &theme, cursor, inspecionar, acesso.as_mut());
         let mudou = self.renderer.changes();
-        if std::env::var_os("PELICANO_DANO").is_some() { eprintln!("[dano] {mudou:?} view {t1:?} layout {t2:?} gravar {:?}", t0.elapsed()); }
+        let t3 = t0.elapsed();
+        let dano = std::env::var_os("PELICANO_DANO").is_some();
+        let tipo = dano.then(|| match &mudou { Changes::All => "tudo".to_string(), Changes::None => "nada".to_string(), Changes::Regions(r) => format!("{} regiões", r.len()) });
         let regioes = match mudou {
             _ if tudo => None,
             Changes::None => Some(Vec::new()),
@@ -855,9 +857,14 @@ impl<A: App> Runtime<A> {
         // Quadro perdido (superfície velha no meio do resize): pede outro, senão a janela
         // fica com o conteúdo antigo até o próximo evento.
         let nada = parcial && regioes.is_some_and(|r| r.is_empty());
+        let t4 = t0.elapsed();
         if !nada && self.gpu.as_ref().is_some_and(|g| !j.tela.present(g, &self.renderer.pixmap, self.renderer.changed_rows())) {
             j.tudo = true;
             w.request_redraw();
+        }
+        // Os tempos acumulados de cada etapa do quadro (para achar o gargalo).
+        if let Some(tipo) = tipo {
+            eprintln!("[quadro] {size:?} view {t1:.1?} layout {t2:.1?} gravar {t3:.1?} pintar {t4:.1?} tela {:.1?} {tipo}", t0.elapsed());
         }
         self.renderer.trocar(&mut j.quadro);
     }

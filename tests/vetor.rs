@@ -268,3 +268,24 @@ fn quina_do_traco_fica_dentro_da_area_gravada() {
     let Changes::Regions(rs) = r.changes() else { panic!("só o traço mudou") };
     assert!(rs.iter().any(|a| a.y <= topo as f32 && a.contains(Point::new(100.0, topo as f32 + 0.5))), "{rs:?} não cobre a ponta em y={topo}");
 }
+
+#[test]
+fn recorte_dentro_de_canto_arredondado_so_corta_perto_do_canto() {
+    use pelicano::{Border, Color, Rect, Renderer, Size};
+    let mut r = Renderer::new();
+    r.begin(Size::new(100.0, 100.0), 1.0, Color::BLACK);
+    let vermelho = |r: &mut Renderer, x: u32, y: u32| r.pixmap.pixel(x, y).is_some_and(|p| p.red() > 200);
+    r.push_clip(Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 }, [20.0; 4]);
+    // Encostada no canto: a curva de fora ainda corta.
+    r.push_clip(Rect { x: 0.0, y: 0.0, width: 50.0, height: 50.0 }, [0.0; 4]);
+    r.fill_quad(Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 }, Some(&Color::rgb8(255, 0, 0).into()), Border::default(), None);
+    r.pop_clip();
+    assert!(!vermelho(&mut r, 1, 1), "o canto arredondado de fora sumiu");
+    assert!(vermelho(&mut r, 25, 25));
+    assert!(!vermelho(&mut r, 60, 25), "vazou do recorte de dentro");
+    // Longe dos cantos: só o retângulo de dentro vale.
+    r.push_clip(Rect { x: 55.0, y: 55.0, width: 20.0, height: 20.0 }, [0.0; 4]);
+    r.fill_quad(Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 }, Some(&Color::rgb8(255, 0, 0).into()), Border::default(), None);
+    r.pop_clip();
+    assert!(vermelho(&mut r, 60, 60) && !vermelho(&mut r, 80, 60) && !vermelho(&mut r, 98, 98));
+}

@@ -145,14 +145,13 @@ pub fn primeiras_linhas(p: &Path, n: usize) -> Option<String> {
     Some(s.lines().take(n).map(|l| l.replace('\t', "    ")).collect::<Vec<_>>().join("\n"))
 }
 
-/// (arquivos, pastas, bytes dos arquivos de dentro, primeira imagem).
+/// (arquivos, pastas, bytes dos arquivos de dentro).
 // shortcut: o tamanho soma só o primeiro nível; percorrer tudo numa Task se precisar do total.
-pub fn resumo_pasta(p: &Path) -> (usize, usize, u64, Option<PathBuf>) {
+pub fn resumo_pasta(p: &Path) -> (usize, usize, u64) {
     let v = listar(p).unwrap_or_default();
     let pastas = v.iter().filter(|e| e.pasta).count();
     let bytes = v.iter().filter(|e| !e.pasta).map(|e| e.tamanho).sum();
-    let img = v.iter().find(|e| !e.pasta && matches!(extensao(&e.caminho).as_str(), "png" | "jpg" | "jpeg")).map(|e| e.caminho.clone());
-    (v.len() - pastas, pastas, bytes, img)
+    (v.len() - pastas, pastas, bytes)
 }
 
 fn ler(p: &str) -> String {

@@ -142,10 +142,21 @@ struct Clip {
     rect: Rect,
     own: Rect,
     radius: [f32; 4],
-    /// Algum recorte da pilha tem canto arredondado: aí só a máscara resolve.
+    /// Algum canto arredondado da pilha alcança este recorte: aí só a máscara resolve.
     rounded: bool,
+    /// Os quadrados dos cantos arredondados da pilha que tocam este recorte: um recorte de dentro
+    /// que não encoste em nenhum é só retângulo.
+    cantos: Vec<Canto>,
     /// Feita só quando um desenho pode sair do recorte; vale até o `pop_clip`.
     mask: Option<Mask>,
+}
+
+/// O quadrado de um canto arredondado e o centro do arco dele (lógicos).
+#[derive(Clone, Copy)]
+struct Canto {
+    quadrado: Rect,
+    centro: Point,
+    raio: f32,
 }
 
 /// A máscara do recorte atual, só se o desenho em `area` (pixels físicos) puder sair dele.
@@ -171,11 +182,27 @@ fn clip_mask(clips: &mut [Clip], w: u32, h: u32, s: f32, area: Option<tiny_skia:
             clips[n - 1].mask = Some(m);
             return clips[n - 1].mask.as_ref();
         }
-        m.data_mut().fill(255);
-        for c in clips.iter() {
-            match rounded_path(c.own, c.radius, s) {
-                Some(p) => m.intersect_path(&p, FillRule::Winding, true, Transform::identity()),
-                None => m.data_mut().fill(0),
+        // O retângulo cheio e, nos quadrados dos cantos, a cobertura do arco calculada pixel a
+        // pixel: rasterizar cada contorno na máscara inteira custava a tela toda por recorte.
+        let (x0, y0) = (((r.x * s).round().max(0.0) as usize).min(w as usize), ((r.y * s).round().max(0.0) as usize).min(h as usize));
+        let (x1, y1) = ((((r.x + r.width) * s).round().max(0.0) as usize).min(w as usize), (((r.y + r.height) * s).round().max(0.0) as usize).min(h as usize));
+        let largura = w as usize;
+        let dados = m.data_mut();
+        for y in y0..y1.max(y0) {
+            dados[y * largura + x0..y * largura + x1.max(x0)].fill(255);
+        }
+        for k in &clips[n - 1].cantos {
+            let q = k.quadrado;
+            let (qx0, qy0) = (((q.x * s).floor().max(x0 as f32) as usize), ((q.y * s).floor().max(y0 as f32) as usize));
+            let (qx1, qy1) = ((((q.x + q.width) * s).ceil() as usize).min(x1), (((q.y + q.height) * s).ceil() as usize).min(y1));
+            let (cx, cy, raio) = (k.centro.x * s, k.centro.y * s, k.raio * s);
+            for y in qy0..qy1.max(qy0) {
+                for x in qx0..qx1.max(qx0) {
+                    let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+                    let cob = (raio - d + 0.5).clamp(0.0, 1.0);
+                    let px = &mut dados[y * largura + x];
+                    *px = (*px as f32 * cob) as u8;
+                }
             }
         }
         clips[n - 1].mask = Some(m);
@@ -849,7 +876,7 @@ impl Renderer {
         let tam = ((f.right().ceil() as i32 - x), (f.bottom().ceil() as i32 - y));
         let ultima = cores.len() - 1;
         let amostra = |px: usize, py: usize| cores[if vertical { py } else { px }.min(ultima)];
-        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, Some((f, cantos.map(|v| v * s))), false, false, self.parcial.is_none(), 255, amostra);
+        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, Some((f, cantos.map(|v| v * s))), false, false, self.parcial.is_none(), 255, vertical, amostra);
         false
     }
 
@@ -907,7 +934,7 @@ impl Renderer {
         let (tam, amostra) = de(pm, mapa);
         // A sombra fica no cache com a cor cheia: a opacidade entra só na hora de compor.
         let alfa = (self.opacidade * 255.0).round() as u32;
-        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, caixa, true, false, self.parcial.is_none(), alfa, amostra);
+        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, caixa, true, false, self.parcial.is_none(), alfa, false, amostra);
     }
 
     /// Imagem esticada em `r`, já recortada pelos cantos `radius`.
@@ -945,7 +972,7 @@ impl Renderer {
         let forma = tiny_skia::Rect::from_xywh(x as f32, y as f32, w as f32, h as f32).map(|f| (f, radius.map(|v| v * s)));
         let (tam, amostra) = de(pm, None);
         let alfa = (self.opacidade * 255.0).round() as u32;
-        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, forma, false, false, self.parcial.is_none(), alfa, amostra);
+        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, forma, false, false, self.parcial.is_none(), alfa, false, amostra);
     }
 
     /// Imagem sem suavizar: cada pixel dela vira um bloco (página de PDF 1:1, pixel art, zoom).
@@ -1104,17 +1131,25 @@ impl Renderer {
         let forma = tiny_skia::Rect::from_xywh(r.x * s, r.y * s, r.width * s, r.height * s).map(|f| (f, cantos.map(|v| v * s)));
         let (tam, amostra) = de(&pm, None);
         let alfa = self.alfa();
-        compor(&mut self.pixmap, &mut self.clips, s, x0, y0, tam, forma, false, true, self.parcial.is_none(), alfa, amostra);
+        compor(&mut self.pixmap, &mut self.clips, s, x0, y0, tam, forma, false, true, self.parcial.is_none(), alfa, false, amostra);
     }
 
     /// Daqui até o `pop_clip`, nada sai de `r` (nem dos cantos arredondados).
     pub fn push_clip(&mut self, r: Rect, radius: [f32; 4]) {
         let r = self.local(r);
-        let (rect, fora_rounded) = match self.clips.last() {
-            Some(c) => (c.rect.intersect(&r), c.rounded),
-            None => (r, false),
-        };
-        self.clips.push(Clip { rect, own: r, radius, rounded: fora_rounded || radius.iter().any(|v| *v > 0.0), mask: None });
+        let rect = self.clips.last().map_or(r, |c| c.rect.intersect(&r));
+        let toca = |q: &Rect| q.x < rect.x + rect.width && rect.x < q.x + q.width && q.y < rect.y + rect.height && rect.y < q.y + q.height;
+        // A célula de uma tabela num painel arredondado fica longe dos cantos: não herda a máscara.
+        let mut cantos: Vec<Canto> = self.clips.last().map_or(Vec::new(), |c| c.cantos.iter().filter(|q| toca(&q.quadrado)).copied().collect());
+        let max = (r.width.min(r.height) / 2.0).max(0.0);
+        let [a, b, c, d] = radius.map(|v| v.clamp(0.0, max));
+        let fim = (r.x + r.width, r.y + r.height);
+        for (x, y, k, cx, cy) in [(r.x, r.y, a, r.x + a, r.y + a), (fim.0 - b, r.y, b, fim.0 - b, r.y + b), (fim.0 - c, fim.1 - c, c, fim.0 - c, fim.1 - c), (r.x, fim.1 - d, d, r.x + d, fim.1 - d)] {
+            if k > 0.0 {
+                cantos.push(Canto { quadrado: Rect { x, y, width: k, height: k }, centro: Point::new(cx, cy), raio: k });
+            }
+        }
+        self.clips.push(Clip { rect, own: r, radius, rounded: !cantos.is_empty(), cantos, mask: None });
     }
 
     pub fn pop_clip(&mut self) {
@@ -1286,7 +1321,8 @@ fn de<'a>(pm: &'a Pixmap, mapa: Option<(&'a [usize], &'a [usize])>) -> ((i32, i3
 /// `fora` inverte a forma (sombra só do lado de fora da caixa, como no CSS);
 /// `fonte` substitui o que havia em vez de sobrepor; `alfa` (0..255) é a opacidade do todo.
 #[allow(clippy::too_many_arguments)]
-fn compor(dst: &mut Pixmap, clips: &mut [Clip], s: f32, x: i32, y: i32, (sw, sh): (i32, i32), forma: Option<(tiny_skia::Rect, [f32; 4])>, fora: bool, fonte: bool, paralelo: bool, alfa: u32, amostra: impl Fn(usize, usize) -> [u8; 4] + Sync) {
+/// `linha_igual`: a `amostra` não depende de x (cor sólida, degradê vertical): o miolo de cada linha vai de uma vez.
+fn compor(dst: &mut Pixmap, clips: &mut [Clip], s: f32, x: i32, y: i32, (sw, sh): (i32, i32), forma: Option<(tiny_skia::Rect, [f32; 4])>, fora: bool, fonte: bool, paralelo: bool, alfa: u32, linha_igual: bool, amostra: impl Fn(usize, usize) -> [u8; 4] + Sync) {
     let (pw, ph) = (dst.width() as i32, dst.height() as i32);
     let area = tiny_skia::Rect::from_xywh(x as f32, y as f32, sw as f32, sh as f32);
     let mask = clip_mask(clips, pw as u32, ph as u32, s, area).map(|m| m.data());
@@ -1303,7 +1339,7 @@ fn compor(dst: &mut Pixmap, clips: &mut [Clip], s: f32, x: i32, y: i32, (sw, sh)
     std::thread::scope(|e| {
         for (i, dd) in linhas.chunks_mut((faixa * pw * 4) as usize).enumerate() {
             let ya = ya + i as i32 * faixa;
-            let mut trabalho = move || compor_linhas(dd, ya, pw, x, y, sw, mask, forma, fora, fonte, alfa, amostra);
+            let mut trabalho = move || compor_linhas(dd, ya, pw, x, y, sw, mask, forma, fora, fonte, alfa, linha_igual, amostra);
             if n == 1 {
                 trabalho();
             } else {
@@ -1314,11 +1350,50 @@ fn compor(dst: &mut Pixmap, clips: &mut [Clip], s: f32, x: i32, y: i32, (sw, sh)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compor_linhas(dd: &mut [u8], ya: i32, pw: i32, x: i32, y: i32, sw: i32, mask: Option<&[u8]>, forma: Option<(tiny_skia::Rect, [f32; 4])>, fora: bool, fonte: bool, alfa: u32, amostra: &(impl Fn(usize, usize) -> [u8; 4] + Sync)) {
+fn compor_linhas(dd: &mut [u8], ya: i32, pw: i32, x: i32, y: i32, sw: i32, mask: Option<&[u8]>, forma: Option<(tiny_skia::Rect, [f32; 4])>, fora: bool, fonte: bool, alfa: u32, linha_igual: bool, amostra: &(impl Fn(usize, usize) -> [u8; 4] + Sync)) {
     for py in ya..ya + (dd.len() / (pw as usize * 4)) as i32 {
         // Linhas longe dos cantos e das bordas ficam inteiras dentro da forma.
         let meio = forma.is_some_and(|(r, c)| py as f32 >= r.top() + c[0].max(c[1]) + 1.0 && py as f32 + 1.0 <= r.bottom() - c[2].max(c[3]) - 1.0);
-        let (mut px, fim) = (x.max(0), (x + sw).min(pw));
+        let (px, fim) = (x.max(0), (x + sw).min(pw));
+        // O miolo da linha (cobertura cheia, sem máscara): os fundos dos painéis são quase tudo isso.
+        // Nas linhas dos cantos, o miolo fica entre os arcos.
+        let dentro_v = forma.is_none_or(|(r, _)| py as f32 >= r.top() + 1.0 && py as f32 + 1.0 <= r.bottom() - 1.0);
+        if linha_igual && mask.is_none() && alfa == 255 && !fora && dentro_v {
+            let (a, b) = match forma {
+                Some((r, c)) => {
+                    let (e, d) = if meio { (0.0, 0.0) } else { (c[0].max(c[3]), c[1].max(c[2])) };
+                    (((r.left() + e + 1.0).ceil() as i32).max(px), ((r.right() - d - 2.0).floor() as i32 + 1).min(fim))
+                }
+                None => (px, fim),
+            };
+            if a < b {
+                let sp = amostra(0, (py - y) as usize);
+                let linha = &mut dd[(((py - ya) * pw + a) * 4) as usize..(((py - ya) * pw + b) * 4) as usize];
+                if fonte || sp[3] == 255 {
+                    for d in linha.chunks_exact_mut(4) {
+                        d.copy_from_slice(&sp);
+                    }
+                } else if sp[3] > 0 {
+                    let k = 255 - sp[3] as u32;
+                    for d in linha.chunks_exact_mut(4) {
+                        for c in 0..4 {
+                            d[c] = (sp[c] as u32 + d[c] as u32 * k / 255) as u8;
+                        }
+                    }
+                }
+                compor_trecho(dd, ya, pw, x, y, py, px, a, mask, forma, fora, fonte, alfa, meio, amostra);
+                compor_trecho(dd, ya, pw, x, y, py, b, fim, mask, forma, fora, fonte, alfa, meio, amostra);
+                continue;
+            }
+        }
+        compor_trecho(dd, ya, pw, x, y, py, px, fim, mask, forma, fora, fonte, alfa, meio, amostra);
+    }
+}
+
+/// Os pixels `px..fim` da linha `py`, um a um (bordas, cantos, máscara, imagens).
+#[allow(clippy::too_many_arguments)]
+fn compor_trecho(dd: &mut [u8], ya: i32, pw: i32, x: i32, y: i32, py: i32, mut px: i32, fim: i32, mask: Option<&[u8]>, forma: Option<(tiny_skia::Rect, [f32; 4])>, fora: bool, fonte: bool, alfa: u32, meio: bool, amostra: &(impl Fn(usize, usize) -> [u8; 4] + Sync)) {
+    {
         while px < fim {
             let mut cov = match forma {
                 Some((r, _)) if meio && px as f32 >= r.left() + 1.0 && px as f32 + 1.0 <= r.right() - 1.0 => {
