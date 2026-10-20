@@ -1,5 +1,5 @@
 //! Seletores que abrem um painel: data e cor.
-use crate::widget::{CursorIcon, DrawCx, Element, EventCx, LayoutCx, Limits, Node, Widget};
+use crate::widget::{surgir, ABRIR, CursorIcon, DrawCx, Element, EventCx, LayoutCx, Limits, Node, Widget};
 use crate::{Background, Border, Captured, Color, Event, Font, Key, Length, MouseButton, NamedKey, Point, Rect, Renderer, Shadow, Size, Theme};
 
 fn painel(r: &mut Renderer, area: Rect, t: &Theme) {
@@ -194,11 +194,14 @@ impl<M> Widget<M> for DatePicker<'_, M> {
         let (ix, iy) = (n.rect.x + n.rect.width - 24.0, n.rect.y + n.rect.height / 2.0 - 7.0);
         cx.renderer.fill_quad(Rect { x: ix, y: iy + 2.0, width: 14.0, height: 12.0 }, None, Border::rounded(2.0).color(t.muted, 1.5), None);
         cx.renderer.stroke(&[Point::new(ix, iy + 6.0), Point::new(ix + 14.0, iy + 6.0)], 1.5, t.muted);
+        // O painel surge ao abrir (fechar é na hora: o estado de dentro já se foi).
+        let p = cx.transition(n.key, if aberto { 1.0f32 } else { 0.0 }, ABRIR);
         if !aberto {
             return;
         }
         let (ano, mes) = self.mes(st);
-        let (valor, cursor, g) = (self.value, cx.cursor, geo(n.rect, cx.renderer.window_size().height));
+        let (valor, cursor, g) = (self.value, cx.popup_cursor(), geo(n.rect, cx.renderer.window_size().height));
+        cx.popup(g.painel);
         // O trecho pintado: o escolhido, ou do primeiro clique até o dia sob o mouse.
         let faixa = match (&self.escolha, st.and_then(|s| s.inicio)) {
             (Escolha::Intervalo(_), Some(a)) => {
@@ -208,7 +211,7 @@ impl<M> Widget<M> for DatePicker<'_, M> {
             (Escolha::Intervalo(_), None) => self.value.zip(self.end),
             _ => None,
         };
-        cx.overlay(move |r| {
+        cx.overlay(move |r| surgir(r, g.painel, p, |r| {
             painel(r, g.painel, &t);
             let titulo = format!("{} {}", MESES[mes as usize - 1], ano);
             let tw = r.measure(&titulo, 14.0, Font::SEMIBOLD, None).width;
@@ -250,11 +253,11 @@ impl<M> Widget<M> for DatePicker<'_, M> {
                 let w = r.measure(&s, 13.0, Font::DEFAULT, None).width;
                 texto_centrado_y(r, &s, 13.0, Font::DEFAULT, if escolhido { t.on_primary } else { t.text }, cel.x + (cel.width - w) / 2.0, cel);
             }
-        });
+        }));
     }
     fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
         let aberto = cx.states.get::<Calendario>(n.key).is_some_and(|s| s.aberto);
-        let p = cx.cursor;
+        let p = cx.popup_cursor();
         match ev {
             Event::MousePressed(MouseButton::Left) if aberto => {
                 let g = geo(n.rect, cx.renderer.window_size().height);
@@ -445,13 +448,16 @@ impl<M> Widget<M> for ColorPicker<'_, M> {
         let amostra = Rect { x: n.rect.x + 6.0, y: n.rect.y + 6.0, width: n.rect.height - 12.0, height: n.rect.height - 12.0 };
         cx.renderer.fill_quad(amostra, Some(&self.value.into()), Border::rounded(4.0).color(t.text.alpha(0.2), 1.0), None);
         texto_centrado_y(cx.renderer, &to_hex(self.value), 13.0, Font::MONO, cx.text_color, amostra.x + amostra.width + 8.0, n.rect);
+        // O painel surge ao abrir (fechar é na hora: o estado de dentro já se foi).
+        let p = cx.transition(n.key, if aberto { 1.0f32 } else { 0.0 }, ABRIR);
         if !aberto {
             return;
         }
         let (h, s, v) = self.hsv(st);
         let digitando = st.and_then(|p| p.hex.clone());
         let (g, valor) = (geo_cor(n.rect, cx.renderer.window_size().height), self.value);
-        cx.overlay(move |r| {
+        cx.popup(g.painel);
+        cx.overlay(move |r| surgir(r, g.painel, p, |r| {
             painel(r, g.painel, &t);
             // Quadro: matiz pura, clareada para a esquerda e escurecida para baixo.
             let raio = Border::rounded(6.0);
@@ -482,12 +488,12 @@ impl<M> Widget<M> for ColorPicker<'_, M> {
                 r.fill_quad(Rect { x: g.hex.x + 10.0 + w + 1.0, y: g.hex.y + 6.0, width: 1.0, height: g.hex.height - 12.0 }, Some(&t.text.into()), Border::default(), None);
             }
             r.draw_text("Hex", 11.0, Font::DEFAULT, t.muted, Point::new(g.hex.x + g.hex.width - 30.0, g.hex.y + 8.0), None);
-        });
+        }));
     }
     fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
         let st = cx.states.get::<Paleta>(n.key);
         let (aberto, arraste) = (st.is_some_and(|s| s.aberto), st.map_or(Arraste::Nada, |s| s.arraste));
-        let p = cx.cursor;
+        let p = cx.popup_cursor();
         let g = geo_cor(n.rect, cx.renderer.window_size().height);
         // A barra de matiz é fina: o clique vale com 4 px de folga.
         let matiz_alvo = Rect { y: g.matiz.y - 4.0, height: g.matiz.height + 8.0, ..g.matiz };

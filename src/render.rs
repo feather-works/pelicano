@@ -3,7 +3,7 @@ use crate::{Background, Border, Color, Point, Rect, Shadow, Size};
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tiny_skia::{FillRule, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, SpreadMode, Transform};
+use tiny_skia::{FillRule, FilterQuality, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, SpreadMode, Transform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Font {
@@ -158,6 +158,10 @@ pub struct Renderer {
     anterior: Vec<(Rect, u64)>,
     /// As linhas (pixels) que o último quadro mudou: `None` = todas.
     mudou: Option<(u32, u32)>,
+    /// O alfa que multiplica tudo que for desenhado ([`push_opacity`](Self::push_opacity)), e os de fora.
+    opacidade: f32,
+    opacidades: Vec<f32>,
+    camadas: Vec<Camada>,
 }
 
 /// O que um quadro deixa para o próximo. Com várias janelas, cada uma guarda o seu e troca com
@@ -174,6 +178,29 @@ impl Default for Quadro {
     fn default() -> Self {
         Quadro { pixmap: Pixmap::new(1, 1).expect("1x1"), scale: 1.0, anterior: Vec::new(), vidros: Vec::new(), mudou: None }
     }
+}
+
+/// Uma camada aberta ([`Renderer::push_layer`]).
+struct Camada {
+    /// A área que ela cobre na tela já transformada (lógica): gravando, os desenhos de dentro anotam esta.
+    caixa: Rect,
+    /// A impressão digital da transformação: mudou a escala, muda tudo o que está dentro.
+    chave: u64,
+    escala: f32,
+    rotacao: f32,
+    alfa: f32,
+    /// Pintando: onde o pixmap dela começa no de fora (pixels) e o que estava sendo desenhado antes.
+    canto: (i32, i32),
+    fora: Option<Fora>,
+}
+
+struct Fora {
+    pixmap: Pixmap,
+    origem: Point,
+    desloc: (i32, i32),
+    clips: Vec<Clip>,
+    opacidade: f32,
+    opacidades: Vec<f32>,
 }
 
 struct Parcial {
@@ -214,6 +241,9 @@ impl Renderer {
             lista: Vec::new(),
             anterior: Vec::new(),
             mudou: None,
+            opacidade: 1.0,
+            opacidades: Vec::new(),
+            camadas: Vec::new(),
         }
     }
 
@@ -253,6 +283,7 @@ impl Renderer {
         self.clips.clear();
         self.vidros.clear();
         self.mudou = None;
+        self.sem_opacidade();
         self.pixmap.fill(skia_color(fundo));
     }
 
@@ -282,11 +313,16 @@ impl Renderer {
         self.origem = Point::new(ex0 as f32 / scale, ey0 as f32 / scale);
         self.desloc = (ex0, ey0);
         self.clips.clear();
+        self.sem_opacidade();
         true
     }
 
     /// Fecha um quadro parcial, colando a região no quadro cheio (sem efeito num quadro cheio).
     pub fn end(&mut self) {
+        // Uma camada esquecida aberta ainda tem o pixmap de fora guardado.
+        while !self.camadas.is_empty() {
+            self.pop_layer();
+        }
         let Some(Parcial { mut cheio, dentro: (x0, y0, x1, y1) }) = self.parcial.take() else { return };
         let (ex, ey) = self.desloc;
         let (pw, cw) = (self.pixmap.width() as usize * 4, cheio.width() as usize * 4);
@@ -306,7 +342,8 @@ impl Renderer {
 
     /// Tamanho lógico da janela inteira (mesmo durante um quadro parcial).
     pub fn window_size(&self) -> Size {
-        let p = self.parcial.as_ref().map_or(&self.pixmap, |p| &p.cheio);
+        let camada = self.camadas.first().and_then(|c| c.fora.as_ref()).map(|f| &f.pixmap);
+        let p = self.parcial.as_ref().map(|p| &p.cheio).or(camada).unwrap_or(&self.pixmap);
         Size::new(p.width() as f32 / self.scale, p.height() as f32 / self.scale)
     }
 
@@ -325,6 +362,88 @@ impl Renderer {
         self.lista.clear();
         self.vidros.clear();
         self.clips.clear();
+        self.sem_opacidade();
+    }
+
+    fn sem_opacidade(&mut self) {
+        self.opacidade = 1.0;
+        self.opacidades.clear();
+    }
+
+    /// Daqui até o [`pop_opacity`](Self::pop_opacity), tudo sai com o alfa multiplicado por `a`
+    /// (o `opacity` do CSS; dentro de outro, multiplica).
+    /// shortcut: cada desenho fica translúcido sozinho, não o grupo: onde dois se sobrepõem o de baixo aparece um pouco; uma camada à parte resolve se incomodar.
+    pub fn push_opacity(&mut self, a: f32) {
+        self.opacidades.push(self.opacidade);
+        self.opacidade *= a.clamp(0.0, 1.0);
+    }
+
+    pub fn pop_opacity(&mut self) {
+        self.opacidade = self.opacidades.pop().unwrap_or(1.0);
+    }
+
+    /// Daqui até o [`pop_layer`](Self::pop_layer) tudo cai numa camada à parte do tamanho de
+    /// `area`, que no fim vai para a tela escalada por `scale` e girada `rotate` graus em volta
+    /// do centro de `area`, com opacidade `opacity` (o `transform` e o `opacity` do CSS, para o grupo).
+    /// shortcut: um vidro dentro da camada não vê o que está atrás dela (desfoca transparente).
+    pub fn push_layer(&mut self, area: Rect, scale: f32, rotate: f32, opacity: f32) {
+        let (sen, cos) = rotate.to_radians().sin_cos();
+        let (hw, hh) = (area.width * scale / 2.0, area.height * scale / 2.0);
+        let (bw, bh) = (hw * cos.abs() + hh * sen.abs(), hw * sen.abs() + hh * cos.abs());
+        let (mx, my) = (area.x + area.width / 2.0, area.y + area.height / 2.0);
+        let caixa = Rect { x: mx - bw - 2.0, y: my - bh - 2.0, width: 2.0 * bw + 4.0, height: 2.0 * bh + 4.0 };
+        let mut k = Chave::new(8);
+        k.r(area).f(scale).f(rotate).f(opacity);
+        let mut c = Camada { caixa, chave: k.0.finish(), escala: scale, rotacao: rotate, alfa: opacity * self.opacidade, canto: (0, 0), fora: None };
+        if self.gravando {
+            self.camadas.push(c);
+            return;
+        }
+        let (s, l) = (self.scale, self.local(area));
+        let (x0, y0) = ((l.x * s).floor() as i32, (l.y * s).floor() as i32);
+        let (w, h) = ((((l.x + l.width) * s).ceil() as i32 - x0).max(1), (((l.y + l.height) * s).ceil() as i32 - y0).max(1));
+        let Some(novo) = Pixmap::new(w as u32, h as u32) else { return self.camadas.push(c) };
+        c.canto = (x0, y0);
+        c.fora = Some(Fora {
+            pixmap: std::mem::replace(&mut self.pixmap, novo),
+            origem: self.origem,
+            desloc: self.desloc,
+            clips: std::mem::take(&mut self.clips),
+            opacidade: self.opacidade,
+            opacidades: std::mem::take(&mut self.opacidades),
+        });
+        self.origem = Point::new(self.origem.x + x0 as f32 / s, self.origem.y + y0 as f32 / s);
+        self.desloc = (self.desloc.0 + x0, self.desloc.1 + y0);
+        self.opacidade = 1.0;
+        self.camadas.push(c);
+    }
+
+    pub fn pop_layer(&mut self) {
+        let Some(c) = self.camadas.pop() else { return };
+        let Some(f) = c.fora else { return };
+        let camada = std::mem::replace(&mut self.pixmap, f.pixmap);
+        self.origem = f.origem;
+        self.desloc = f.desloc;
+        self.clips = f.clips;
+        self.opacidade = f.opacidade;
+        self.opacidades = f.opacidades;
+        if c.alfa <= 0.0 {
+            return;
+        }
+        let (w, h) = (camada.width() as f32, camada.height() as f32);
+        let t = Transform::from_translate(c.canto.0 as f32 + w / 2.0, c.canto.1 as f32 + h / 2.0).pre_rotate(c.rotacao).pre_scale(c.escala, c.escala).pre_translate(-w / 2.0, -h / 2.0);
+        let tinta = PixmapPaint { opacity: c.alfa.min(1.0), quality: FilterQuality::Bilinear, ..Default::default() };
+        let (pw, ph, s) = (self.pixmap.width(), self.pixmap.height(), self.scale);
+        let mask = clip_mask(&mut self.clips, pw, ph, s, None);
+        self.pixmap.draw_pixmap(0, 0, camada.as_ref(), &tinta, t, mask);
+    }
+
+    fn alfa(&self) -> u32 {
+        (self.opacidade * 255.0).round() as u32
+    }
+
+    fn esmaecer(&self, c: Color) -> Color {
+        c.alpha(c.a * self.opacidade)
     }
 
     /// Fecha a gravação e compara com o que está no `pixmap`.
@@ -332,6 +451,7 @@ impl Renderer {
     pub fn changes(&mut self) -> Changes {
         self.gravando = false;
         self.clips.clear();
+        self.camadas.clear();
         let novo = std::mem::take(&mut self.lista);
         let c = comparar(&self.anterior, &novo, &self.vidros);
         self.lista = std::mem::replace(&mut self.anterior, novo);
@@ -345,6 +465,14 @@ impl Renderer {
             return false;
         }
         let mut area = crescer(area, 2.0);
+        k.f(self.opacidade);
+        // Dentro de uma camada o desenho aparece transformado: vale a área dela toda.
+        if let Some(c) = self.camadas.first() {
+            area = c.caixa;
+        }
+        for c in &self.camadas {
+            k.h(c.chave);
+        }
         for c in &self.clips {
             k.r(c.own).h(c.radius.map(f32::to_bits));
         }
@@ -417,6 +545,7 @@ impl Renderer {
         let key = TextKey { text: text.to_owned(), size: (size * self.scale * 64.0) as u32, font, width: max_width.map(|w| (w * self.scale) as u32) };
         let b = self.texts.get(&key).expect("criado pelo buffer");
         let at = Point::new(at.x - self.origem.x, at.y - self.origem.y);
+        let color = color.alpha(color.a * self.opacidade);
         pintar_glifos(b, &mut self.fonts, &mut self.swash, &mut self.pixmap, &mut self.clips, self.scale, at, color);
     }
 
@@ -435,6 +564,7 @@ impl Renderer {
             return;
         }
         let at = Point::new(at.x - self.origem.x, at.y - self.origem.y);
+        let color = self.esmaecer(color);
         pintar_glifos(b, &mut self.fonts, &mut self.swash, &mut self.pixmap, &mut self.clips, self.scale, at, color);
     }
 }
@@ -510,6 +640,13 @@ impl Renderer {
         }
         let r = self.local(r);
         let s = self.scale;
+        let esmaecido;
+        let (bg, border) = if self.opacidade < 1.0 {
+            esmaecido = bg.map(|b| b.faded(self.opacidade));
+            (esmaecido.as_ref(), Border { color: self.esmaecer(border.color), ..border })
+        } else {
+            (bg, border)
+        };
         if let Some(sh) = shadow.filter(|sh| sh.color.a > 0.0) {
             self.shadow(r, border.radius, sh);
         }
@@ -587,7 +724,7 @@ impl Renderer {
         let tam = ((f.right().ceil() as i32 - x), (f.bottom().ceil() as i32 - y));
         let ultima = cores.len() - 1;
         let amostra = |px: usize, py: usize| cores[if vertical { py } else { px }.min(ultima)];
-        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, Some((f, cantos.map(|v| v * s))), false, false, self.parcial.is_none(), amostra);
+        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, Some((f, cantos.map(|v| v * s))), false, false, self.parcial.is_none(), 255, amostra);
         false
     }
 
@@ -645,7 +782,9 @@ impl Renderer {
             None
         };
         let (tam, amostra) = de(pm, mapa);
-        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, caixa, true, false, self.parcial.is_none(), amostra);
+        // A sombra fica no cache com a cor cheia: a opacidade entra só na hora de compor.
+        let alfa = (self.opacidade * 255.0).round() as u32;
+        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, caixa, true, false, self.parcial.is_none(), alfa, amostra);
     }
 
     /// Imagem esticada em `r`, já recortada pelos cantos `radius`.
@@ -667,7 +806,8 @@ impl Renderer {
         let pm = self.imagens.pegar((img.1, w, h), || escalar(&img.0, w, h, None));
         let forma = tiny_skia::Rect::from_xywh(x as f32, y as f32, w as f32, h as f32).map(|f| (f, radius.map(|v| v * s)));
         let (tam, amostra) = de(pm, None);
-        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, forma, false, false, self.parcial.is_none(), amostra);
+        let alfa = (self.opacidade * 255.0).round() as u32;
+        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, forma, false, false, self.parcial.is_none(), alfa, amostra);
     }
 
     /// SVG em `r`; com `color`, troca a cor de tudo mantendo o alfa (ícones de um traço só).
@@ -705,7 +845,8 @@ impl Renderer {
         let area = tiny_skia::Rect::from_xywh(x as f32, y as f32, w as f32, h as f32);
         let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
         let mask = clip_mask(&mut self.clips, pw, ph, s, area);
-        self.pixmap.draw_pixmap(x, y, pm.as_ref(), &PixmapPaint::default(), Transform::identity(), mask);
+        let tinta = PixmapPaint { opacity: self.opacidade, ..Default::default() };
+        self.pixmap.draw_pixmap(x, y, pm.as_ref(), &tinta, Transform::identity(), mask);
     }
 
     /// Linha passando pelos `pontos`, com pontas e junções redondas.
@@ -740,6 +881,7 @@ impl Renderer {
         let area = tiny_skia::Rect::from_ltrb(area.left() - meia, area.top() - meia, area.right() + meia, area.bottom() + meia);
         let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
         let mask = clip_mask(&mut self.clips, pw, ph, s, area);
+        let cor = cor.alpha(cor.a * self.opacidade);
         self.pixmap.stroke_path(&path, &paint(cor), &traco, Transform::identity(), mask);
     }
 
@@ -780,7 +922,8 @@ impl Renderer {
         let pm = if d > 1.0 { escalar(&pq, w as u32, h as u32, Some(d as i64)) } else { pq };
         let forma = tiny_skia::Rect::from_xywh(r.x * s, r.y * s, r.width * s, r.height * s).map(|f| (f, cantos.map(|v| v * s)));
         let (tam, amostra) = de(&pm, None);
-        compor(&mut self.pixmap, &mut self.clips, s, x0, y0, tam, forma, false, true, self.parcial.is_none(), amostra);
+        let alfa = self.alfa();
+        compor(&mut self.pixmap, &mut self.clips, s, x0, y0, tam, forma, false, true, self.parcial.is_none(), alfa, amostra);
     }
 
     /// Daqui até o `pop_clip`, nada sai de `r` (nem dos cantos arredondados).
@@ -938,9 +1081,9 @@ fn de<'a>(pm: &'a Pixmap, mapa: Option<(&'a [usize], &'a [usize])>) -> ((i32, i3
 /// Escreve em `(x, y)` uma área `sw`×`sh` cujos pixels (pré-multiplicados) vêm de `amostra`,
 /// em inteiros, sem o pipeline de pattern do tiny-skia, que é lento em área grande. `forma` limita a um retângulo arredondado;
 /// `fora` inverte a forma (sombra só do lado de fora da caixa, como no CSS);
-/// `fonte` substitui o que havia em vez de sobrepor.
+/// `fonte` substitui o que havia em vez de sobrepor; `alfa` (0..255) é a opacidade do todo.
 #[allow(clippy::too_many_arguments)]
-fn compor(dst: &mut Pixmap, clips: &mut [Clip], s: f32, x: i32, y: i32, (sw, sh): (i32, i32), forma: Option<(tiny_skia::Rect, [f32; 4])>, fora: bool, fonte: bool, paralelo: bool, amostra: impl Fn(usize, usize) -> [u8; 4] + Sync) {
+fn compor(dst: &mut Pixmap, clips: &mut [Clip], s: f32, x: i32, y: i32, (sw, sh): (i32, i32), forma: Option<(tiny_skia::Rect, [f32; 4])>, fora: bool, fonte: bool, paralelo: bool, alfa: u32, amostra: impl Fn(usize, usize) -> [u8; 4] + Sync) {
     let (pw, ph) = (dst.width() as i32, dst.height() as i32);
     let area = tiny_skia::Rect::from_xywh(x as f32, y as f32, sw as f32, sh as f32);
     let mask = clip_mask(clips, pw as u32, ph as u32, s, area).map(|m| m.data());
@@ -957,7 +1100,7 @@ fn compor(dst: &mut Pixmap, clips: &mut [Clip], s: f32, x: i32, y: i32, (sw, sh)
     std::thread::scope(|e| {
         for (i, dd) in linhas.chunks_mut((faixa * pw * 4) as usize).enumerate() {
             let ya = ya + i as i32 * faixa;
-            let mut trabalho = move || compor_linhas(dd, ya, pw, x, y, sw, mask, forma, fora, fonte, amostra);
+            let mut trabalho = move || compor_linhas(dd, ya, pw, x, y, sw, mask, forma, fora, fonte, alfa, amostra);
             if n == 1 {
                 trabalho();
             } else {
@@ -968,7 +1111,7 @@ fn compor(dst: &mut Pixmap, clips: &mut [Clip], s: f32, x: i32, y: i32, (sw, sh)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compor_linhas(dd: &mut [u8], ya: i32, pw: i32, x: i32, y: i32, sw: i32, mask: Option<&[u8]>, forma: Option<(tiny_skia::Rect, [f32; 4])>, fora: bool, fonte: bool, amostra: &(impl Fn(usize, usize) -> [u8; 4] + Sync)) {
+fn compor_linhas(dd: &mut [u8], ya: i32, pw: i32, x: i32, y: i32, sw: i32, mask: Option<&[u8]>, forma: Option<(tiny_skia::Rect, [f32; 4])>, fora: bool, fonte: bool, alfa: u32, amostra: &(impl Fn(usize, usize) -> [u8; 4] + Sync)) {
     for py in ya..ya + (dd.len() / (pw as usize * 4)) as i32 {
         // Linhas longe dos cantos e das bordas ficam inteiras dentro da forma.
         let meio = forma.is_some_and(|(r, c)| py as f32 >= r.top() + c[0].max(c[1]) + 1.0 && py as f32 + 1.0 <= r.bottom() - c[2].max(c[3]) - 1.0);
@@ -990,6 +1133,9 @@ fn compor_linhas(dd: &mut [u8], ya: i32, pw: i32, x: i32, y: i32, sw: i32, mask:
             let px = px - 1;
             if let Some(m) = mask {
                 cov = cov * m[(py * pw + px) as usize] as u32 / 255;
+            }
+            if alfa < 255 {
+                cov = cov * alfa / 255;
             }
             if cov == 0 {
                 continue;

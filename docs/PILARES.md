@@ -90,7 +90,7 @@ Checklist dos seis pilares de um motor de interface, com o estado do pelicano ve
 | Duplo clique e clique direito | ✅ `mouse_area` com `on_double_click` e `on_right_press` | `src/widget.rs` (`MouseArea`) | — |
 | Roda do mouse | 🟡 vertical ✅; horizontal ❌ (`dx` é ignorado) | `src/app.rs` (`window_event`); `src/widget.rs` (`Scrollable::event`) | Eixo horizontal |
 | IME (composição, ex.: ~ + a = ã) | ❌ `Event` não tem composição; sem `set_ime_allowed` | `src/lib.rs` (`Event`) | Eventos de pré-edição do winit, posição do candidato, campo que trata pré-edição |
-| Acessibilidade (AccessKit, UIA, AT-SPI) | ❌ o README lista como pendente | `README.md` (Ainda falta) | Árvore de papéis e rótulos gerada a partir dos widgets |
+| Acessibilidade (AccessKit, UIA, AT-SPI) | ✅ árvore montada no desenho, só com leitor ligado; clicar e focar pelo leitor | `src/access.rs`; `src/app.rs` (`acessibilidade`) | Seletores de data e cor, menus abertos e tooltips ainda não entram; slider sem incrementar pelo leitor |
 
 ## Onde Tk, Iced e Slint pecam e como o pelicano responde
 

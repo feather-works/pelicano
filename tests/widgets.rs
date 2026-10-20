@@ -134,6 +134,23 @@ fn dropdown_abre_escolhe_e_fecha() {
     assert_eq!(h.click(&el, item(0.0)), vec![]);
 }
 
+#[test]
+fn menu_aberto_por_cima_de_quem_vem_antes_ganha_o_clique() {
+    // Sem espaço embaixo o menu abre para cima, sobre um botão que vem antes na árvore (as abas).
+    let mut h = H::new();
+    // Dentro de uma rolagem, como numa página: ela também não pode engolir o clique no menu.
+    let el: Element<M> = scrollable(column![Space::new(1.0, 170.0), button("aba").on_press(M::Clique(0)).width(200.0).height(40.0), pick_list(&OPCOES[..], None, M::Escolha).width(120.0)]).into();
+    let campo = h.node(&el).children[0].children[2].rect;
+    h.click(&el, centro(campo));
+    h.desenhar(&el, None);
+    let sob_o_menu = Point::new(20.0, 195.0);
+    let m = h.click(&el, sob_o_menu);
+    assert!(matches!(m.as_slice(), [M::Escolha(_)]), "o menu de cima ganha, não o botão: {m:?}");
+    // Fechado, o botão volta a receber.
+    h.desenhar(&el, None);
+    assert_eq!(h.click(&el, sob_o_menu), vec![M::Clique(0)]);
+}
+
 // ---------- Slider ----------
 
 #[test]

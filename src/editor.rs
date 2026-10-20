@@ -730,7 +730,13 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             Some(f) => f(cx.theme, status),
             None => Style::default().text_color(cx.theme.text),
         };
+        let st = cx.styled(n.key, st);
         st.paint(n.rect, cx);
+        cx.access(n.key, n.rect, || {
+            let mut a = crate::widget::no(crate::accesskit::Role::MultilineTextInput, &[crate::accesskit::Action::Click, crate::accesskit::Action::Focus]);
+            a.set_value(self.content.text());
+            a
+        });
         let cor = st.text_color.unwrap_or(cx.text_color);
         let (calha, area) = self.areas(n, cx.renderer);
         let s = cx.renderer.scale();

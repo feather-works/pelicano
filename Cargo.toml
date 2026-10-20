@@ -20,6 +20,8 @@ wgpu = "0.19"
 futures = { version = "0.3", features = ["thread-pool"] }
 # Ctrl+C / Ctrl+V: a área de transferência do sistema (no Wayland, pela conexão da janela).
 window_clipboard = "0.4"
+accesskit = "0.25"
+accesskit_winit = "0.34"
 
 # O desenho é todo na CPU: sem otimizar, o tiny-skia e o texto levam centenas de ms por quadro.
 # Os apps que usarem o pelicano precisam destas mesmas linhas no Cargo.toml deles.

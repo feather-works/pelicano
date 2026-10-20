@@ -13,6 +13,8 @@ personalizar — a ideia é chegar perto do que HTML + CSS permitem.
 - **Vidro em qualquer caixa**: `Style::backdrop_blur` (o `backdrop-filter` do CSS) e o preset `Style::glass(raio)`.
 - **Recorte pelo raio**: `container(...).clip(true)` corta imagem, lista e qualquer filho nos cantos arredondados.
 - Raio por canto, borda, sombra desfocada e gradiente em todo contêiner; **padding e margin**.
+- **Transições e animações** como no CSS: `Style::transition`; `animate(..)` com opacidade, deslocamento, escala e rotação, `:hover`/`:active`, entrada, saída e laço; os widgets prontos já animam. O loop só desenha quadros enquanto algo anda (`cargo run --release --example animacoes`).
+- **Acessibilidade** com AccessKit: botões, campos, caixas e textos chegam aos leitores de tela; `access_label` para ícones.
 - Hover que respeita camadas (o botão debaixo de um menu aberto não acende) e cursor do mouse que muda sozinho.
 - **Inspetor de layout** como o do navegador — desligado por padrão: `Settings { debug: true }` libera o F12 (ou `PELICANO_DEBUG=1`). Margem em laranja, padding em verde, conteúdo em azul, com o tamanho.
 - **Captura sem janela**: `capture(&app.view(), tamanho, escala, &tema, &mut Renderer::new(), None)` devolve o PNG — para testes e miniaturas.
@@ -45,8 +47,7 @@ pré-multiplicado — é isso que dá a transparência no Wayland.
 
 ## Ainda falta
 
-Seletor de data, área de texto multilinha, seleção e área de transferência no
-`text_input`, assinaturas de tempo (`every`), executor tokio (para `reqwest`),
-acessibilidade (AccessKit) e redesenho parcial.
+Seleção no `text_input`, navegação por Tab, assinaturas de tempo (`every`),
+executor tokio (para `reqwest`) e grid.
 
 Licença GPL-3.0-only.

@@ -1,4 +1,6 @@
 //! O trait [`Widget`], a árvore de layout e os widgets prontos.
+use crate::access::{accesskit, Access};
+use crate::anim::{animar, Lerp, Transition};
 use crate::{Align, Background, Border, Captured, Color, Event, Font, Image, Length, MouseButton, Padding, Point, Rect, Renderer, Shadow, Size, States, Status, Svg, Theme, WindowCmd};
 use crate::{Key, NamedKey};
 use std::borrow::Cow;
@@ -24,7 +26,7 @@ impl Node {
     pub fn size(&self) -> Size {
         self.rect.size()
     }
-    fn translate(&mut self, dx: f32, dy: f32) {
+    pub(crate) fn translate(&mut self, dx: f32, dy: f32) {
         self.rect.x += dx;
         self.rect.y += dy;
         for c in &mut self.children {
@@ -93,6 +95,8 @@ pub struct DrawCx<'a> {
     /// O ícone do mouse no próximo quadro; os widgets sob o cursor o trocam.
     pub cursor_icon: CursorIcon,
     overlays: Vec<Box<dyn FnOnce(&mut Renderer) + 'a>>,
+    /// Montando a árvore de acessibilidade (há um leitor de tela ligado).
+    acesso: Option<&'a mut Access>,
 }
 
 impl<'a> DrawCx<'a> {
@@ -104,6 +108,79 @@ impl<'a> DrawCx<'a> {
     pub fn overlay(&mut self, f: impl FnOnce(&mut Renderer) + 'a) {
         self.overlays.push(Box::new(f));
     }
+    /// `alvo` com transição (o `transition` do CSS): quando ele muda, o valor devolvido anda
+    /// até lá em `t`, e a janela desenha os quadros do caminho. `key` é a do widget (`node.key`);
+    /// cada tipo de valor dele anda separado.
+    pub fn transition<T: Lerp>(&self, key: u64, alvo: T, t: Transition) -> T {
+        animar(self.states, key, &alvo, None, t, None)
+    }
+    /// O estilo com a transição dele ([`Style::transition`]), se tiver.
+    pub fn styled(&self, key: u64, st: Style) -> Style {
+        match st.transition {
+            Some(t) => self.transition(key, st, t),
+            None => st,
+        }
+    }
+    /// Um menu ou painel solto que este widget abriu em `r` (desenhado por [`overlay`](Self::overlay)):
+    /// com o mouse em cima dele, o resto da árvore não vê o mouse, nem para hover nem para clique.
+    pub fn popup(&self, r: Rect) {
+        self.states.popups.borrow_mut().push(r);
+    }
+    /// O cursor para o dono de um popup: o de sempre, ou o que está em cima de um popup.
+    pub fn popup_cursor(&self) -> Option<Point> {
+        self.cursor.or(self.states.sob_popup.get())
+    }
+    /// Se há um leitor de tela ouvindo: só aí vale montar nós de acessibilidade.
+    pub fn accessible(&self) -> bool {
+        self.acesso.is_some()
+    }
+    /// Registra o widget para os leitores de tela; `node` só roda se houver um ligado.
+    pub fn access(&mut self, key: u64, r: Rect, node: impl FnOnce() -> accesskit::Node) {
+        if let Some(a) = self.acesso.as_deref_mut() {
+            a.push(key, r, node(), false);
+        }
+    }
+    /// Igual a [`access`](Self::access), mas o que for registrado até o [`access_end`](Self::access_end)
+    /// fica dentro dele. Num botão, o texto de dentro vira o nome.
+    pub fn access_begin(&mut self, key: u64, r: Rect, node: impl FnOnce() -> accesskit::Node) {
+        if let Some(a) = self.acesso.as_deref_mut() {
+            a.push(key, r, node(), true);
+        }
+    }
+    pub fn access_end(&mut self) {
+        if let Some(a) = self.acesso.as_deref_mut() {
+            a.end();
+        }
+    }
+    /// Um texto à mostra (o leitor lê os textos soltos e dá nome aos botões com eles).
+    pub fn access_text(&mut self, key: u64, r: Rect, s: &str) {
+        if let Some(a) = self.acesso.as_deref_mut() {
+            a.text(key, r, s);
+        }
+    }
+}
+
+/// Como menus, calendários e dicas abrem: crescem um pouco e aparecem.
+pub(crate) const ABRIR: Transition = Transition { duration: std::time::Duration::from_millis(150), easing: crate::Easing::EaseOut, delay: std::time::Duration::ZERO };
+
+/// Desenha um painel solto (menu, calendário, dica) no ponto `p` (0 a 1) da abertura dele.
+pub(crate) fn surgir(r: &mut Renderer, painel: Rect, p: f32, f: impl FnOnce(&mut Renderer)) {
+    if p >= 1.0 {
+        return f(r);
+    }
+    let area = Rect { x: painel.x - 24.0, y: painel.y - 24.0, width: painel.width + 48.0, height: painel.height + 48.0 };
+    r.push_layer(area, 0.95 + 0.05 * p, 0.0, p);
+    f(r);
+    r.pop_layer();
+}
+
+/// Um nó do AccessKit com o papel e as ações dadas.
+pub(crate) fn no(role: accesskit::Role, acoes: &[accesskit::Action]) -> accesskit::Node {
+    let mut n = accesskit::Node::new(role);
+    for a in acoes {
+        n.add_action(*a);
+    }
+    n
 }
 
 pub struct EventCx<'a, M> {
@@ -140,6 +217,10 @@ impl<M> EventCx<'_, M> {
     pub fn publish(&mut self, m: M) {
         self.messages.push(m);
     }
+    /// O cursor para o dono de um popup (veja [`DrawCx::popup`]).
+    pub fn popup_cursor(&self) -> Option<Point> {
+        self.cursor.or(self.states.sob_popup.get())
+    }
 }
 
 pub trait Widget<M> {
@@ -169,6 +250,45 @@ impl<'a, M: 'a> Element<'a, M> {
     }
     pub fn widget(&self) -> &dyn Widget<M> {
         self.0.as_ref()
+    }
+    /// O nome que o leitor de tela fala (o `aria-label` do HTML): botão só de ícone, imagem.
+    pub fn access_label(self, label: impl Into<Cow<'a, str>>) -> Self {
+        Element::new(AccessLabel { content: self, label: label.into() })
+    }
+}
+
+struct AccessLabel<'a, M> {
+    content: Element<'a, M>,
+    label: Cow<'a, str>,
+}
+
+impl<M> Widget<M> for AccessLabel<'_, M> {
+    fn size(&self) -> (Length, Length) {
+        self.content.0.size()
+    }
+    fn layout(&self, cx: &mut LayoutCx, l: Limits) -> Node {
+        let n = cx.child(0, &self.content, l);
+        Node { rect: n.rect, key: cx.key(), children: vec![n], ..Default::default() }
+    }
+    fn draw(&self, n: &Node, cx: &mut DrawCx) {
+        if let Some(a) = cx.acesso.as_deref_mut() {
+            a.rotulo = Some(self.label.to_string());
+        }
+        self.content.0.draw(&n.children[0], cx);
+        // Ninguém de dentro se registrou (um ícone, uma imagem): o rótulo vira um nó próprio.
+        if let Some(a) = cx.acesso.as_deref_mut() {
+            if let Some(l) = a.rotulo.take() {
+                let mut no = accesskit::Node::new(accesskit::Role::Image);
+                no.set_label(l);
+                a.push(n.key, n.rect, no, false);
+            }
+        }
+    }
+    fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
+        self.content.0.event(&n.children[0], ev, cx)
+    }
+    fn opaque_at(&self, n: &Node, p: Point) -> bool {
+        self.content.0.opaque_at(&n.children[0], p)
     }
 }
 
@@ -242,13 +362,25 @@ pub fn layout<M>(el: &Element<'_, M>, size: Size, renderer: &mut Renderer, state
 /// Desenha um quadro já com layout; devolve o ícone do mouse pedido.
 /// Com `debug`, desenha por cima o inspetor (veja [`inspect`]).
 pub fn draw<M>(el: &Element<'_, M>, node: &Node, renderer: &mut Renderer, states: &States, theme: &Theme, cursor: Option<Point>, debug: bool) -> CursorIcon {
-    let mut cx = DrawCx { renderer, states, theme, cursor, text_color: theme.text, cursor_icon: CursorIcon::Default, overlays: Vec::new() };
+    draw_access(el, node, renderer, states, theme, cursor, debug, None)
+}
+
+/// O [`draw`] que também monta a árvore de acessibilidade em `acesso`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_access<M>(el: &Element<'_, M>, node: &Node, renderer: &mut Renderer, states: &States, theme: &Theme, cursor: Option<Point>, debug: bool, acesso: Option<&mut Access>) -> CursorIcon {
+    // Os popups do quadro passado decidem quem vê o mouse; os deste quadro se registram de novo.
+    let popups = std::mem::take(&mut *states.popups.borrow_mut());
+    let sob = cursor.filter(|p| popups.iter().any(|r| r.contains(*p)));
+    states.sob_popup.set(sob);
+    let inspecionar = cursor;
+    let cursor = if sob.is_some() { None } else { cursor };
+    let mut cx = DrawCx { renderer, states, theme, cursor, text_color: theme.text, cursor_icon: CursorIcon::Default, overlays: Vec::new(), acesso };
     el.0.draw(node, &mut cx);
     for o in std::mem::take(&mut cx.overlays) {
         o(cx.renderer);
     }
     if debug {
-        inspect(node, cx.renderer, cursor);
+        inspect(node, cx.renderer, inspecionar);
     }
     cx.cursor_icon
 }
@@ -300,12 +432,29 @@ pub fn inspect(node: &Node, r: &mut Renderer, cursor: Option<Point>) {
     r.draw_text(&rotulo, 11.0, Font::MONO, Color::WHITE, Point::new(caixa.x + 6.0, caixa.y + 4.0), None);
 }
 
+/// Desenha o quadro e devolve o que os leitores de tela recebem dele (testes; a janela manda sozinha).
+pub fn access_tree<M>(el: &Element<'_, M>, node: &Node, renderer: &mut Renderer, states: &States, theme: &Theme, title: &str) -> accesskit::TreeUpdate {
+    let mut a = Access::default();
+    draw_access(el, node, renderer, states, theme, None, false, Some(&mut a));
+    a.tree(title, renderer.scale() as f64, states.focus)
+}
+
 /// Passa um evento pela árvore; o clique fora de um campo tira o foco dele.
 pub fn dispatch<M>(el: &Element<'_, M>, node: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
     if matches!(ev, Event::MousePressed(_)) && cx.states.focus.take().is_some() {
         cx.redraw = true;
     }
-    el.0.event(node, ev, cx)
+    let mouse = matches!(ev, Event::MousePressed(_) | Event::MouseReleased(_) | Event::Wheel { .. } | Event::CursorMoved(_));
+    let sob = cx.cursor.filter(|p| mouse && cx.states.popups.borrow().iter().any(|r| r.contains(*p)));
+    cx.states.sob_popup.set(sob);
+    if sob.is_none() {
+        return el.0.event(node, ev, cx);
+    }
+    let real = cx.cursor.take();
+    let c = el.0.event(node, ev, cx);
+    cx.cursor = real;
+    cx.states.sob_popup.set(None);
+    c
 }
 
 /// Desenha `el` em `size` lógico e devolve o PNG: testes, capturas e miniaturas sem janela nem GPU.
@@ -329,6 +478,8 @@ pub struct Style {
     pub text_color: Option<Color>,
     /// Desfoca o que já foi desenhado atrás da caixa (o `backdrop-filter: blur()` do CSS), em pixels lógicos.
     pub backdrop_blur: f32,
+    /// Mudanças de estilo (hover, foco, o app trocou a cor) andam em vez de pular (o `transition` do CSS).
+    pub transition: Option<Transition>,
 }
 
 impl Style {
@@ -340,6 +491,7 @@ impl Style {
             shadow: Some(Shadow { color: Color::BLACK.alpha(0.25), offset: Point::new(0.0, 8.0), blur: 24.0 }),
             text_color: None,
             backdrop_blur: 18.0,
+            transition: None,
         }
     }
     pub fn backdrop_blur(self, b: f32) -> Self {
@@ -356,6 +508,9 @@ impl Style {
     }
     pub fn text_color(self, c: Color) -> Self {
         Style { text_color: Some(c), ..self }
+    }
+    pub fn transition(self, t: Transition) -> Self {
+        Style { transition: Some(t), ..self }
     }
     pub(crate) fn paint(&self, r: Rect, cx: &mut DrawCx) {
         if self.backdrop_blur > 0.0 {
@@ -462,6 +617,7 @@ impl<M> Widget<M> for Text<'_> {
         let w = if self.align_x == Align::Start { 0.0 } else { cx.renderer.measure(&self.content, self.size, self.font, mw).width };
         let at = Point::new(r.x + self.align_x.offset(r.width, w), r.y);
         cx.renderer.draw_text(&self.content, self.size, self.font, self.color.unwrap_or(cx.text_color), at, mw);
+        cx.access_text(n.key, r, &self.content);
     }
 }
 
@@ -581,6 +737,7 @@ impl<M> Widget<M> for Container<'_, M> {
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
         let caixa = n.rect.shrink(self.margin);
         let st = self.style.as_ref().map(|f| f(cx.theme)).unwrap_or_default();
+        let st = cx.styled(n.key, st);
         st.paint(caixa, cx);
         let herdada = cx.text_color;
         if let Some(c) = st.text_color {
@@ -959,8 +1116,11 @@ pub fn button_primary(t: &Theme, s: Status) -> Style {
         Status::Disabled => t.primary.alpha(0.45),
         _ => t.primary,
     };
-    Style::default().background(base).border(Border::rounded(6.0)).text_color(t.on_primary)
+    Style::default().background(base).border(Border::rounded(6.0)).text_color(t.on_primary).transition(HOVER)
 }
+
+/// A transição dos estilos padrão: o hover acende em vez de piscar.
+const HOVER: Transition = Transition { duration: std::time::Duration::from_millis(120), easing: crate::Easing::Ease, delay: std::time::Duration::ZERO };
 
 /// Botão sem fundo, que só acende no hover (barras de ferramentas).
 pub fn button_text(t: &Theme, s: Status) -> Style {
@@ -969,7 +1129,7 @@ pub fn button_text(t: &Theme, s: Status) -> Style {
         Status::Pressed => Some(t.text.alpha(0.14)),
         _ => None,
     };
-    Style { background: bg.map(Into::into), border: Border::rounded(6.0), text_color: Some(if s == Status::Disabled { t.muted } else { t.text }), ..Default::default() }
+    Style { background: bg.map(Into::into), border: Border::rounded(6.0), text_color: Some(if s == Status::Disabled { t.muted } else { t.text }), transition: Some(HOVER), ..Default::default() }
 }
 
 impl<M: Clone> Widget<M> for Button<'_, M> {
@@ -1005,12 +1165,22 @@ impl<M: Clone> Widget<M> for Button<'_, M> {
             Some(f) => f(cx.theme, status),
             None => button_primary(cx.theme, status),
         };
+        let st = cx.styled(n.key, st);
         st.paint(n.rect, cx);
         let herdada = cx.text_color;
         if let Some(c) = st.text_color {
             cx.text_color = c;
         }
+        let desabilitado = self.on_press.is_none();
+        cx.access_begin(n.key, n.rect, || {
+            let mut a = no(accesskit::Role::Button, &[accesskit::Action::Click, accesskit::Action::Focus]);
+            if desabilitado {
+                a.set_disabled();
+            }
+            a
+        });
         self.content.0.draw(&n.children[0], cx);
+        cx.access_end();
         cx.text_color = herdada;
     }
     fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
@@ -1095,7 +1265,15 @@ impl<M: Clone> Widget<M> for MouseArea<'_, M> {
         Node { rect: n.rect, key: cx.key(), children: vec![n], ..Default::default() }
     }
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
+        // Clicável vira botão para o leitor de tela (a linha de uma lista de apps).
+        let clicavel = self.on_press.is_some() || self.on_release.is_some() || self.on_double_click.is_some();
+        if clicavel {
+            cx.access_begin(n.key, n.rect, || no(accesskit::Role::Button, &[accesskit::Action::Click]));
+        }
         self.content.0.draw(&n.children[0], cx);
+        if clicavel {
+            cx.access_end();
+        }
         if let Some(i) = self.icon.filter(|_| cx.hovered(&n.rect)) {
             cx.cursor_icon = i;
         }
@@ -1191,7 +1369,9 @@ impl<M> Widget<M> for Scrollable<'_, M> {
         let cursor = cx.cursor;
         cx.cursor = cursor.filter(|p| n.rect.contains(*p));
         cx.renderer.push_clip(n.rect, [0.0; 4]);
+        cx.access_begin(n.key, n.rect, || no(accesskit::Role::ScrollView, &[]));
         self.content.0.draw(&n.children[0], cx);
+        cx.access_end();
         cx.renderer.pop_clip();
         cx.cursor = cursor;
         let off = n.rect.y - n.children[0].rect.y;
@@ -1247,8 +1427,8 @@ impl<M> Widget<M> for Scrollable<'_, M> {
             }
             _ => {}
         }
-        // Clique na parte escondida do conteúdo não vale.
-        if !dentro && matches!(ev, Event::MousePressed(_)) {
+        // Clique na parte escondida do conteúdo não vale; num menu aberto de dentro, vale.
+        if !dentro && matches!(ev, Event::MousePressed(_)) && cx.states.sob_popup.get().is_none() {
             return Captured::No;
         }
         self.content.0.event(&n.children[0], ev, cx)
@@ -1378,7 +1558,7 @@ pub fn input_default(t: &Theme, s: Status) -> Style {
         Status::Hovered => t.muted,
         _ => t.border,
     };
-    Style::default().background(t.surface).border(Border::rounded(6.0).color(borda, 1.0)).text_color(t.text)
+    Style::default().background(t.surface).border(Border::rounded(6.0).color(borda, 1.0)).text_color(t.text).transition(HOVER)
 }
 
 impl<M: Clone> Widget<M> for TextInput<'_, M> {
@@ -1409,7 +1589,22 @@ impl<M: Clone> Widget<M> for TextInput<'_, M> {
             Some(f) => f(cx.theme, status),
             None => input_default(cx.theme, status),
         };
+        let st = cx.styled(n.key, st);
         st.paint(n.rect, cx);
+        let (secreto, desabilitado) = (self.secure, self.on_input.is_none());
+        cx.access(n.key, n.rect, || {
+            let mut a = no(if secreto { accesskit::Role::PasswordInput } else { accesskit::Role::TextInput }, &[accesskit::Action::Click, accesskit::Action::Focus]);
+            if !secreto {
+                a.set_value(&*self.value);
+            }
+            if !self.placeholder.is_empty() {
+                a.set_placeholder(&*self.placeholder);
+            }
+            if desabilitado {
+                a.set_disabled();
+            }
+            a
+        });
         let dentro = n.rect.shrink(self.padding);
         let cor = st.text_color.unwrap_or(cx.text_color);
         let cursor = cx.states.get::<Cursor>(n.key).map_or(self.value.len(), |c| c.0).min(self.value.len());
@@ -1673,8 +1868,18 @@ impl<M> Widget<M> for ProgressBar {
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
         let raio = Border::rounded(self.height / 2.0);
         cx.renderer.fill_quad(n.rect, Some(&cx.theme.text.alpha(0.12).into()), raio, None);
-        if self.fraction > 0.0 {
-            let cheio = Rect { width: n.rect.width * self.fraction, ..n.rect };
+        let f = self.fraction as f64;
+        // A barra escorrega até o valor novo em vez de pular.
+        let fraction = cx.transition(n.key, self.fraction, Transition::new(300).easing(crate::Easing::EaseOut));
+        cx.access(n.key, n.rect, || {
+            let mut a = no(accesskit::Role::ProgressIndicator, &[]);
+            a.set_numeric_value(f * 100.0);
+            a.set_min_numeric_value(0.0);
+            a.set_max_numeric_value(100.0);
+            a
+        });
+        if fraction > 0.0 {
+            let cheio = Rect { width: n.rect.width * fraction, ..n.rect };
             cx.renderer.fill_quad(cheio, Some(&self.color.unwrap_or(cx.theme.primary).into()), raio, None);
         }
     }
@@ -1708,12 +1913,16 @@ impl<'a, M> Widget<M> for Tooltip<'a, M> {
     }
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
         self.content.0.draw(&n.children[0], cx);
-        if !cx.hovered(&n.rect) {
+        // Aparece depois de um tempo parado em cima; some logo.
+        let em_cima = cx.hovered(&n.rect);
+        let p = cx.transition(n.key, if em_cima { 1.0f32 } else { 0.0 }, if em_cima { Transition::new(120).delay(350) } else { Transition::new(90) });
+        if p <= 0.0 {
             return;
         }
         let (tip, theme, r, pos) = (self.tip.to_string(), *cx.theme, n.rect, self.position);
         let janela = cx.renderer.window_size();
         cx.overlay(move |rd| {
+            rd.push_opacity(p);
             let t = rd.measure(&tip, 12.0, Font::DEFAULT, Some(320.0));
             let (w, h) = (t.width + 16.0, t.height + 8.0);
             let x = (r.x + (r.width - w) / 2.0).clamp(4.0, (janela.width - w - 4.0).max(4.0));
@@ -1724,6 +1933,7 @@ impl<'a, M> Widget<M> for Tooltip<'a, M> {
             let caixa = Rect { x, y, width: w, height: h };
             rd.fill_quad(caixa, Some(&theme.surface.into()), Border::rounded(6.0).color(theme.border, 1.0), Some(Shadow { color: Color::BLACK.alpha(0.3), offset: Point::new(0.0, 2.0), blur: 6.0 }));
             rd.draw_text(&tip, 12.0, Font::DEFAULT, theme.text, Point::new(x + 8.0, y + 4.0), Some(320.0));
+            rd.pop_opacity();
         });
     }
     fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {

@@ -10,6 +10,8 @@
 //!   translúcida com desfoque do desktop atrás ([`Settings`]);
 //! - o trait [`Widget`] é pequeno e público, e todo estilo é uma closure que
 //!   recebe o [`Status`] e o [`Theme`] — nada de tema fechado num enum.
+mod access;
+mod anim;
 mod app;
 mod controls;
 mod editor;
@@ -17,6 +19,8 @@ mod pickers;
 mod render;
 pub mod widget;
 
+pub use access::{accesskit, Access};
+pub use anim::{animate, Animate, Easing, Keyframe, Lerp, Repeat, Transition};
 pub use app::{run, App, Error, Handle, Settings, Task, WindowCmd, WindowId};
 /// Canais e fluxos para as tarefas ([`Task::run`]).
 pub use futures;
@@ -28,8 +32,10 @@ pub use widget::*;
 pub use winit::keyboard::{Key, ModifiersState as Modifiers, NamedKey};
 pub use winit::window::{Icon, ResizeDirection, WindowLevel};
 
-use std::any::Any;
+use std::any::{Any, TypeId};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Point {
@@ -258,6 +264,16 @@ pub enum Background {
     Linear { angle: f32, stops: Vec<(f32, Color)> },
 }
 
+impl Background {
+    /// As cores com o alfa multiplicado por `a` (opacidade de um grupo).
+    pub(crate) fn faded(&self, a: f32) -> Background {
+        match self {
+            Background::Color(c) => Background::Color(c.alpha(c.a * a)),
+            Background::Linear { angle, stops } => Background::Linear { angle: *angle, stops: stops.iter().map(|(p, c)| (*p, c.alpha(c.a * a))).collect() },
+        }
+    }
+}
+
 impl From<Color> for Background {
     fn from(c: Color) -> Self {
         Background::Color(c)
@@ -347,9 +363,32 @@ pub enum Status {
 pub struct States {
     map: HashMap<u64, Box<dyn Any>>,
     pub focus: Option<u64>,
+    /// A hora do quadro. `None` (capturas e testes sem [`tick`](Self::tick)): toda transição já está no fim.
+    pub(crate) agora: Option<Instant>,
+    /// Conta os quadros: quem não foi desenhado no anterior está entrando na tela.
+    pub(crate) quadro: u64,
+    /// O estado das transições, por widget e tipo do valor; o desenho (que só lê `States`) muda ele.
+    pub(crate) animacoes: RefCell<HashMap<(u64, TypeId), Box<dyn Any>>>,
+    pub(crate) animando: Cell<bool>,
+    /// Os menus e painéis abertos no último quadro ([`DrawCx::popup`]): o mouse em cima deles não
+    /// chega ao resto da árvore.
+    pub(crate) popups: RefCell<Vec<Rect>>,
+    /// O mouse sobre um popup: só o dono dele vê ([`DrawCx::popup_cursor`]).
+    pub(crate) sob_popup: Cell<Option<Point>>,
 }
 
 impl States {
+    /// Começa um quadro na hora `now`: as transições andam até ela. A janela chama a cada
+    /// quadro; um teste chama para desenhar o meio de uma animação.
+    pub fn tick(&mut self, now: Instant) {
+        self.agora = Some(now);
+        self.quadro += 1;
+        self.animando.set(false);
+    }
+    /// Alguma transição do último quadro ainda não chegou ao fim: a janela pede outro quadro.
+    pub fn animating(&self) -> bool {
+        self.animando.get()
+    }
     pub fn get<T: 'static>(&self, key: u64) -> Option<&T> {
         self.map.get(&key)?.downcast_ref()
     }

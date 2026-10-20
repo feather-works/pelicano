@@ -1,4 +1,5 @@
 //! A janela, o laço de eventos, as tarefas assíncronas e a apresentação do quadro.
+use crate::access::{accesskit, Access};
 use crate::widget::{self, CursorIcon, Element, EventCx};
 use crate::render::Quadro;
 use crate::{Changes, Color, Event, Modifiers, Point, Renderer, ResizeDirection, Size, States, Theme};
@@ -205,6 +206,18 @@ impl<M: Send + 'static> Task<M> {
     }
 }
 
+/// O que chega ao laço de fora da janela: as mensagens das tarefas e os pedidos do leitor de tela.
+enum Evento<M> {
+    App(M),
+    Acesso(accesskit_winit::Event),
+}
+
+impl<M> From<accesskit_winit::Event> for Evento<M> {
+    fn from(e: accesskit_winit::Event) -> Self {
+        Evento::Acesso(e)
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     EventLoop(winit::error::EventLoopError),
@@ -229,13 +242,13 @@ pub fn run<A: App>(settings: Settings, init: impl FnOnce() -> (A, Task<A::Msg>))
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
     let x11 = settings.x11.then(|| {
         use winit::platform::x11::EventLoopBuilderExtX11;
-        EventLoop::<A::Msg>::with_user_event().with_x11().build().ok()
+        EventLoop::<Evento<A::Msg>>::with_user_event().with_x11().build().ok()
     });
     #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "android"))))]
-    let x11: Option<Option<EventLoop<A::Msg>>> = None;
+    let x11: Option<Option<EventLoop<Evento<A::Msg>>>> = None;
     let event_loop = match x11.flatten() {
         Some(el) => el,
-        None => EventLoop::<A::Msg>::with_user_event().build().map_err(Error::EventLoop)?,
+        None => EventLoop::<Evento<A::Msg>>::with_user_event().build().map_err(Error::EventLoop)?,
     };
     let pool = futures::executor::ThreadPool::new().map_err(|e| Error::Window(e.to_string()))?;
     let (app, task) = init();
@@ -253,7 +266,7 @@ struct Runtime<A: App> {
     app: A,
     /// As da janela principal (o `debug` vale para todas).
     settings: Settings,
-    proxy: EventLoopProxy<A::Msg>,
+    proxy: EventLoopProxy<Evento<A::Msg>>,
     pool: futures::executor::ThreadPool,
     /// A do sistema, ligada quando a primeira janela abre (antes disso, na memória).
     clipboard: Box<dyn widget::Clipboard>,
@@ -293,6 +306,13 @@ struct Janela {
     /// máximo um por quadro do monitor (o último).
     mover: bool,
     ultimo_mover: std::time::Instant,
+    /// Uma animação pediu o próximo quadro: quando ele vem.
+    proximo: Option<std::time::Instant>,
+    acesso: accesskit_winit::Adapter,
+    /// Um leitor de tela pediu a árvore: cada quadro manda a dele (se mudou).
+    leitor: bool,
+    /// A última árvore mandada: não repetir a mesma, e achar onde fica o alvo de uma ação.
+    arvore: Option<accesskit::TreeUpdate>,
 }
 
 impl<A: App> Runtime<A> {
@@ -301,11 +321,11 @@ impl<A: App> Runtime<A> {
             let proxy = self.proxy.clone();
             match a {
                 Action::Future(f) => self.pool.spawn_ok(async move {
-                    let _ = proxy.send_event(f.await);
+                    let _ = proxy.send_event(Evento::App(f.await));
                 }),
                 Action::Stream(mut s) => self.pool.spawn_ok(async move {
                     while let Some(m) = s.next().await {
-                        if proxy.send_event(m).is_err() {
+                        if proxy.send_event(Evento::App(m)).is_err() {
                             break;
                         }
                     }
@@ -375,7 +395,8 @@ impl<A: App> Runtime<A> {
     /// Abre as janelas pedidas (a principal no `resumed`).
     fn abrir_janelas(&mut self, el: &ActiveEventLoop) {
         for (id, s) in std::mem::take(&mut self.abrir) {
-            let w = match el.create_window(atributos(&s)) {
+            // Invisível até o AccessKit se ligar: ele precisa chegar antes da janela aparecer.
+            let w = match el.create_window(atributos(&s).with_visible(false)) {
                 Ok(w) => Arc::new(w),
                 Err(e) => {
                     self.erro = Some(Error::Window(e.to_string()));
@@ -409,13 +430,15 @@ impl<A: App> Runtime<A> {
                     self.clipboard = Box::new(Sistema(c));
                 }
             }
+            let acesso = accesskit_winit::Adapter::with_event_loop_proxy(el, &w, self.proxy.clone());
             // O X11 do GNOME ignora a posição da criação (o winit não marca como escolhida pelo
             // programa); mover depois de aberta ele obedece.
             if let Some(p) = s.position {
                 w.set_outer_position(winit::dpi::LogicalPosition::new(p.x, p.y));
             }
+            w.set_visible(true);
             w.request_redraw();
-            self.janelas.push(Janela { id, w, tela, quadro: Quadro::default(), states: States::default(), cursor: None, icon: CursorIcon::Default, transparente: s.transparent, fechar_ao_pedir: s.close_on_request, tudo: true, mover: false, ultimo_mover: std::time::Instant::now() });
+            self.janelas.push(Janela { id, w, tela, quadro: Quadro::default(), states: States::default(), cursor: None, icon: CursorIcon::Default, transparente: s.transparent, fechar_ao_pedir: s.close_on_request, tudo: true, mover: false, ultimo_mover: std::time::Instant::now(), proximo: None, acesso, leitor: false, arvore: None });
             let (dela, outras) = std::mem::take(&mut self.pendentes).into_iter().partition(|(i, _)| *i == id);
             self.pendentes = outras;
             for (i, c) in dela {
@@ -458,6 +481,42 @@ impl<A: App> Runtime<A> {
         }
     }
 
+    /// Os pedidos do leitor de tela. Clicar e focar viram um clique no meio do widget: cada um
+    /// já sabe o que fazer com o clique.
+    fn acessibilidade(&mut self, e: accesskit_winit::Event) {
+        let Some(i) = self.janelas.iter().position(|j| j.w.id() == e.window_id) else { return };
+        let j = &mut self.janelas[i];
+        match e.window_event {
+            accesskit_winit::WindowEvent::InitialTreeRequested => {
+                j.leitor = true;
+                j.arvore = None;
+                j.w.request_redraw();
+            }
+            accesskit_winit::WindowEvent::AccessibilityDeactivated => {
+                j.leitor = false;
+                j.arvore = None;
+            }
+            accesskit_winit::WindowEvent::ActionRequested(pedido) => {
+                use accesskit::Action;
+                if !matches!(pedido.action, Action::Click | Action::Focus) {
+                    return;
+                }
+                let alvo = j.arvore.as_ref().and_then(|t| t.nodes.iter().find(|(id, _)| *id == pedido.target_node)).and_then(|(_, n)| n.bounds());
+                let Some(b) = alvo else { return };
+                let meio = Point::new(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+                let antes = j.cursor.replace(meio);
+                self.event(i, Event::MousePressed(crate::MouseButton::Left));
+                if i < self.janelas.len() {
+                    self.event(i, Event::MouseReleased(crate::MouseButton::Left));
+                }
+                if let Some(j) = self.janelas.get_mut(i) {
+                    j.cursor = antes;
+                    j.w.request_redraw();
+                }
+            }
+        }
+    }
+
     fn entregar_mover(&mut self, i: usize) {
         let j = &mut self.janelas[i];
         if std::mem::take(&mut j.mover) {
@@ -478,15 +537,18 @@ impl<A: App> Runtime<A> {
         let tudo = std::mem::replace(&mut j.tudo, false);
         self.renderer.trocar(&mut j.quadro);
         let t0 = std::time::Instant::now();
+        j.states.tick(t0);
         let el = self.app.view_window(j.id);
         let t1 = t0.elapsed();
         let node = widget::layout(&el, size, &mut self.renderer, &j.states, &theme);
         let t2 = t0.elapsed();
         let (states, cursor, inspecionar) = (&j.states, j.cursor, self.inspecionar);
         let pintar = |r: &mut Renderer| widget::draw(&el, &node, r, states, &theme, cursor, inspecionar);
-        // Primeiro grava (barato: só áreas e hashes) e compara com o quadro na tela.
+        // Primeiro grava (barato: só áreas e hashes) e compara com o quadro na tela. Com leitor de
+        // tela, a gravação também monta a árvore de acessibilidade.
         self.renderer.record();
-        let icon = pintar(&mut self.renderer);
+        let mut acesso = j.leitor.then(Access::default);
+        let icon = widget::draw_access(&el, &node, &mut self.renderer, states, &theme, cursor, inspecionar, acesso.as_mut());
         let mudou = self.renderer.changes();
         if std::env::var_os("PELICANO_DANO").is_some() { eprintln!("[dano] {mudou:?} view {t1:?} layout {t2:?} gravar {:?}", t0.elapsed()); }
         let regioes = match mudou {
@@ -505,6 +567,17 @@ impl<A: App> Runtime<A> {
             pintar(&mut self.renderer);
         }
         drop(el);
+        if let Some(a) = acesso {
+            let arvore = a.tree(&w.title(), escala as f64, j.states.focus);
+            if j.arvore.as_ref() != Some(&arvore) {
+                j.arvore = Some(arvore.clone());
+                j.acesso.update_if_active(|| arvore);
+            }
+        }
+        // Transição no meio do caminho: o próximo quadro vem no ritmo do monitor.
+        if j.states.animating() {
+            j.proximo = Some(t0 + self.intervalo.unwrap_or(std::time::Duration::from_millis(16)));
+        }
         if icon != j.icon {
             j.icon = icon;
             w.set_cursor(icon);
@@ -556,7 +629,7 @@ fn atributos(s: &Settings) -> winit::window::WindowAttributes {
     attrs
 }
 
-impl<A: App> ApplicationHandler<A::Msg> for Runtime<A> {
+impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if std::mem::replace(&mut self.iniciou, true) {
             return;
@@ -572,16 +645,26 @@ impl<A: App> ApplicationHandler<A::Msg> for Runtime<A> {
         if self.sair {
             return el.exit();
         }
+        let agora = std::time::Instant::now();
+        let mut prox: Option<std::time::Instant> = None;
+        for j in &mut self.janelas {
+            match j.proximo {
+                Some(q) if agora >= q => {
+                    j.proximo = None;
+                    j.w.request_redraw();
+                }
+                Some(q) => prox = Some(prox.map_or(q, |p| p.min(q))),
+                None => {}
+            }
+        }
         if !self.janelas.iter().any(|j| j.mover) {
-            return el.set_control_flow(ControlFlow::Wait);
+            return el.set_control_flow(prox.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
         }
         let janela = self.janelas.first().map(|j| j.w.clone());
         let intervalo = *self.intervalo.get_or_insert_with(|| {
             let hz = janela.and_then(|w| w.current_monitor()).and_then(|m| m.refresh_rate_millihertz()).unwrap_or(60_000);
             std::time::Duration::from_micros(1_000_000_000 / hz.max(1000) as u64)
         });
-        let agora = std::time::Instant::now();
-        let mut prox: Option<std::time::Instant> = None;
         let mut i = 0;
         while i < self.janelas.len() {
             let j = &self.janelas[i];
@@ -606,8 +689,11 @@ impl<A: App> ApplicationHandler<A::Msg> for Runtime<A> {
         self.clipboard = Box::new(widget::MemoryClipboard::default());
     }
 
-    fn user_event(&mut self, el: &ActiveEventLoop, m: A::Msg) {
-        self.update(vec![m]);
+    fn user_event(&mut self, el: &ActiveEventLoop, e: Evento<A::Msg>) {
+        match e {
+            Evento::App(m) => self.update(vec![m]),
+            Evento::Acesso(a) => self.acessibilidade(a),
+        }
         self.abrir_janelas(el);
         if self.sair {
             el.exit();
@@ -617,6 +703,7 @@ impl<A: App> ApplicationHandler<A::Msg> for Runtime<A> {
     fn window_event(&mut self, el: &ActiveEventLoop, wid: winit::window::WindowId, we: WindowEvent) {
         let Some(i) = self.janelas.iter().position(|j| j.w.id() == wid) else { return };
         let j = &mut self.janelas[i];
+        j.acesso.process_event(&j.w, &we);
         let escala = j.w.scale_factor();
         let ev = match we {
             WindowEvent::RedrawRequested => return self.redraw(i),

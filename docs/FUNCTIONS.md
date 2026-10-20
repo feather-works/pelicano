@@ -195,9 +195,11 @@ A caixa de qualquer widget:
 | `shadow` | `Option<Shadow>` | Sombra desfocada de verdade. |
 | `text_color` | `Option<Color>` | Cor herdada pelos textos de dentro. |
 | `backdrop_blur` | `f32` | Desfoca o que está atrás da caixa (o `backdrop-filter: blur()` do CSS). |
+| `transition` | `Option<Transition>` | Mudanças de estilo andam em vez de pular (o `transition` do CSS). Veja a seção 5. |
 
 Construtores: `Style::glass(raio)` (vidro pronto: fundo translúcido, fio de luz na borda, sombra e desfoque 18) e
-os encadeáveis `.background(..)`, `.border(..)`, `.shadow(..)`, `.text_color(..)` e `.backdrop_blur(..)`.
+os encadeáveis `.background(..)`, `.border(..)`, `.shadow(..)`, `.text_color(..)`, `.backdrop_blur(..)` e `.transition(..)`.
+Os estilos padrão (`button_primary`, `button_text`, `input_default`) já vêm com uma transição de 120 ms.
 
 ### `Status`
 
@@ -337,6 +339,84 @@ canvas(width, height, paint: impl Fn(&mut Renderer, Rect, &Theme)) -> Canvas
 ```
 
 Um retângulo onde você desenha à mão com o `Renderer` (gráficos, réguas, prévias). `paint` recebe a área do canvas em coordenadas absolutas.
+
+`Renderer::push_opacity(a)` / `pop_opacity()`: tudo desenhado no meio sai com o alfa multiplicado por `a`.
+Cada desenho fica translúcido por conta própria, não o grupo: onde dois se sobrepõem, o de baixo aparece um pouco.
+`Renderer::push_layer(area, escala, graus, opacidade)` / `pop_layer()`: o que for desenhado no meio cai numa camada
+do tamanho de `area` e vai para a tela transformado em volta do centro dela, com a opacidade do grupo.
+
+---
+
+## 5. Transições, animações e acessibilidade (`anim.rs`, `access.rs`)
+
+### Transições
+
+```rust
+button("Salvar").style(|t, s| button_primary(t, s).transition(Transition::new(200).easing(Easing::EaseOut)))
+```
+
+| Tipo | O que é |
+|---|---|
+| `Transition::new(ms)` | Duração. `.easing(Easing)` e `.delay(ms)` encadeiam. |
+| `Easing` | `Linear`, `Ease` (padrão), `EaseIn`, `EaseOut`, `EaseInOut`, `CubicBezier(x1, y1, x2, y2)`, as curvas do CSS. `apply(t)` dá o progresso. |
+| `Lerp` | O que sabe ir de um valor a outro: `f32`, `Point`, `Color`, `Border`, `Shadow`, `Background`, `Style`, `Keyframe`, `Option<T>`. |
+
+Com o estilo tendo `transition`, qualquer mudança dele anda: hover, foco, ou o app trocar a cor (cartão escolhido).
+Fundo e sombra que surgem ou somem vêm do transparente; degradês com número diferente de paradas trocam no meio.
+
+Num widget próprio: `cx.transition(node.key, alvo, Transition)` em `draw` devolve o valor de agora a caminho de
+`alvo` (cada tipo de valor anda separado). `cx.styled(node.key, style)` aplica a transição do próprio estilo.
+
+### `animate`
+
+```rust
+animate(content) -> Animate
+```
+
+| Método | O que faz |
+|---|---|
+| `.opacity(f32)` / `.offset(x, y)` / `.scale(k)` / `.rotate(graus)` | O alvo. Mudou, anima até lá. Nada disso mexe no layout (o `transform` do CSS); o clique segue o deslocamento (não a escala nem a rotação). |
+| `.transition(Transition)` | Padrão: 250 ms, `Ease`. |
+| `.hover(Keyframe)` / `.pressed(Keyframe)` | O alvo com o mouse em cima / com o botão apertado em cima (o `:hover` e o `:active`). |
+| `.enter(Keyframe)` | Como ele aparece: ao entrar na tela anima dali até o alvo (o `@starting-style`). Sumir de um quadro e voltar conta como entrar. |
+| `.show(bool)` / `.exit(Keyframe)` | `show(false)` anima até a saída (padrão: só some), depois para de desenhar e de pegar clique. O lugar no layout continua ocupado (numa pilha não se nota). |
+| `.repeat(Repeat::Forever \| Repeat::Alternate)` | Laço sem fim da entrada (ou do normal) até o alvo: pulsar, piscar, girar (`.rotate(360.0)` com `Easing::Linear`). |
+
+`Keyframe::default().opacity(0.0).offset(0.0, 24.0).scale(0.9).rotate(15.0)` monta um quadro-chave (o padrão é
+opacidade 1, no lugar, tamanho 1, sem giro). Escala e rotação desenham o grupo numa camada (`Renderer::push_layer`),
+que também deixa a opacidade certa para o grupo; um vidro dentro dela não vê o que está atrás.
+
+Os widgets prontos já animam: menus, calendário e seletor de cor surgem crescendo um pouco (o menu também se apaga
+ao fechar); a dica aparece depois de 350 ms em cima; checkbox enche de cor, rádio engrossa, toggler desliza, a bolinha
+do slider cresce, a barra de progresso escorrega até o valor novo e as abas trocam de cor andando.
+
+Como roda: o relógio é o do quadro (`States::tick`). Enquanto alguma transição não acabou, a janela pede o próximo
+quadro no ritmo do monitor e redesenha só a área que mudou; parado, não roda nada. Sem `tick` (capturas com
+`capture`, testes), tudo já está no fim. Para testar o meio de uma animação: `states.tick(instante)` antes do `draw`,
+e `states.animating()` diz se ainda falta.
+
+### Acessibilidade (AccessKit)
+
+A janela conversa sozinha com o leitor de tela do sistema (Orca, NVDA, Narrador, VoiceOver). A árvore sai do
+próprio desenho e só é montada quando há um leitor ligado.
+
+| Widget | Para o leitor |
+|---|---|
+| `text` | Rótulo. Dentro de um botão, vira o nome do botão. |
+| `button`, `mouse_area` clicável | Botão (desabilitado sem `on_press`). |
+| `text_input` | Campo (senha sem o valor), com o placeholder. |
+| `text_editor` | Campo de várias linhas, com o texto. |
+| `checkbox`, `toggler`, `radio` | Caixa, chave ou rádio, marcado ou não. |
+| `pick_list` | Caixa de seleção com o valor e se está aberta. |
+| `slider`, `progress_bar` | Valor, mínimo e máximo. |
+| `scrollable` | Área de rolagem com o conteúdo dentro. |
+
+`Element::access_label("Fechar")`: o nome que o leitor fala (o `aria-label`): botão só de ícone, imagem.
+Clicar e focar pelo leitor viram um clique no meio do widget.
+
+Num widget próprio: `cx.access(key, rect, || accesskit::Node::new(Role::..))` em `draw`, ou `access_begin` / `access_end`
+para nós com filhos; `cx.access_text` para texto. `pelicano::accesskit` é o crate. `access_tree(..)` devolve a árvore
+de um quadro (para testes).
 
 ---
 

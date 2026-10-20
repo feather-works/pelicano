@@ -1,5 +1,7 @@
 //! Controles prontos: checkbox, toggler, dropdown, slider e régua.
-use crate::widget::{CursorIcon, DrawCx, Element, EventCx, LayoutCx, Limits, Node, Num, Widget};
+use crate::access::accesskit::{Action, Role};
+use crate::anim::{Lerp, Transition};
+use crate::widget::{no, surgir, ABRIR, CursorIcon, DrawCx, Element, EventCx, LayoutCx, Limits, Node, Num, Widget};
 use crate::{Background, Border, Captured, Color, Event, Font, Key, Length, MouseButton, NamedKey, Point, Rect, Shadow, Size, Status};
 use std::borrow::Cow;
 
@@ -84,24 +86,45 @@ impl<M> Widget<M> for Toggle<'_, M> {
         let m = self.marca();
         let r = Rect { x: n.rect.x, y: n.rect.y + (n.rect.height - m.height) / 2.0, width: m.width, height: m.height };
         let apagado = if st == Status::Disabled { 0.45 } else { 1.0 };
+        let (papel, rotulo, marcado, desabilitado) = (match self.forma {
+            Forma::Caixa => Role::CheckBox,
+            Forma::Chave => Role::Switch,
+            Forma::Radio => Role::RadioButton,
+        }, &self.label, self.checked, self.on_toggle.is_none());
+        cx.access(n.key, n.rect, || {
+            let mut a = no(papel, &[Action::Click]);
+            a.set_label(&**rotulo);
+            a.set_toggled(marcado.into());
+            if desabilitado {
+                a.set_disabled();
+            }
+            a
+        });
         match self.forma {
             Forma::Caixa => {
-                let (bg, borda) = if self.checked { (ativa, ativa) } else { (t.surface, if hover { t.muted } else { t.border }) };
+                // A caixa enche de cor e o visto aparece junto.
+                let p = cx.transition(n.key, if self.checked { 1.0f32 } else { 0.0 }, Transition::new(140));
+                let vazia = if hover { t.muted } else { t.border };
+                let (bg, borda) = (t.surface.lerp(&ativa, p), vazia.lerp(&ativa, p));
                 cx.renderer.fill_quad(r, Some(&bg.alpha(apagado).into()), Border::rounded(4.0).color(borda.alpha(apagado), 1.0), None);
-                if self.checked {
-                    let p = |x: f32, y: f32| Point::new(r.x + x, r.y + y);
-                    cx.renderer.stroke(&[p(4.0, 8.5), p(7.0, 11.5), p(12.0, 5.0)], 2.0, t.on_primary);
+                if p > 0.0 {
+                    let q = |x: f32, y: f32| Point::new(r.x + x, r.y + y);
+                    cx.renderer.stroke(&[q(4.0, 8.5), q(7.0, 11.5), q(12.0, 5.0)], 2.0, t.on_primary.alpha(p));
                 }
             }
             Forma::Radio => {
-                let borda = if self.checked { ativa } else if hover { t.muted } else { t.border };
-                cx.renderer.fill_quad(r, Some(&t.surface.alpha(apagado).into()), Border::rounded(8.0).color(borda.alpha(apagado), if self.checked { 5.0 } else { 1.0 }), None);
+                // O anel engrossa até virar o ponto.
+                let p = cx.transition(n.key, if self.checked { 1.0f32 } else { 0.0 }, Transition::new(160));
+                let vazia = if hover { t.muted } else { t.border };
+                cx.renderer.fill_quad(r, Some(&t.surface.alpha(apagado).into()), Border::rounded(8.0).color(vazia.lerp(&ativa, p).alpha(apagado), 1.0 + 4.0 * p), None);
             }
             Forma::Chave => {
-                let trilho = if self.checked { ativa } else { t.text.alpha(0.2) };
+                // A bolinha desliza até o outro lado em vez de pular.
+                let p = cx.transition(n.key, if self.checked { 1.0f32 } else { 0.0 }, Transition::new(160));
+                let trilho = t.text.alpha(0.2).lerp(&ativa, p);
                 cx.renderer.fill_quad(r, Some(&trilho.alpha(trilho.a * apagado).into()), Border::rounded(m.height / 2.0), None);
                 let d = m.height - 4.0;
-                let x = if self.checked { r.x + m.width - d - 2.0 } else { r.x + 2.0 };
+                let x = r.x + 2.0 + (m.width - d - 4.0) * p;
                 let bola = Rect { x, y: r.y + 2.0, width: d, height: d };
                 cx.renderer.fill_quad(bola, Some(&Color::WHITE.into()), Border::rounded(d / 2.0), Some(Shadow { color: Color::BLACK.alpha(0.25), offset: Point::new(0.0, 1.0), blur: 2.0 }));
             }
@@ -189,6 +212,12 @@ impl<'a, T: Clone + PartialEq + ToString + 'a, M> Widget<M> for PickList<'a, T, 
             Some(s) => (s.to_string(), cx.text_color),
             None => (self.placeholder.to_string(), t.muted),
         };
+        cx.access(n.key, n.rect, || {
+            let mut a = no(Role::ComboBox, &[Action::Click]);
+            a.set_value(&*rotulo);
+            a.set_expanded(aberto);
+            a
+        });
         let th = cx.renderer.measure(&rotulo, self.size, Font::DEFAULT, None).height;
         let y = n.rect.y + (n.rect.height - th) / 2.0;
         cx.renderer.push_clip(Rect { width: n.rect.width - 28.0, ..n.rect }, [0.0; 4]);
@@ -197,13 +226,18 @@ impl<'a, T: Clone + PartialEq + ToString + 'a, M> Widget<M> for PickList<'a, T, 
         let (ax, ay) = (n.rect.x + n.rect.width - 18.0, n.rect.y + n.rect.height / 2.0);
         let seta = if aberto { [Point::new(ax - 4.0, ay + 2.0), Point::new(ax, ay - 2.0), Point::new(ax + 4.0, ay + 2.0)] } else { [Point::new(ax - 4.0, ay - 2.0), Point::new(ax, ay + 2.0), Point::new(ax + 4.0, ay - 2.0)] };
         cx.renderer.stroke(&seta, 1.5, t.muted);
-        if !aberto {
+        // O menu surge ao abrir e se apaga ao fechar.
+        let p = cx.transition(n.key, if aberto { 1.0f32 } else { 0.0 }, ABRIR);
+        if p <= 0.0 {
             return;
         }
         let menu = self.menu(n.rect, cx.renderer.window_size().height);
         let itens: Vec<(String, bool)> = self.options.iter().map(|o| (o.to_string(), self.selected.as_ref() == Some(o))).collect();
-        let (cursor, size) = (cx.cursor, self.size);
-        cx.overlay(move |rd| {
+        if aberto {
+            cx.popup(menu);
+        }
+        let (cursor, size) = (cx.popup_cursor().filter(|_| aberto), self.size);
+        cx.overlay(move |rd| surgir(rd, menu, p, |rd| {
             rd.fill_quad(menu, Some(&t.surface.into()), Border::rounded(8.0).color(t.border, 1.0), Some(Shadow { color: Color::BLACK.alpha(0.3), offset: Point::new(0.0, 6.0), blur: 14.0 }));
             for (i, (s, escolhido)) in itens.iter().enumerate() {
                 let r = Rect { x: menu.x + 4.0, y: menu.y + 4.0 + i as f32 * ITEM, width: menu.width - 8.0, height: ITEM };
@@ -214,13 +248,12 @@ impl<'a, T: Clone + PartialEq + ToString + 'a, M> Widget<M> for PickList<'a, T, 
                 let th = rd.measure(s, size, Font::DEFAULT, None).height;
                 rd.draw_text(s, size, Font::DEFAULT, t.text, Point::new(r.x + 8.0, r.y + (ITEM - th) / 2.0), None);
             }
-        });
+        }));
     }
     fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
         let aberto = cx.states.get::<Aberto>(n.key).is_some_and(|a| a.0);
-        let p = cx.cursor;
+        let p = cx.popup_cursor();
         match ev {
-            // shortcut: o menu recebe o clique antes dos irmãos seguintes, mas um irmão anterior que fique embaixo dele ganha; um canal de "popup" na raiz resolve se aparecer.
             Event::MousePressed(MouseButton::Left) if aberto => {
                 cx.states.get_mut::<Aberto>(n.key).0 = false;
                 cx.redraw = true;
@@ -316,11 +349,21 @@ impl<M> Widget<M> for Slider<'_, M> {
         cx.renderer.fill_quad(trilho, Some(&t.text.alpha(0.15).into()), Border::rounded(2.0), None);
         let cor = self.color.unwrap_or(t.primary);
         cx.renderer.fill_quad(Rect { width: trilho.width * frac, ..trilho }, Some(&cor.into()), Border::rounded(2.0), None);
+        cx.access(n.key, n.rect, || {
+            let mut s = no(Role::Slider, &[]);
+            s.set_numeric_value(self.value as f64);
+            s.set_min_numeric_value(a as f64);
+            s.set_max_numeric_value(b as f64);
+            if self.step > 0.0 {
+                s.set_numeric_value_step(self.step as f64);
+            }
+            s
+        });
         let ativo = cx.hovered(&n.rect) || cx.states.get::<Arrastando>(n.key).is_some_and(|d| d.0);
         if ativo {
             cx.cursor_icon = CursorIcon::Pointer;
         }
-        let d = if ativo { 16.0 } else { 14.0 };
+        let d = cx.transition(n.key, if ativo { 16.0f32 } else { 14.0 }, Transition::new(120));
         let bola = Rect { x: trilho.x + trilho.width * frac - d / 2.0, y: n.rect.y + 10.0 - d / 2.0, width: d, height: d };
         cx.renderer.fill_quad(bola, Some(&Color::WHITE.into()), Border::rounded(d / 2.0).color(cor, 2.0), Some(Shadow { color: Color::BLACK.alpha(0.2), offset: Point::new(0.0, 1.0), blur: 2.0 }));
     }
@@ -427,7 +470,7 @@ pub fn tabs<'a, M: Clone + 'a>(labels: &[&'a str], active: usize, on_select: imp
             // O sublinhado é o fim do próprio fundo: um filho "encher" ao lado esticaria a aba.
             let barra = if ativa { t.primary } else { fundo };
             let bg = Background::Linear { angle: std::f32::consts::FRAC_PI_2, stops: vec![(0.0, fundo), (0.94, fundo), (0.95, barra), (1.0, barra)] };
-            crate::Style::default().text_color(cor).background(bg).border(Border { radius: [6.0, 6.0, 0.0, 0.0], ..Border::default() })
+            crate::Style::default().text_color(cor).background(bg).border(Border { radius: [6.0, 6.0, 0.0, 0.0], ..Border::default() }).transition(Transition::new(160))
         })
         .into()
     });
