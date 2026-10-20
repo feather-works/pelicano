@@ -18,6 +18,7 @@ impl Font {
     pub const SEMIBOLD: Font = Font { family: None, weight: 600 };
     pub const BOLD: Font = Font { family: None, weight: 700 };
     pub const MONO: Font = Font { family: Some("monospace"), weight: 400 };
+    pub const SERIF: Font = Font { family: Some("serif"), weight: 400 };
 }
 
 impl Default for Font {
@@ -159,10 +160,38 @@ pub struct Renderer {
     mudou: Option<(u32, u32)>,
 }
 
+/// O que um quadro deixa para o próximo. Com várias janelas, cada uma guarda o seu e troca com
+/// o renderizador na hora de desenhar: as fontes e os caches ficam um só.
+pub(crate) struct Quadro {
+    pixmap: Pixmap,
+    scale: f32,
+    anterior: Vec<(Rect, u64)>,
+    vidros: Vec<(Rect, f32)>,
+    mudou: Option<(u32, u32)>,
+}
+
+impl Default for Quadro {
+    fn default() -> Self {
+        Quadro { pixmap: Pixmap::new(1, 1).expect("1x1"), scale: 1.0, anterior: Vec::new(), vidros: Vec::new(), mudou: None }
+    }
+}
+
 struct Parcial {
     cheio: Pixmap,
     /// A parte que vale de verdade (a margem em volta só serve ao desfoque), em pixels.
     dentro: (i32, i32, i32, i32),
+}
+
+/// As fontes do sistema. O fontdb chama de monoespaçada a "Courier New", que no Linux cai na
+/// Courier fina: troca pela primeira monoespaçada moderna instalada.
+fn fontes() -> FontSystem {
+    let mut f = FontSystem::new();
+    let db = f.db_mut();
+    let tem = |nome: &str| db.faces().any(|face| face.families.iter().any(|(n, _)| n == nome));
+    if let Some(nome) = ["Cascadia Mono", "Consolas", "SF Mono", "Menlo", "DejaVu Sans Mono", "Noto Sans Mono", "Liberation Mono"].into_iter().find(|n| tem(n)) {
+        db.set_monospace_family(nome);
+    }
+    f
 }
 
 impl Renderer {
@@ -170,7 +199,7 @@ impl Renderer {
         Renderer {
             pixmap: Pixmap::new(1, 1).expect("1x1"),
             scale: 1.0,
-            fonts: FontSystem::new(),
+            fonts: fontes(),
             swash: SwashCache::new(),
             texts: Cache::default(),
             svgs: Cache::default(),
@@ -186,6 +215,17 @@ impl Renderer {
             anterior: Vec::new(),
             mudou: None,
         }
+    }
+
+    /// Troca o quadro guardado pelo que está aqui (veja [`Quadro`]).
+    pub(crate) fn trocar(&mut self, q: &mut Quadro) {
+        self.end();
+        std::mem::swap(&mut self.pixmap, &mut q.pixmap);
+        std::mem::swap(&mut self.anterior, &mut q.anterior);
+        std::mem::swap(&mut self.vidros, &mut q.vidros);
+        std::mem::swap(&mut self.mudou, &mut q.mudou);
+        // A escala vale do quadro: trocar não limpa os caches (o `begin` limpa se mudar de verdade).
+        std::mem::swap(&mut self.scale, &mut q.scale);
     }
 
     /// Prepara um quadro novo de `size` lógico na escala `scale`, limpo com `fundo`.
@@ -338,6 +378,7 @@ impl Renderer {
             let attrs = Attrs::new().weight(Weight(font.weight)).family(match font.family {
                 None => Family::SansSerif,
                 Some("monospace") => Family::Monospace,
+                Some("serif") => Family::Serif,
                 Some(nome) => Family::Name(nome),
             });
             b.set_text(fonts, text, attrs, Shaping::Advanced);
@@ -372,41 +413,77 @@ impl Renderer {
             self.gravou(Rect::new(at, m), k);
             return;
         }
-        let at = Point::new(at.x - self.origem.x, at.y - self.origem.y);
-        let s = self.scale;
-        let (ox, oy) = ((at.x * s).round() as i32, (at.y * s).round() as i32);
-        let clip = self.clips.last().map(|c| c.rect);
-        let cor = cosmic_text::Color::rgba((color.r * 255.0) as u8, (color.g * 255.0) as u8, (color.b * 255.0) as u8, (color.a * 255.0) as u8);
         self.buffer(text, size, font, max_width);
-        let key = TextKey { text: text.to_owned(), size: (size * s * 64.0) as u32, font, width: max_width.map(|w| (w * s) as u32) };
+        let key = TextKey { text: text.to_owned(), size: (size * self.scale * 64.0) as u32, font, width: max_width.map(|w| (w * self.scale) as u32) };
         let b = self.texts.get(&key).expect("criado pelo buffer");
-        let (w, h) = (self.pixmap.width() as i32, self.pixmap.height() as i32);
-        let (cx0, cy0, cx1, cy1) = match clip {
-            Some(r) => ((r.x * s).floor() as i32, (r.y * s).floor() as i32, ((r.x + r.width) * s).ceil() as i32, ((r.y + r.height) * s).ceil() as i32),
-            None => (0, 0, w, h),
-        };
-        let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
-        let precisa = self.clips.last().is_some_and(|c| c.rounded);
-        let mask = if precisa { clip_mask(&mut self.clips, pw, ph, s, None).map(|m| m.data()) } else { None };
-        let px = self.pixmap.pixels_mut();
-        b.draw(&mut self.fonts, &mut self.swash, cor, |x, y, gw, gh, c| {
-            let a = c.a() as u32;
-            if a == 0 {
-                return;
-            }
-            for yy in (oy + y).max(cy0.max(0))..(oy + y + gh as i32).min(cy1.min(h)) {
-                for xx in (ox + x).max(cx0.max(0))..(ox + x + gw as i32).min(cx1.min(w)) {
-                    let i = (yy * w + xx) as usize;
-                    let a = match mask {
-                        Some(m) => a * m[i] as u32 / 255,
-                        None => a,
-                    };
-                    blend(&mut px[i], c.r(), c.g(), c.b(), a);
-                }
-            }
-        });
+        let at = Point::new(at.x - self.origem.x, at.y - self.origem.y);
+        pintar_glifos(b, &mut self.fonts, &mut self.swash, &mut self.pixmap, &mut self.clips, self.scale, at, color);
     }
 
+    /// As fontes, para quem monta o próprio `Buffer` (o editor de texto).
+    pub(crate) fn fonts(&mut self) -> &mut FontSystem {
+        &mut self.fonts
+    }
+
+    /// Os glifos de um `Buffer` já montado (em pixels físicos), a partir de `at` lógico.
+    /// Gravando, anota `area` com a impressão digital `chave`, que o dono do buffer calcula
+    /// (o conteúdo dele não está aqui para entrar no hash).
+    pub(crate) fn draw_buffer(&mut self, b: &Buffer, at: Point, color: Color, area: Rect, chave: u64) {
+        let mut k = Chave::new(7);
+        k.h(chave).f(at.x).f(at.y).c(color);
+        if self.gravou(area, k) {
+            return;
+        }
+        let at = Point::new(at.x - self.origem.x, at.y - self.origem.y);
+        pintar_glifos(b, &mut self.fonts, &mut self.swash, &mut self.pixmap, &mut self.clips, self.scale, at, color);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pintar_glifos(b: &Buffer, fonts: &mut FontSystem, swash: &mut SwashCache, pixmap: &mut Pixmap, clips: &mut [Clip], s: f32, at: Point, color: Color) {
+    let (ox, oy) = ((at.x * s).round() as i32, (at.y * s).round() as i32);
+    let clip = clips.last().map(|c| c.rect);
+    let cor = cosmic_text::Color::rgba((color.r * 255.0) as u8, (color.g * 255.0) as u8, (color.b * 255.0) as u8, (color.a * 255.0) as u8);
+    let (w, h) = (pixmap.width() as i32, pixmap.height() as i32);
+    let (cx0, cy0, cx1, cy1) = match clip {
+        Some(r) => ((r.x * s).floor() as i32, (r.y * s).floor() as i32, ((r.x + r.width) * s).ceil() as i32, ((r.y + r.height) * s).ceil() as i32),
+        None => (0, 0, w, h),
+    };
+    let (pw, ph) = (pixmap.width(), pixmap.height());
+    let precisa = clips.last().is_some_and(|c| c.rounded);
+    let mask = if precisa { clip_mask(clips, pw, ph, s, None).map(|m| m.data()) } else { None };
+    let px = pixmap.pixels_mut();
+    // O laço do `Buffer::draw`, mas pulando glifos de cor transparente (o swash ignora o alfa
+    // da cor; o Markdown esconde sinais assim) e linhas fora do recorte.
+    for run in b.layout_runs() {
+        let topo = oy + run.line_top as i32;
+        if topo > cy1 || topo + run.line_height.ceil() as i32 + 1 < cy0 {
+            continue;
+        }
+        for g in run.glyphs {
+            let cor_g = g.color_opt.unwrap_or(cor);
+            if cor_g.a() == 0 {
+                continue;
+            }
+            let fis = g.physical((0., 0.), 1.0);
+            swash.with_pixels(fonts, fis.cache_key, cor_g, |x, y, c| {
+                let a = c.a() as u32;
+                let (xx, yy) = (ox + fis.x + x, oy + run.line_y as i32 + fis.y + y);
+                if a == 0 || xx < cx0.max(0) || xx >= cx1.min(w) || yy < cy0.max(0) || yy >= cy1.min(h) {
+                    return;
+                }
+                let i = (yy * w + xx) as usize;
+                let a = match mask {
+                    Some(m) => a * m[i] as u32 / 255,
+                    None => a,
+                };
+                blend(&mut px[i], c.r(), c.g(), c.b(), a);
+            });
+        }
+    }
+}
+
+impl Renderer {
     /// Retângulo com fundo, borda e sombra; o raio vale para os três.
     pub fn fill_quad(&mut self, r: Rect, bg: Option<&Background>, border: Border, shadow: Option<Shadow>) {
         if self.gravando {

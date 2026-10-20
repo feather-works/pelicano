@@ -357,7 +357,7 @@ impl Style {
     pub fn text_color(self, c: Color) -> Self {
         Style { text_color: Some(c), ..self }
     }
-    fn paint(&self, r: Rect, cx: &mut DrawCx) {
+    pub(crate) fn paint(&self, r: Rect, cx: &mut DrawCx) {
         if self.backdrop_blur > 0.0 {
             if let Some(sh) = self.shadow {
                 cx.renderer.fill_quad(r, None, self.border, Some(sh));
@@ -1017,11 +1017,18 @@ impl<M: Clone> Widget<M> for Button<'_, M> {
         let dentro = cx.cursor.is_some_and(|p| n.rect.contains(p));
         match ev {
             Event::MousePressed(MouseButton::Left) if dentro && self.on_press.is_some() => {
+                // Um botão dentro deste (o × de uma aba) recebe o clique primeiro.
+                if self.content.0.event(&n.children[0], ev, cx) == Captured::Yes {
+                    return Captured::Yes;
+                }
                 cx.states.get_mut::<Apertado>(n.key).0 = true;
                 cx.redraw = true;
                 Captured::Yes
             }
             Event::MouseReleased(MouseButton::Left) => {
+                if self.content.0.event(&n.children[0], ev, cx) == Captured::Yes {
+                    return Captured::Yes;
+                }
                 let a = std::mem::take(&mut cx.states.get_mut::<Apertado>(n.key).0);
                 if a {
                     cx.redraw = true;
@@ -1267,10 +1274,35 @@ pub struct TextInput<'a, M> {
     width: Length,
     secure: bool,
     style: Option<StyleFn<'a>>,
+    autofocus: Option<u64>,
+}
+
+/// O último pedido de foco ([`TextInput::autofocus`]) que o widget já atendeu.
+#[derive(Default)]
+pub(crate) struct Autofoco(Option<u64>);
+
+/// Há um pedido de foco novo para `key`: a próxima tecla é dele.
+pub(crate) fn foco_pendente(states: &States, key: u64, pedido: Option<u64>) -> bool {
+    pedido.is_some_and(|p| states.focus != Some(key) && states.get::<Autofoco>(key).and_then(|a| a.0) != Some(p))
+}
+
+/// Atende um pedido de foco: a tecla toma o foco, um clique em qualquer lugar só o cancela.
+pub(crate) fn atender_foco(ev: &Event, states: &mut States, key: u64, pedido: Option<u64>) {
+    if !foco_pendente(states, key, pedido) {
+        return;
+    }
+    match ev {
+        Event::Key { pressed: true, .. } => {
+            states.get_mut::<Autofoco>(key).0 = pedido;
+            states.focus = Some(key);
+        }
+        Event::MousePressed(_) => states.get_mut::<Autofoco>(key).0 = pedido,
+        _ => {}
+    }
 }
 
 pub fn text_input<'a, M>(placeholder: impl Into<Cow<'a, str>>, value: impl Into<Cow<'a, str>>) -> TextInput<'a, M> {
-    TextInput { placeholder: placeholder.into(), value: value.into(), on_input: None, on_submit: None, size: 14.0, font: Font::DEFAULT, padding: [6u16, 10].into(), width: Length::FILL, secure: false, style: None }
+    TextInput { placeholder: placeholder.into(), value: value.into(), on_input: None, on_submit: None, size: 14.0, font: Font::DEFAULT, padding: [6u16, 10].into(), width: Length::FILL, secure: false, style: None, autofocus: None }
 }
 
 impl<'a, M> TextInput<'a, M> {
@@ -1280,6 +1312,12 @@ impl<'a, M> TextInput<'a, M> {
     }
     pub fn on_submit(mut self, m: M) -> Self {
         self.on_submit = Some(m);
+        self
+    }
+    /// Pede o foco: a próxima tecla digitada vem para o campo (um clique antes cancela).
+    /// Mude o número para pedir de novo (ao reabrir um painel de busca, por exemplo).
+    pub fn autofocus(mut self, pedido: u64) -> Self {
+        self.autofocus = Some(pedido);
         self
     }
     pub fn size(mut self, s: impl Into<Num>) -> Self {
@@ -1353,7 +1391,7 @@ impl<M: Clone> Widget<M> for TextInput<'_, M> {
         Node::leaf(cx.key(), Size::new(w, h))
     }
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
-        let focado = cx.states.focus == Some(n.key);
+        let focado = cx.states.focus == Some(n.key) || foco_pendente(cx.states, n.key, self.autofocus);
         let hover = cx.hovered(&n.rect);
         let status = if self.on_input.is_none() {
             Status::Disabled
@@ -1390,6 +1428,7 @@ impl<M: Clone> Widget<M> for TextInput<'_, M> {
     }
     fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
         let Some(on_input) = &self.on_input else { return Captured::No };
+        atender_foco(ev, cx.states, n.key, self.autofocus);
         let v = &self.value;
         let focado = cx.states.focus == Some(n.key);
         let mut c = cx.states.get::<Cursor>(n.key).map_or(v.len(), |c| c.0).min(v.len());

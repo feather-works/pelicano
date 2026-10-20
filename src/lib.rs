@@ -12,19 +12,21 @@
 //!   recebe o [`Status`] e o [`Theme`] — nada de tema fechado num enum.
 mod app;
 mod controls;
+mod editor;
 mod pickers;
 mod render;
 pub mod widget;
 
-pub use app::{run, App, Error, Handle, Settings, Task, WindowCmd};
+pub use app::{run, App, Error, Handle, Settings, Task, WindowCmd, WindowId};
 /// Canais e fluxos para as tarefas ([`Task::run`]).
 pub use futures;
 pub use render::{Changes, Font, Image, Renderer, Svg};
 pub use controls::*;
+pub use editor::{is_invisible, text_editor, Content, TextEditor};
 pub use pickers::*;
 pub use widget::*;
 pub use winit::keyboard::{Key, ModifiersState as Modifiers, NamedKey};
-pub use winit::window::{Icon, ResizeDirection};
+pub use winit::window::{Icon, ResizeDirection, WindowLevel};
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -310,9 +312,12 @@ pub enum Event {
     MousePressed(MouseButton),
     MouseReleased(MouseButton),
     /// Rolagem em pixels lógicos; positivo = conteúdo desce (roda para cima).
-    Wheel { dx: f32, dy: f32 },
+    /// `modifiers`: com Ctrl, os apps costumam dar zoom em vez de rolar.
+    Wheel { dx: f32, dy: f32, modifiers: Modifiers },
     Key { key: Key, text: Option<String>, modifiers: Modifiers, pressed: bool },
     Resized(Size),
+    /// A janela foi para outro lugar da tela (lógico). O Wayland nunca conta.
+    Moved(Point),
     CloseRequested,
     Focused(bool),
 }

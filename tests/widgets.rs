@@ -75,15 +75,15 @@ fn deslocamento(h: &mut H, el: &Element<M>) -> f32 {
 fn rolagem_pela_roda_respeita_os_limites() {
     let (mut h, el) = (H::new(), lista());
     let dentro = Point::new(100.0, 100.0);
-    h.ev(&el, dentro, Event::Wheel { dx: 0.0, dy: -120.0 });
+    h.ev(&el, dentro, Event::Wheel { dx: 0.0, dy: -120.0, modifiers: Modifiers::empty() });
     assert_eq!(deslocamento(&mut h, &el), 120.0);
-    h.ev(&el, dentro, Event::Wheel { dx: 0.0, dy: -100_000.0 });
+    h.ev(&el, dentro, Event::Wheel { dx: 0.0, dy: -100_000.0, modifiers: Modifiers::empty() });
     // 20 itens de 50 = 1000, menos os 200 visíveis.
     assert_eq!(deslocamento(&mut h, &el), 800.0);
-    h.ev(&el, dentro, Event::Wheel { dx: 0.0, dy: 100_000.0 });
+    h.ev(&el, dentro, Event::Wheel { dx: 0.0, dy: 100_000.0, modifiers: Modifiers::empty() });
     assert_eq!(deslocamento(&mut h, &el), 0.0);
     // Roda com o mouse fora não rola.
-    h.ev(&el, Point::new(350.0, 100.0), Event::Wheel { dx: 0.0, dy: -120.0 });
+    h.ev(&el, Point::new(350.0, 100.0), Event::Wheel { dx: 0.0, dy: -120.0, modifiers: Modifiers::empty() });
     assert_eq!(deslocamento(&mut h, &el), 0.0);
 }
 
@@ -332,6 +332,19 @@ fn botao_desabilitado_e_soltar_fora_nao_disparam() {
     assert_eq!(h.ev(&el, Point::new(390.0, 290.0), Event::MouseReleased(MouseButton::Left)).0, vec![]);
 }
 
+#[test]
+fn botao_dentro_de_botao_recebe_o_clique() {
+    let mut h = H::new();
+    let el: Element<M> = button(row![text("aba"), button("x").on_press(M::Clique(2)).width(30.0)].spacing(20)).on_press(M::Clique(1)).into();
+    let n = h.node(&el);
+    fn achar(n: &Node) -> Option<Rect> {
+        if n.rect.width == 30.0 { Some(n.rect) } else { n.children.iter().find_map(achar) }
+    }
+    let x = achar(&n).expect("tem o x");
+    assert_eq!(h.click(&el, centro(x)), vec![M::Clique(2)]);
+    assert_eq!(h.click(&el, Point::new(n.rect.x + 3.0, centro(n.rect).y)), vec![M::Clique(1)]);
+}
+
 // ---------- Layout ----------
 
 #[test]
@@ -478,13 +491,13 @@ fn rolagem_de_dentro_tem_a_vez() {
         let lista = &pagina.children[0].children[1];
         (pagina.rect.y - pagina.children[0].rect.y, lista.rect.y - lista.children[0].rect.y)
     };
-    h.ev(&el, Point::new(100.0, 100.0), Event::Wheel { dx: 0.0, dy: -120.0 });
+    h.ev(&el, Point::new(100.0, 100.0), Event::Wheel { dx: 0.0, dy: -120.0, modifiers: Modifiers::empty() });
     assert_eq!(rolagens(&mut h), (0.0, 120.0), "só a lista rolou");
     // No fim da lista a página não rola por tabela (o evento já foi da lista).
-    h.ev(&el, Point::new(100.0, 100.0), Event::Wheel { dx: 0.0, dy: -100_000.0 });
+    h.ev(&el, Point::new(100.0, 100.0), Event::Wheel { dx: 0.0, dy: -100_000.0, modifiers: Modifiers::empty() });
     assert_eq!(rolagens(&mut h).1, 800.0);
     // Fora da lista, rola a página.
-    h.ev(&el, Point::new(350.0, 100.0), Event::Wheel { dx: 0.0, dy: -50.0 });
+    h.ev(&el, Point::new(350.0, 100.0), Event::Wheel { dx: 0.0, dy: -50.0, modifiers: Modifiers::empty() });
     assert_eq!(rolagens(&mut h).0, 50.0);
 }
 
@@ -521,4 +534,172 @@ fn sombra_grande_sem_emenda() {
     r.begin(tam, 1.0, Color::TRANSPARENT);
     r.fill_quad(Rect { x: 50.0, y: 50.0, width: 45.0, height: 45.0 }, None, Border::rounded(10.0), Some(sombra));
     assert!((alfa(&r, 48, 48) - canto).abs() <= 8, "canto {} x {}", alfa(&r, 48, 48), canto);
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum E {
+    Mudou,
+}
+
+#[test]
+fn editor_digita_desfaz_copia_e_troca() {
+    let mut h = H::new();
+    let c = Content::with_text("um\ndois\r\ntrês");
+    let el: Element<E> = text_editor(&c).on_change(E::Mudou).into();
+    let r = h.node(&el).rect;
+    h.click(&el, Point::new(r.x + 20.0, r.y + 18.0));
+    let ctrl = |h: &mut H, k: &str| h.ev(&el, Point::ORIGIN, Event::Key { key: Key::Character(k.into()), text: Some(k.into()), modifiers: Modifiers::CONTROL, pressed: true }).0;
+    h.tecla(&el, Key::Named(NamedKey::Home), None);
+    h.ev(&el, Point::ORIGIN, Event::Key { key: Key::Named(NamedKey::Home), text: None, modifiers: Modifiers::CONTROL, pressed: true });
+    // Digitar avisa e junta num passo só no desfazer; as quebras originais (\r\n) ficam.
+    assert_eq!(h.tecla(&el, Key::Character("o".into()), Some("o")), vec![E::Mudou]);
+    h.tecla(&el, Key::Character("i".into()), Some("i"));
+    assert_eq!(c.text(), "oium\ndois\r\ntrês");
+    assert_eq!(c.cursor(), (1, 3));
+    ctrl(&mut h, "z");
+    assert_eq!(c.text(), "um\ndois\r\ntrês");
+    ctrl(&mut h, "y");
+    assert_eq!(c.text(), "oium\ndois\r\ntrês");
+    // Ctrl+A, Ctrl+C copia tudo; colar no lugar não muda nada.
+    ctrl(&mut h, "a");
+    ctrl(&mut h, "c");
+    assert_eq!(h.area.0.as_deref(), Some("oium\ndois\ntrês"));
+    // Localizar sem diferenciar maiúsculas, e trocar tudo num passo.
+    assert!(c.find_next("DOIS", false));
+    assert!(!c.find_next("nada", false));
+    assert_eq!(c.replace_all("s", "S", true), 2);
+    assert_eq!(c.text(), "oium\ndoiS\r\ntrêS");
+    c.undo();
+    assert_eq!(c.text(), "oium\ndois\r\ntrês");
+}
+
+#[test]
+fn autofocus_pega_a_proxima_tecla_e_clique_cancela() {
+    let mut h = H::new();
+    let campo = |pedido| -> Element<M> { text_input("", "").on_input(M::Texto).autofocus(pedido).width(200.0).into() };
+    // Sem clicar: a primeira tecla já vai para o campo.
+    assert_eq!(h.tecla(&campo(1), Key::Character("a".into()), Some("a")), vec![M::Texto("a".into())]);
+    // Saiu do foco com um clique fora; o mesmo pedido não volta a pegar.
+    h.click(&campo(1), Point::new(700.0, 500.0));
+    assert_eq!(h.tecla(&campo(1), Key::Character("b".into()), Some("b")), vec![]);
+    // Um pedido novo pega de novo; um clique antes da tecla cancela o pedido.
+    assert_eq!(h.tecla(&campo(2), Key::Character("c".into()), Some("c")), vec![M::Texto("c".into())]);
+    h.click(&campo(3), Point::new(700.0, 500.0));
+    assert_eq!(h.tecla(&campo(3), Key::Character("d".into()), Some("d")), vec![]);
+}
+
+#[test]
+fn acha_e_conta_caracteres_ocultos() {
+    let mut h = H::new();
+    let c = Content::with_text("a\u{200b}b\nc d\u{a0}e\u{feff}");
+    let el: Element<E> = text_editor(&c).invisibles(true).into();
+    h.desenhar(&el, None);
+    assert_eq!(c.count_chars(is_invisible), 3);
+    // Espaço comum, tab e quebra não contam.
+    assert!(!is_invisible(' ') && !is_invisible('\t') && !is_invisible('\n'));
+    assert!(c.find_char(is_invisible));
+    assert_eq!(c.cursor(), (1, 3));
+    assert!(c.find_char(is_invisible));
+    assert_eq!(c.cursor(), (2, 5));
+    assert!(c.find_char(is_invisible));
+    // Do fim, volta ao primeiro.
+    assert!(c.find_char(is_invisible));
+    assert_eq!(c.cursor(), (1, 3));
+}
+
+#[test]
+fn formatar_liga_e_desliga() {
+    let mut h = H::new();
+    let c = Content::with_text("oi mundo\nsegunda");
+    let el: Element<E> = text_editor(&c).into();
+    h.desenhar(&el, None);
+    // Sem seleção: os sinais entram no cursor, que fica no meio.
+    c.wrap_selection("**", "**", |_| 0);
+    assert_eq!(c.text(), "****oi mundo\nsegunda");
+    assert_eq!(c.cursor(), (1, 3));
+    c.undo();
+    // Com seleção ("oi"): envolve, e o mesmo comando tira.
+    c.find_next("oi", true);
+    c.wrap_selection("**", "**", |_| 0);
+    assert_eq!(c.text(), "**oi** mundo\nsegunda");
+    c.wrap_selection("**", "**", |_| 0);
+    assert_eq!(c.text(), "oi mundo\nsegunda");
+    // Os três juntos: negrito, depois itálico e tachado na mesma palavra, e cada um sai sozinho.
+    c.find_next("oi", true);
+    c.wrap_selection("**", "**", |_| 0);
+    c.wrap_selection("*", "*", |_| 0);
+    c.wrap_selection("~~", "~~", |_| 0);
+    assert_eq!(c.text(), "***~~oi~~*** mundo\nsegunda");
+    c.wrap_selection("*", "*", |_| 0);
+    assert_eq!(c.text(), "**~~oi~~** mundo\nsegunda");
+    c.wrap_selection("*", "*", |_| 0);
+    c.wrap_selection("**", "**", |_| 0);
+    assert_eq!(c.text(), "~~*oi*~~ mundo\nsegunda");
+    c.undo();
+    c.undo();
+    c.undo();
+    c.undo();
+    c.undo();
+    c.undo();
+    // Seleção que pega o "# " do começo: os sinais entram depois dele.
+    let t = Content::with_text("# oi");
+    let el: Element<E> = text_editor(&t).into();
+    h.desenhar(&el, None);
+    t.find_next("# oi", true);
+    t.wrap_selection("~~", "~~", |l| if l.starts_with("# ") { 2 } else { 0 });
+    assert_eq!(t.text(), "# ~~oi~~");
+    // Começo de linha: título nas duas linhas selecionadas e um desfazer só.
+    c.find_next("oi", true);
+    c.edit_lines(|l| (0, if l.starts_with('#') { String::new() } else { "# ".into() }));
+    assert_eq!(c.text(), "# oi mundo\nsegunda");
+    c.undo();
+    assert_eq!(c.text(), "oi mundo\nsegunda");
+}
+
+#[test]
+fn trocar_linha_a_linha_guarda_as_quebras_e_desfaz() {
+    let mut h = H::new();
+    let c = Content::with_text("ab\r\ncd\nef");
+    let el: Element<E> = text_editor(&c).into();
+    h.desenhar(&el, None);
+    c.map_lines(|l| l.to_uppercase());
+    assert_eq!(c.text(), "AB\r\nCD\nEF");
+    c.undo();
+    assert_eq!(c.text(), "ab\r\ncd\nef");
+}
+
+#[test]
+fn enter_e_colar_no_fim_guardam_a_quebra() {
+    let mut h = H::new();
+    let c = Content::with_text("um");
+    let el: Element<E> = text_editor(&c).into();
+    h.desenhar(&el, None);
+    h.ev(&el, Point::ORIGIN, Event::Key { key: Key::Named(NamedKey::End), text: None, modifiers: Modifiers::CONTROL, pressed: true });
+    h.tecla(&el, Key::Named(NamedKey::Enter), None);
+    h.tecla(&el, Key::Character("x".into()), Some("x"));
+    assert_eq!(c.text(), "um\nx");
+    h.area.0 = Some("a\nb".into());
+    h.ev(&el, Point::ORIGIN, Event::Key { key: Key::Character("v".into()), text: Some("v".into()), modifiers: Modifiers::CONTROL, pressed: true });
+    assert_eq!(c.text(), "um\nxa\nb");
+}
+
+#[test]
+fn clique_na_caixinha_marca_e_o_cursor_fica() {
+    let mut h = H::new();
+    let c = Content::with_text("a\n- [ ] tarefa");
+    let el: Element<E> = text_editor(&c).markdown(true).on_change(E::Mudou).into();
+    let r = h.node(&el).rect;
+    h.desenhar(&el, None);
+    // O meio do "[ ]" na segunda linha (padding 12, linha de 15 × 1.45).
+    let x = r.x + 12.0 + h.r.measure("- ", 15.0, Font::DEFAULT, None).width + h.r.measure("[ ]", 15.0, Font::DEFAULT, None).width / 2.0;
+    let y = r.y + 12.0 + (15.0f32 * 1.45).ceil() * 1.5;
+    assert_eq!(h.click(&el, Point::new(x, y)), vec![E::Mudou]);
+    assert_eq!(c.text(), "a\n- [x] tarefa");
+    assert_eq!(c.cursor(), (1, 1));
+    h.desenhar(&el, None);
+    h.click(&el, Point::new(x, y));
+    assert_eq!(c.text(), "a\n- [ ] tarefa");
+    // Clicar no texto da tarefa não marca nada.
+    h.click(&el, Point::new(x + 80.0, y));
+    assert_eq!(c.text(), "a\n- [ ] tarefa");
 }
