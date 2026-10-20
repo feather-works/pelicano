@@ -51,22 +51,34 @@ pub(crate) struct Realce {
     /// `estados[k]` vale no começo da linha k; tem uma entrada a mais que `linhas`.
     estados: Vec<(ParseState, HighlightState)>,
     linhas: Vec<(u64, Trechos)>,
+    /// A versão do texto na última passada e quantas linhas já foram conferidas com ela: sem
+    /// edição, não há o que comparar de novo.
+    versao: u64,
+    pub(crate) conferidas: usize,
 }
 
 impl Realce {
     /// As cores das linhas `primeira..ultima`, analisando o que falta desde a primeira mudada.
-    pub(crate) fn cores(&mut self, ext: &str, tema: Highlight, textos: &[&str], primeira: usize, base: Attrs) -> Vec<AttrsList> {
+    /// `texto(k)` é a linha k do texto de versão `versao`.
+    pub(crate) fn cores<'t>(&mut self, ext: &str, tema: Highlight, versao: u64, texto: impl Fn(usize) -> &'t str, vista: std::ops::Range<usize>, base: Attrs) -> Vec<AttrsList> {
+        let (primeira, ultima) = (vista.start, vista.end);
         let hl = Highlighter::new(tema.tema());
         if self.pedido.as_ref().is_none_or(|(e, t)| e != ext || *t != tema) {
             let ss = sintaxes();
             let sintaxe = ss.find_syntax_by_extension(ext).or_else(|| ss.find_syntax_by_token(ext)).unwrap_or_else(|| ss.find_syntax_plain_text());
-            *self = Realce { pedido: Some((ext.to_owned(), tema)), estados: vec![(ParseState::new(sintaxe), HighlightState::new(&hl, ScopeStack::new()))], linhas: Vec::new() };
+            *self = Realce { pedido: Some((ext.to_owned(), tema)), estados: vec![(ParseState::new(sintaxe), HighlightState::new(&hl, ScopeStack::new()))], ..Realce::default() };
         }
-        let mudou = textos.iter().zip(&self.linhas).position(|(t, (h, _))| hash(t) != *h).unwrap_or(self.linhas.len());
-        self.linhas.truncate(mudou);
-        self.estados.truncate(mudou + 1);
+        if versao != self.versao {
+            (self.versao, self.conferidas) = (versao, 0);
+        }
+        let ate = ultima.min(self.linhas.len());
+        if let Some(mudou) = (self.conferidas.min(ate)..ate).find(|&k| hash(texto(k)) != self.linhas[k].0) {
+            self.linhas.truncate(mudou);
+            self.estados.truncate(mudou + 1);
+        }
+        self.conferidas = self.conferidas.max(ultima);
         let mut linha = String::new();
-        for t in textos.get(self.linhas.len()..).unwrap_or_default() {
+        for t in (self.linhas.len()..ultima).map(&texto) {
             let (mut parse, mut estado) = self.estados.last().expect("sempre há o do começo").clone();
             // As gramáticas "newlines" esperam o \n no fim.
             linha.clear();
@@ -86,7 +98,7 @@ impl Realce {
             self.linhas.push((hash(t), trechos));
             self.estados.push((parse, estado));
         }
-        self.linhas[primeira.min(textos.len())..textos.len()]
+        self.linhas[primeira.min(ultima)..ultima]
             .iter()
             .map(|(_, trechos)| {
                 let mut a = AttrsList::new(base);
@@ -122,14 +134,33 @@ mod testes {
         let base = Attrs::new();
         let cor = |a: &AttrsList, i: usize| a.get_span(i).color_opt;
         let texto = ["fn main() {", "    let s = \"oi\";", "}"];
-        let v = r.cores("rs", Highlight::Base16Ocean, &texto, 0, base);
+        let v = r.cores("rs", Highlight::Base16Ocean, 0, |k| texto[k], 0..3, base);
         assert_eq!(v.len(), 3);
         assert_ne!(cor(&v[0], 0), cor(&v[1], 13), "palavra-chave e texto entre aspas com cores diferentes");
         let antes = cor(&v[1], 13);
         // Abrir aspas na linha 1 faz o resto virar string: a linha 2 muda de cor.
         let texto2 = ["fn main() {", "    let s = \"oi;", "}"];
-        let v2 = r.cores("rs", Highlight::Base16Ocean, &texto2, 1, base);
+        let v2 = r.cores("rs", Highlight::Base16Ocean, 1, |k| texto2[k], 1..3, base);
         assert_eq!(v2.len(), 2);
         assert_eq!(cor(&v2[1], 0), antes, "a chave de baixo virou parte da string");
+    }
+
+    #[test]
+    fn mesma_versao_nao_confere_de_novo() {
+        let base = Attrs::new();
+        let cor = |a: &AttrsList| a.get_span(0).color_opt;
+        let a = ["fn x() {}", "let y = 1;"];
+        let b = ["\"fn x() {}", "let y = 1;"];
+        let mut r = Realce::default();
+        let v = r.cores("rs", Highlight::Base16Ocean, 7, |k| a[k], 0..2, base);
+        assert_eq!(r.conferidas, 2);
+        // Mesma versão: nada é relido (o texto trocado por baixo nem é olhado).
+        let v2 = r.cores("rs", Highlight::Base16Ocean, 7, |k| b[k], 0..2, base);
+        assert_eq!(v.iter().map(cor).collect::<Vec<_>>(), v2.iter().map(cor).collect::<Vec<_>>());
+        // Versão nova: igual a analisar do zero.
+        let v3 = r.cores("rs", Highlight::Base16Ocean, 8, |k| b[k], 0..2, base);
+        let zero = Realce::default().cores("rs", Highlight::Base16Ocean, 0, |k| b[k], 0..2, base);
+        assert_eq!(v3.iter().map(cor).collect::<Vec<_>>(), zero.iter().map(cor).collect::<Vec<_>>());
+        assert_ne!(v3.iter().map(cor).collect::<Vec<_>>(), v2.iter().map(cor).collect::<Vec<_>>());
     }
 }

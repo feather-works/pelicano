@@ -2,7 +2,7 @@
 //! linha, e só as linhas visíveis montadas) com desfazer/refazer, área de transferência,
 //! localizar/substituir e números de linha.
 use crate::widget::{CursorIcon, DrawCx, EventCx, Node, Style, Widget};
-use crate::{Border, Captured, Color, Event, Font, Key, LayoutCx, Length, Limits, MouseButton, NamedKey, Padding, Point, Rect, Status, Theme};
+use crate::{Border, Captured, Color, Event, Font, Key, LayoutCx, Length, Limits, MouseButton, NamedKey, Padding, Point, Rect, Size, Status, Theme};
 use cosmic_text::{Action, Attrs, AttrsList, Buffer, Change, Cursor, Edit, Editor, Family, FontSystem, Metrics, Motion, Selection, Shaping, Style as Estilo, Weight, Wrap};
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
@@ -23,9 +23,13 @@ struct Interno {
     digitando: Option<std::time::Instant>,
     /// (tamanho físico × 64, altura da linha × 64, fonte, quebra) com que o buffer está montado.
     config: Option<(u32, u32, Font, bool)>,
+    /// (versão, primeira linha à vista) -> se ela começa dentro de um bloco ```.
+    cercas: Option<(u64, usize, bool)>,
     #[cfg(feature = "highlighter")]
     realce: crate::highlight::Realce,
 }
+
+const DESFAZER_MAX: usize = 500;
 
 impl Default for Content {
     fn default() -> Self {
@@ -39,7 +43,7 @@ impl Content {
     }
 
     pub fn with_text(texto: &str) -> Self {
-        Content(RefCell::new(Interno { ed: None, inicial: texto.to_owned(), versao: 0, desfazer: Vec::new(), refazer: Vec::new(), digitando: None, config: None, #[cfg(feature = "highlighter")] realce: Default::default() }))
+        Content(RefCell::new(Interno { ed: None, inicial: texto.to_owned(), versao: 0, desfazer: Vec::new(), refazer: Vec::new(), digitando: None, config: None, cercas: None, #[cfg(feature = "highlighter")] realce: Default::default() }))
     }
 
     /// O texto inteiro, com as quebras de linha que o arquivo tinha.
@@ -370,7 +374,7 @@ impl Interno {
     fn editor(&mut self, fonts: &mut FontSystem, tamanho: f32, altura: f32, escala: f32, fonte: Font, quebra: bool) -> &mut Editor<'static> {
         let config = ((tamanho * escala * 64.0) as u32, (altura * escala * 64.0) as u32, fonte, quebra);
         let metricas = Metrics::new(tamanho * escala, (altura * escala).ceil());
-        let attrs = Attrs::new().weight(Weight(fonte.weight)).family(familia(fonte));
+        let attrs = crate::render::attrs(fonte);
         let ed = self.ed.get_or_insert_with(|| {
             let mut b = Buffer::new(fonts, metricas);
             // Sem altura, o set_text monta todas as linhas; com zero, nenhuma (o desenho monta as visíveis).
@@ -411,6 +415,10 @@ impl Interno {
         match self.desfazer.last_mut() {
             Some(ultimo) if junta => ultimo.items.extend(mudou.items),
             _ => self.desfazer.push(mudou),
+        }
+        // Cada passo guarda o texto mexido: sem teto, uma sessão longa só cresce.
+        if self.desfazer.len() > DESFAZER_MAX {
+            self.desfazer.remove(0);
         }
         self.digitando = digitacao.then_some(agora);
         self.refazer.clear();
@@ -609,15 +617,6 @@ fn inline(texto: &str, desde: usize, l: &mut AttrsList, base: Attrs<'static>, t:
     }
 }
 
-fn familia(f: Font) -> Family<'static> {
-    match f.family {
-        None => Family::SansSerif,
-        Some("monospace") => Family::Monospace,
-        Some("serif") => Family::Serif,
-        Some(nome) => Family::Name(nome),
-    }
-}
-
 /// `termo` em `texto` a partir do byte `desde`: (início, fim) em bytes.
 fn achar(texto: &str, termo: &str, desde: usize, maiusculas: bool) -> Option<(usize, usize)> {
     if maiusculas {
@@ -667,6 +666,7 @@ pub struct TextEditor<'a, M> {
     markdown: bool,
     line_height: Option<f32>,
     placeholder: &'a str,
+    id: Option<u64>,
     on_key: Option<Box<dyn Fn(&Key, crate::Modifiers) -> Option<M> + 'a>>,
     #[cfg(feature = "highlighter")]
     highlight: Option<(&'a str, crate::Highlight)>,
@@ -675,7 +675,7 @@ pub struct TextEditor<'a, M> {
 /// Editor de várias linhas sobre um [`Content`]. Edita o conteúdo direto e avisa com
 /// `on_change` (para o app marcar "não salvo").
 pub fn text_editor<'a, M>(content: &'a Content) -> TextEditor<'a, M> {
-    TextEditor { content, size: 15.0, font: Font::DEFAULT, wrap: true, line_numbers: false, padding: Padding::from(12.0), on_change: None, style: None, autofocus: None, invisibles: false, markdown: false, line_height: None, placeholder: "", on_key: None, #[cfg(feature = "highlighter")] highlight: None }
+    TextEditor { content, size: 15.0, font: Font::DEFAULT, wrap: true, line_numbers: false, padding: Padding::from(12.0), on_change: None, style: None, autofocus: None, invisibles: false, markdown: false, line_height: None, placeholder: "", id: None, on_key: None, #[cfg(feature = "highlighter")] highlight: None }
 }
 
 impl<'a, M> TextEditor<'a, M> {
@@ -706,6 +706,11 @@ impl<'a, M> TextEditor<'a, M> {
     /// Altura de cada linha, em pixels lógicos. Padrão: 1,45 × o tamanho.
     pub fn line_height(mut self, h: f32) -> Self {
         self.line_height = Some(h);
+        self
+    }
+    /// O nome para [`crate::Task::focus`].
+    pub fn id(mut self, id: impl std::hash::Hash) -> Self {
+        self.id = Some(crate::id_hash(&id));
         self
     }
     /// O texto apagado que aparece com o editor vazio.
@@ -777,7 +782,10 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         (Length::FILL, Length::FILL)
     }
     fn layout(&self, cx: &mut LayoutCx, l: Limits) -> Node {
-        Node::leaf(cx.key(), l.max)
+        if let Some(id) = self.id {
+            cx.states.ids.borrow_mut().insert(id, cx.key());
+        }
+        Node::leaf(cx.key(), l.fill(Size::new(400.0, 300.0)))
     }
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
         // Sem outro campo focado, o editor recebe a digitação (abrir e já escrever).
@@ -803,6 +811,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         let s = cx.renderer.scale();
         let mut i = self.content.0.borrow_mut();
         let versao = i.versao;
+        let mut cercas = i.cercas;
         #[cfg(feature = "highlighter")]
         let mut realce = std::mem::take(&mut i.realce);
         let ed = i.editor(cx.renderer.fonts(), self.size, self.altura(), s, self.font, self.wrap);
@@ -811,17 +820,23 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         ed.with_buffer_mut(|b| {
             b.set_size(fonts, Some(area.width * s), Some(area.height * s));
             // Só as linhas à vista (e algumas a mais) ganham estilo; as outras quando aparecerem.
-            let base = Attrs::new().weight(Weight(self.font.weight)).family(familia(self.font));
+            let base = crate::render::attrs(self.font);
             let primeira = b.scroll().line;
             let ultima = (primeira + (area.height / self.altura()) as usize + 2).min(b.lines.len());
             let tons = Tons { sinal: cor_ct(cx.theme.muted), link: cor_ct(cx.theme.primary) };
             // Dentro de um bloco ``` ou não: conta as cercas desde o começo (só comparação de prefixo).
-            let mut em_codigo = self.markdown && b.lines[..primeira].iter().filter(|l| l.text().trim_start().starts_with("```")).count() % 2 == 1;
+            let mut em_codigo = self.markdown
+                && match cercas {
+                    Some((v, p, dentro)) if (v, p) == (versao, primeira) => dentro,
+                    _ => b.lines[..primeira].iter().filter(|l| l.text().trim_start().starts_with("```")).count() % 2 == 1,
+                };
+            if self.markdown {
+                cercas = Some((versao, primeira, em_codigo));
+            }
             let metricas = b.metrics();
             #[cfg(feature = "highlighter")]
             if let Some((ext, tema)) = self.highlight.filter(|_| !self.markdown) {
-                let textos: Vec<&str> = b.lines[..ultima].iter().map(|l| l.text()).collect();
-                let cores = realce.cores(ext, tema, &textos, primeira, base);
+                let cores = realce.cores(ext, tema, versao, |k| b.lines[k].text(), primeira..ultima, base);
                 for (linha, a) in b.lines[primeira..ultima].iter_mut().zip(cores) {
                     linha.set_attrs_list(a);
                 }
@@ -966,6 +981,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             cx.renderer.fill_quad(Rect { x: p.x, y: p.y, width: 1.5, height: altura_linha }, Some(&cor.into()), Border::default(), None);
         }
         cx.renderer.pop_clip();
+        i.cercas = cercas;
         #[cfg(feature = "highlighter")]
         {
             i.realce = realce;
@@ -1238,5 +1254,18 @@ mod testes {
         ed.shape_as_needed(&mut fonts, true);
         assert!(montadas(ed) < 100, "ir ao fim montou {}", montadas(ed));
         assert!(ed.with_buffer(|b| b.scroll().line) > 19_000);
+    }
+
+    #[test]
+    fn desfazer_tem_teto() {
+        let mut fonts = FontSystem::new();
+        let c = Content::with_text("");
+        c.0.borrow_mut().editor(&mut fonts, 15.0, 15.0 * 1.45, 1.0, Font::DEFAULT, true);
+        for _ in 0..600 {
+            c.insert("x");
+        }
+        assert_eq!(c.0.borrow().desfazer.len(), DESFAZER_MAX);
+        c.undo();
+        assert_eq!(c.text().trim_end(), "x".repeat(599));
     }
 }

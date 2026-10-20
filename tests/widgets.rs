@@ -151,6 +151,100 @@ fn menu_aberto_por_cima_de_quem_vem_antes_ganha_o_clique() {
     assert_eq!(h.click(&el, sob_o_menu), vec![M::Clique(0)]);
 }
 
+const MUITAS: [&str; 20] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"];
+
+/// O centro do item `i` (à vista) do menu aberto embaixo de `campo`.
+fn item_do_menu(campo: Rect, i: f32) -> Point {
+    Point::new(campo.x + 20.0, campo.y + campo.height + 4.0 + 4.0 + 30.0 * i + 15.0)
+}
+
+#[test]
+fn dropdown_com_altura_maxima_rola() {
+    let mut h = H::new();
+    let el: Element<M> = pick_list(&MUITAS[..], None, M::Escolha).width(120.0).menu_height(98.0).into();
+    let campo = h.node(&el).rect;
+    h.click(&el, centro(campo));
+    // 98 de altura: três itens à vista; a roda desce dois.
+    h.ev(&el, item_do_menu(campo, 1.0), Event::Wheel { dx: 0.0, dy: -60.0, modifiers: Modifiers::empty() });
+    assert_eq!(h.click(&el, item_do_menu(campo, 0.0)), vec![M::Escolha("2")]);
+    // Abaixo da altura máxima o menu já acabou.
+    h.click(&el, centro(campo));
+    assert_eq!(h.click(&el, item_do_menu(campo, 4.0)), vec![]);
+}
+
+// ---------- Busca com lista ----------
+
+const FRUTAS: [&str; 4] = ["Maçã", "Banana", "Mamão", "Uva"];
+
+fn digitar(h: &mut H, el: &Element<M>, s: &str) {
+    for c in s.chars() {
+        h.tecla(el, Key::Character(c.to_string().into()), Some(&c.to_string()));
+    }
+}
+
+#[test]
+fn combo_box_filtra_ao_digitar_e_escolhe_com_setas() {
+    let mut h = H::new();
+    let el: Element<M> = combo_box(&FRUTAS[..], "Fruta", None, M::Escolha).width(160.0).into();
+    let campo = h.node(&el).rect;
+    h.click(&el, centro(campo));
+    // "ma" sobra Maçã e Mamão; a seta desce para a segunda.
+    digitar(&mut h, &el, "MA");
+    h.tecla(&el, nomeada(NamedKey::ArrowDown), None);
+    assert_eq!(h.tecla(&el, nomeada(NamedKey::Enter), None), vec![M::Escolha("Mamão")]);
+    // Sem acento e em minúsculas também acha.
+    h.click(&el, centro(campo));
+    digitar(&mut h, &el, "maca");
+    assert_eq!(h.tecla(&el, nomeada(NamedKey::Enter), None), vec![M::Escolha("Maçã")]);
+    // Esc fecha sem escolher.
+    h.click(&el, centro(campo));
+    h.tecla(&el, nomeada(NamedKey::Escape), None);
+    assert_eq!(h.click(&el, item_do_menu(campo, 0.0)), vec![]);
+}
+
+#[test]
+fn combo_box_clique_escolhe_da_lista_filtrada() {
+    let mut h = H::new();
+    let el: Element<M> = combo_box(&FRUTAS[..], "Fruta", Some(&FRUTAS[3]), M::Escolha).width(160.0).into();
+    let campo = h.node(&el).rect;
+    // Fechada, o lugar da lista não responde.
+    assert_eq!(h.click(&el, item_do_menu(campo, 1.0)), vec![]);
+    h.click(&el, centro(campo));
+    assert_eq!(h.click(&el, item_do_menu(campo, 1.0)), vec![M::Escolha("Banana")]);
+    h.click(&el, centro(campo));
+    digitar(&mut h, &el, "u");
+    assert_eq!(h.click(&el, item_do_menu(campo, 0.0)), vec![M::Escolha("Uva")]);
+}
+
+#[test]
+fn combo_box_rola_a_lista_com_a_roda_e_as_setas() {
+    let mut h = H::new();
+    let el: Element<M> = combo_box(&MUITAS[..], "", None, M::Escolha).width(120.0).menu_height(98.0).into();
+    let campo = h.node(&el).rect;
+    h.click(&el, centro(campo));
+    h.ev(&el, item_do_menu(campo, 1.0), Event::Wheel { dx: 0.0, dy: -90.0, modifiers: Modifiers::empty() });
+    assert_eq!(h.click(&el, item_do_menu(campo, 0.0)), vec![M::Escolha("3")]);
+    // Descendo com as setas além da borda, a lista acompanha: o item 5 fica embaixo.
+    h.click(&el, centro(campo));
+    for _ in 0..5 {
+        h.tecla(&el, nomeada(NamedKey::ArrowDown), None);
+    }
+    assert_eq!(h.click(&el, item_do_menu(campo, 2.0)), vec![M::Escolha("5")]);
+}
+
+#[test]
+fn combo_box_sem_resultado_aceita_as_setas() {
+    let mut h = H::new();
+    let el: Element<M> = combo_box(&FRUTAS[..], "Fruta", None, M::Escolha).width(160.0).into();
+    let campo = h.node(&el).rect;
+    h.click(&el, centro(campo));
+    digitar(&mut h, &el, "zzz");
+    assert_eq!(h.tecla(&el, nomeada(NamedKey::ArrowDown), None), vec![]);
+    h.tecla(&el, nomeada(NamedKey::ArrowUp), None);
+    h.desenhar(&el, None);
+    assert_eq!(h.tecla(&el, nomeada(NamedKey::Enter), None), vec![]);
+}
+
 // ---------- Slider ----------
 
 #[test]
@@ -302,6 +396,32 @@ fn campo_senha_mapeia_o_clique_para_o_valor() {
     assert_eq!(h.tecla(&el, Key::Character("-".into()), Some("-")), vec![M::Texto("ç-ãb".into())]);
 }
 
+#[test]
+fn senha_trocada_pelo_app_nao_corta_caractere() {
+    let mut h = H::new();
+    let campo = |v| -> Element<M> { text_input("", v).secure(true).on_input(M::Texto).width(200.0).into() };
+    let r = h.node(&campo("ab")).rect;
+    h.click(&campo("ab"), Point::new(r.x + 10.0, r.y + 5.0));
+    h.tecla(&campo("ab"), nomeada(NamedKey::Home), None);
+    h.tecla(&campo("ab"), nomeada(NamedKey::ArrowRight), None);
+    // O cursor ficou no byte 1, que no meio do "é" não é fronteira.
+    h.desenhar(&campo("é"), None);
+}
+
+#[test]
+fn quem_enche_dentro_da_rolagem_fica_finito() {
+    let mut h = H::new();
+    let c = Content::with_text("um\ndois");
+    let el: Element<M> = scrollable(column![text("x"), text_editor(&c)]).into();
+    let n = h.node(&el);
+    assert!(n.children[0].rect.height.is_finite(), "{:?}", n.rect);
+    h.desenhar(&el, None);
+    let el: Element<M> = scrollable(column![text("x"), responsive(|s| Space::new(s.width, s.height).into())]).into();
+    let n = h.node(&el);
+    assert!(n.children[0].rect.height.is_finite(), "{:?}", n.rect);
+    h.desenhar(&el, None);
+}
+
 // ---------- Mouse, camadas e map ----------
 
 #[test]
@@ -313,6 +433,17 @@ fn duplo_clique_e_clique_simples() {
     assert_eq!(h.click(&el, p), vec![M::Duplo]);
     // Depois do duplo, o próximo volta a ser simples.
     assert_eq!(h.click(&el, p), vec![M::Clique(0)]);
+}
+
+#[test]
+fn duplo_clique_com_on_enter_e_o_mouse_andando_entre_os_cliques() {
+    let mut h = H::new();
+    let el: Element<M> = mouse_area(Space::new(100.0, 100.0)).on_enter(M::Enviar).on_double_click(M::Duplo).into();
+    let p = Point::new(50.0, 50.0);
+    assert_eq!(h.click(&el, p), vec![]);
+    // O estado de "em cima" não pode apagar a hora do último clique.
+    h.ev(&el, Point::new(51.0, 50.0), Event::CursorMoved(Point::new(51.0, 50.0)));
+    assert_eq!(h.click(&el, p), vec![M::Duplo]);
 }
 
 #[test]
@@ -603,6 +734,16 @@ fn autofocus_pega_a_proxima_tecla_e_clique_cancela() {
     assert_eq!(h.tecla(&campo(2), Key::Character("c".into()), Some("c")), vec![M::Texto("c".into())]);
     h.click(&campo(3), Point::new(700.0, 500.0));
     assert_eq!(h.tecla(&campo(3), Key::Character("d".into()), Some("d")), vec![]);
+}
+
+#[test]
+fn autofocus_nao_volta_depois_do_esc() {
+    let mut h = H::new();
+    let campo: Element<M> = text_input("", "").on_input(M::Texto).autofocus(1).width(200.0).into();
+    assert_eq!(h.tecla(&campo, Key::Character("a".into()), Some("a")), vec![M::Texto("a".into())]);
+    h.tecla(&campo, nomeada(NamedKey::Escape), None);
+    // O cursor do campo não apaga o pedido já atendido: o mesmo pedido não pega o foco de novo.
+    assert_eq!(h.tecla(&campo, Key::Character("b".into()), Some("b")), vec![]);
 }
 
 #[test]

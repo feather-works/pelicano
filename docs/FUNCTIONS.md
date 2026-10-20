@@ -30,6 +30,7 @@ Convenções que valem para tudo:
 | `view_window` | `fn view_window(&self, id: WindowId) -> Element<'_, Self::Msg>` | Opcional. O que aparece em cada janela aberta com `Task::open_window`. Padrão: `view()`. |
 | `subscription` | `fn subscription(&self) -> Subscription<Self::Msg>` | Opcional. O trabalho que dura enquanto o estado pedir (veja `Subscription`). Padrão: nenhum. |
 | `on_window_event` | `fn on_window_event(&self, id: WindowId, ev: &Event) -> Option<Self::Msg>` | Opcional. Os eventos de cada janela. Padrão: na principal chama `on_event`, nas outras nada. |
+| `on_unhandled_event` | `fn on_unhandled_event(&self, id: WindowId, ev: &Event) -> Option<Self::Msg>` | Opcional. Só os eventos que nenhum widget usou: atalhos globais que não disparam enquanto se digita num campo. |
 
 ### Várias janelas
 
@@ -104,6 +105,13 @@ O trabalho que o `update` devolve. Futuros e fluxos rodam no tokio, fora da thre
 | `Task::window(cmd)` | `WindowCmd` | Uma ordem para a janela principal. |
 | `Task::window_of(id, cmd)` | `WindowId`, `WindowCmd` | Uma ordem para outra janela. Antes de ela abrir, a ordem espera. |
 | `Task::open_window(id, settings)` | `WindowId`, `Settings` | Abre outra janela (não abre duas com o mesmo `id`). |
+| `Task::scroll_to(id, offset)` | `impl Hash`, `Point` | Rola o `scrollable(..).id(id)` até o deslocamento (lógico; `f32::INFINITY` = o fim). |
+| `Task::snap_to(id, rel)` | `impl Hash`, `Point` | Rola até a fração (0 = começo, 1 = fim) de cada eixo. |
+| `Task::focus(id)` | `impl Hash` | Foco no `text_input(..).id(id)` ou `text_editor(..).id(id)` (já desenhado). |
+| `Task::write_clipboard(texto)` | `impl Into<String>` | Copia para a área de transferência. |
+| `Task::read_clipboard(f)` | `FnOnce(Option<String>) -> M` | Lê a área de transferência e manda `f(texto)`. |
+| `Task::window_handle(id, f)` | `WindowId`, `FnOnce(RawWindowHandle) -> M` | Chama `f` na thread da janela com a alça crua dela (`pelicano::raw_window_handle`): id X11, subclasse no Windows. Antes de ela abrir, espera. |
+| `Task::window_event(id, ev)` | `WindowId`, `Event` | Passa `ev` pela árvore da janela como se viesse do sistema (entrada sintética). `Event::CursorMoved` também move o cursor. |
 | `Task::batch(tasks)` | `IntoIterator<Item = Task<M>>` | Junta várias tarefas em uma. |
 | `task.map(f)` | `Fn(M) -> N` | Converte as mensagens (componente dentro de outro app). |
 | `task.abortable()` | — | `(Task<M>, Handle)`. `handle.abort()` cancela (pausar download). |
@@ -122,7 +130,7 @@ cai junto (processo com `kill_on_drop`, conexão). Um id novo começa um fluxo n
 | `Subscription::run_with_id(id, stream)` | `impl Hash`, `Stream<Item = M>` | Roda `stream` enquanto `id` for pedido. Nas outras vezes o `stream` é descartado sem rodar. |
 | `Subscription::batch(subs)` | `IntoIterator<Item = Subscription<M>>` | Junta várias. |
 | `Subscription::every(intervalo)` | `Duration` | `Subscription<Instant>`: a hora, a cada intervalo. |
-| `sub.map(f)` | `Fn(M) -> N` | Converte as mensagens. |
+| `sub.map(f)` | `Fn(M) -> N` | Converte as mensagens. `f` não pode capturar nada (só `Msg::Variante` ou `\|_\| Msg::X`): com o mesmo id ela não é trocada; o que muda vai no id. Em debug, capturar dá pânico. |
 
 ```rust
 fn subscription(&self) -> Subscription<Msg> {
@@ -144,6 +152,8 @@ As que um widget manda (`Drag` no clique da barra) vão para a janela do clique.
 | `Minimize` | Minimiza. |
 | `ToggleMaximize` | Maximiza ou restaura. |
 | `ToggleFullscreen` | Tela cheia sem moldura no monitor atual, ou volta. |
+| `Fullscreen(bool)` / `Maximize(bool)` | Liga ou desliga, sem alternar. |
+| `Move(Point)` | Põe o canto da janela em `p` (lógico, na área de trabalho). O Wayland ignora. |
 | `Close` | Fecha a janela. Sem `run_in_background`, fechar a principal (ou a última) acaba o app. |
 | `Exit` | Acaba o app, com todas as janelas. |
 | `Focus` | Traz para a frente e tira do minimizado (no Wayland pode só piscar na barra). |
@@ -243,6 +253,11 @@ Os eventos da janela, já em pixels lógicos:
 | `Moved(Point)` | A janela foi para outro lugar da tela (o Wayland nunca manda). |
 | `CloseRequested` | Pediram para fechar. Com `close_on_request = false` a janela fica e o app decide. |
 | `Focused(bool)` | A janela ganhou ou perdeu o foco. |
+| `FileDropped(PathBuf)` | Um arquivo arrastado de fora foi solto na janela (um evento por arquivo). |
+| `FileHovered(PathBuf)` / `FileHoverCancelled` | Um arquivo arrastado está em cima / saiu sem soltar. |
+| `ModifiersChanged(Modifiers)` | Ctrl, Shift, Alt ou Super mudou. |
+| `ScaleChanged(f32)` | A escala da tela: na abertura da janela e quando ela muda de monitor. |
+| `FingerPressed { id, position }` / `FingerMoved` / `FingerLifted` / `FingerLost` | Toque na tela (como o `touch::Event` do Iced); `id` separa os dedos, `FingerLost` = o sistema cancelou. O primeiro dedo que nenhum widget capturar ao encostar também chega como mouse (`CursorMoved` + botão esquerdo, e `CursorLeft` ao soltar), para botão e cia. funcionarem no toque. |
 
 Reexportados do winit: `Key`, `NamedKey`, `Modifiers`, `MouseButton`, `Icon`, `ResizeDirection` e `CursorIcon`.
 
@@ -256,13 +271,38 @@ Reexportados do winit: `Key`, `NamedKey`, `Modifiers`, `MouseButton`, `Icon`, `R
 text(s: impl Into<Cow<str>>) -> Text
 ```
 
-Métodos: `.size(Num)`, `.font(Font)`, `.color(Color)`, `.width(Length)`, `.height(Length)`, `.align_x(Align)` e `.no_wrap()`.
+Métodos: `.size(Num)`, `.font(Font)`, `.color(Color)`, `.width(Length)`, `.height(Length)`, `.align_x(Align)`, `.line_height(f32)` (em vezes o tamanho; padrão 1,3) e `.no_wrap()`.
 Quebra linha sozinho na largura disponível. Sem `.color`, usa a cor herdada do contêiner ou o `theme.text`.
 
 ### `Font`
 
-Campos `family: Option<&'static str>` (`None` = sem serifa do sistema) e `weight: u16`.
+Campos `family: Option<&'static str>` (`None` = sem serifa do sistema), `weight: u16` e `italic: bool`.
 Constantes: `Font::DEFAULT` (400), `MEDIUM` (500), `SEMIBOLD` (600), `BOLD` (700), `MONO` e `SERIF`.
+`Font::with_name("Liberation Serif")` pede uma família pelo nome; `.weight(700)` e `.italic()` mudam o resto.
+
+`load_font(bytes)` registra uma fonte (TTF, OTF ou coleção) para o app inteiro, a partir do próximo quadro.
+Depois é só pedir pelo nome da família com `Font::with_name`.
+
+### `rich_text` e `span`
+
+```rust
+rich_text([span("Leia o "), span("manual").link(Msg::Abrir).size(16.0), span(" antes.")])
+```
+
+Um parágrafo de trechos com estilos diferentes, quebrando linha juntos.
+`Span`: `.size(f32)`, `.font(Font)`, `.color(Color)`, `.italic()`, `.underline()`, `.strikethrough()`,
+`.background(Color)` (código em linha, marca-texto) e `.link(m)` (o clique manda `m`; sem cor própria, ganha a de destaque e sublinhado).
+`RichText`: `.size(Num)`, `.font(Font)`, `.color(Color)`, `.width(Length)`, `.line_height(f32)` (em vezes o tamanho; padrão 1,3) e `.no_wrap()`.
+
+### `markdown`
+
+`markdown(src: &str, size: f32, on_link: impl Fn(String) -> M) -> Element`: CommonMark com tabelas, tachado e
+lista de tarefas, montado com `rich_text`, colunas e contêineres. Clicar num link manda `on_link(endereço)`.
+
+### `responsive`
+
+`responsive(|tamanho: Size| -> Element)`: o conteúdo é montado já sabendo o espaço que tem (caber a página na
+largura, trocar de layout em tela estreita). Ocupa todo o espaço; num lado sem limite (dentro de um `scrollable`), 400 × 300.
 
 ### `container`
 
@@ -324,8 +364,15 @@ Camadas umas sobre as outras. A última fica por cima e recebe os eventos primei
 
 ### `scrollable`
 
-`scrollable(content) -> Scrollable`: rolagem vertical com barra arrastável. Padrão `Length::FILL` nos dois eixos. Métodos: `.width(l)` e `.height(l)`.
+`scrollable(content) -> Scrollable`: rolagem com barra arrastável. Padrão `Length::FILL` nos dois eixos.
 A posição da rolagem fica guardada sozinha entre quadros.
+
+| Método | Efeito |
+|---|---|
+| `.width(l)`, `.height(l)` | Tamanho. |
+| `.direction(Direction)` | `Vertical` (padrão), `Horizontal` ou `Both`. A roda com Shift rola na horizontal. |
+| `.id(id)` | O nome para `Task::scroll_to` / `Task::snap_to`. |
+| `.on_scroll(f)` | `Fn(Viewport) -> M`: avisa cada mudança. `Viewport { offset, bounds, content }` e `.relative()` (0 a 1). |
 
 ### `image` e `Image`
 
@@ -344,7 +391,8 @@ A posição da rolagem fica guardada sozinha entre quadros.
 
 `Svg::from_bytes(bytes) -> Option<Svg>`, `svg.size() -> Size` e `svg(s) -> SvgView`.
 `SvgView`: `.width(l)`, `.height(l)` e `.color(Color)` (pinta tudo nessa cor, mantendo o alfa; bom para ícones).
-O SVG é analisado uma vez, e a rasterização fica em cache por tamanho e cor.
+O SVG é analisado uma vez, e a rasterização fica em cache por tamanho e cor. Maior que 2048² pixels (zoom), só a
+parte à mostra é rasterizada, sem cache; o mesmo vale para imagem esticada além de 4096².
 
 ### `progress_bar`
 
@@ -353,7 +401,7 @@ Métodos: `.width(l)`, `.height(f32)` e `.color(Color)`.
 
 ### `tooltip`
 
-`tooltip(content, dica: impl Into<Cow<str>>, TooltipPosition::Top | Bottom) -> Tooltip`: mostra a dica com o mouse em cima.
+`tooltip(content, dica: impl Into<Cow<str>>, TooltipPosition::Top | Bottom | Left | Right) -> Tooltip`: mostra a dica com o mouse em cima. `.style(Fn(&Theme) -> Style)` troca a caixa do balão (fundo, borda, sombra, `text_color`) e `.padding(..)` o espaço em volta do texto (padrão 4 × 8).
 
 ### `canvas`
 
@@ -366,7 +414,23 @@ Um retângulo onde você desenha à mão com o `Renderer` (gráficos, réguas, p
 `Renderer::push_opacity(a)` / `pop_opacity()`: tudo desenhado no meio sai com o alfa multiplicado por `a`.
 Cada desenho fica translúcido por conta própria, não o grupo: onde dois se sobrepõem, o de baixo aparece um pouco.
 `Renderer::push_layer(area, escala, graus, opacidade)` / `pop_layer()`: o que for desenhado no meio cai numa camada
-do tamanho de `area` e vai para a tela transformado em volta do centro dela, com a opacidade do grupo.
+do tamanho de `area` e vai para a tela transformado em volta do centro dela, com a opacidade do grupo. A camada só
+aloca a parte que cai na tela; se ainda passar de 8192² pixels, o conteúdo dela não aparece.
+
+### `program` (canvas interativo)
+
+```rust
+impl Program<Msg> for Palco {
+    type State = Arrasto;          // Default + 'static; guardado sozinho pela posição na árvore
+    fn draw(&self, st: &Arrasto, r: &mut Renderer, bounds: Rect, theme: &Theme, cursor: Option<Point>) { … }
+    fn update(&self, st: &mut Arrasto, ev: &Event, bounds: Rect, cursor: Option<Point>, publish: &mut dyn FnMut(Msg)) -> Captured { … }
+    fn mouse_interaction(&self, st: &Arrasto, bounds: Rect, cursor: Option<Point>) -> CursorIcon { … }
+}
+program(Palco { .. }).width(l).height(l)    // padrão: FILL nos dois
+```
+
+O `canvas::Program` do Iced: desenha, recebe todos os eventos da janela (também os de fora de `bounds`, para soltar
+um arrasto lá fora) e escolhe o ícone do mouse. `update` e `mouse_interaction` são opcionais.
 
 ---
 
@@ -430,12 +494,12 @@ próprio desenho e só é montada quando há um leitor ligado.
 | `text_input` | Campo (senha sem o valor), com o placeholder. |
 | `text_editor` | Campo de várias linhas, com o texto. |
 | `checkbox`, `toggler`, `radio` | Caixa, chave ou rádio, marcado ou não. |
-| `pick_list` | Caixa de seleção com o valor e se está aberta. |
+| `pick_list`, `combo_box` | Caixa de seleção com o valor e se está aberta. |
 | `slider`, `progress_bar` | Valor, mínimo e máximo. |
 | `scrollable` | Área de rolagem com o conteúdo dentro. |
 
 `Element::access_label("Fechar")`: o nome que o leitor fala (o `aria-label`): botão só de ícone, imagem.
-Clicar e focar pelo leitor viram um clique no meio do widget.
+Clicar pelo leitor vira um clique no meio do widget; focar só põe o foco nele.
 
 Num widget próprio: `cx.access(key, rect, || accesskit::Node::new(Role::..))` em `draw`, ou `access_begin` / `access_end`
 para nós com filhos; `cx.access_text` para texto. `pelicano::accesskit` é o crate. `access_tree(..)` devolve a árvore
@@ -464,6 +528,7 @@ Estilos prontos: `button_primary` (padrão: cor primária, mais clara no hover e
 
 `mouse_area(content) -> MouseArea`: dá cliques a qualquer coisa.
 Métodos: `.on_press(m)`, `.on_release(m)`, `.on_right_press(m)`, `.on_double_click(m)` (até 400 ms; use para maximizar pela barra de título) e `.cursor_icon(CursorIcon)`.
+Mais: `.on_enter(m)` e `.on_exit(m)` (o mouse entrou ou saiu), `.on_move(Fn(Point) -> M)` e `.on_scroll(Fn(dx, dy, Modifiers) -> M)` (pega a roda: o scrollable de fora não rola).
 
 ### `text_input`
 
@@ -478,6 +543,7 @@ O campo não guarda o texto: o app guarda e passa de volta em `value` a cada `vi
 | `.on_input(f)` | `Fn(String) -> M`: recebe o texto novo inteiro a cada mudança. |
 | `.on_submit(m)` | Manda `m` no Enter. |
 | `.autofocus(pedido: u64)` | Pede o foco. Mude o número para pedir de novo. |
+| `.id(id)` | O nome para `Task::focus(id)`. |
 | `.secure(bool)` | Senha: mostra bolinhas e não copia. |
 | `.size(Num)`, `.font(Font)`, `.padding(p)`, `.width(l)` | Aparência. |
 | `.style(f)` | `Fn(&Theme, Status) -> Style`. Padrão: `input_default`. |
@@ -491,6 +557,7 @@ text_editor(content: &Content) -> TextEditor      // M: Clone
 ```
 
 Editor de várias linhas. O `Content` fica no estado do app, e o editor edita o conteúdo direto (não há `on_input`).
+Enche o espaço; dentro de um `scrollable` (sem limite), fica com 400 × 300.
 
 `TextEditor`:
 
@@ -503,6 +570,11 @@ Editor de várias linhas. O `Content` fica no estado do app, e o editor edita o 
 | `.invisibles(bool)` | Mostra espaço `·`, tab `→` e fim de linha `↵`, e marca os caracteres ocultos. |
 | `.markdown(bool)` | Realce de Markdown leve no próprio texto (títulos, negrito, código, listas, tabelas). |
 | `.autofocus(u64)` | Como no `text_input`. |
+| `.id(id)` | O nome para `Task::focus(id)`. |
+| `.line_height(f32)` | Altura da linha em pixels lógicos. Padrão: 1,45 × o tamanho. |
+| `.placeholder(&str)` | O texto apagado do editor vazio. |
+| `.on_key(f)` | `Fn(&Key, Modifiers) -> Option<M>`: vê cada tecla antes do editor (com foco). `Some(msg)` manda a mensagem e o editor ignora a tecla (Tab que recua, Enter que envia). |
+| `.highlight(ext, Highlight)` | Cores de código pela extensão (`"rs"`, `"py"`…). Precisa da feature `highlighter` (syntect). Temas: `Highlight::ALL`. |
 | `.style(f)` | `Fn(&Theme, Status) -> Style`. |
 
 Teclas: setas (com Ctrl, anda por palavra), Home e End (com Ctrl, início e fim do texto), PageUp/PageDown, Tab, Enter e Ctrl+A/C/X/V/Z/Y.
@@ -515,9 +587,12 @@ Teclas: setas (com Ctrl, anda por palavra), Home e End (com Ctrl, início e fim 
 | `.text()` | — | `String` com o texto inteiro |
 | `.version()` | — | `u64` que muda a cada edição (não com cursor ou rolagem) |
 | `.cursor()` | — | `(linha, coluna)`, contando de 1 |
+| `.selection()` | — | `Option<String>`: o texto selecionado |
+| `.line(n)` | linha, contando de 1 | `Option<String>` sem a quebra |
+| `.insert(texto)` | `&str` | escreve no cursor, no lugar da seleção (um passo do desfazer) |
 | `.line_count()` | — | `usize` |
 | `.can_undo()` / `.can_redo()` | — | `bool` |
-| `.undo()` / `.redo()` | — | — |
+| `.undo()` / `.redo()` | — | — (guarda os últimos 500 passos) |
 | `.go_to_line(n)` | linha, contando de 1 | leva o cursor ao começo dela |
 | `.wrap_selection(antes, depois, inicio)` | `&str`, `&str`, `Fn(&str) -> usize` | põe em volta da seleção. Se já estão lá (mesmo por fora de outros, como em `***~~oi~~***`), tira. `inicio` diz onde o texto da linha começa (depois de um `## `): a seleção nunca começa antes. |
 | `.edit_lines(f)` | `Fn(&str) -> (bytes_a_tirar, novo_inicio)` | troca o começo de cada linha da seleção (listas, citações) |
@@ -550,7 +625,16 @@ pick_list(options: &[T], selected: Option<T>, on_select: impl Fn(T) -> M) -> Pic
 // T: Clone + PartialEq + ToString
 ```
 
-Lista suspensa. Mostra `selected.to_string()` e abre as outras opções embaixo. Métodos: `.placeholder(..)`, `.width(l)` e `.size(Num)`.
+Lista suspensa. Mostra `selected.to_string()` e abre as outras opções embaixo. Métodos: `.placeholder(..)`, `.width(l)`, `.size(Num)` e `.menu_height(Num)` (altura máxima do menu; passando dela, rola com a roda).
+
+### `combo_box`
+
+```rust
+combo_box(options: &[T], placeholder, selected: Option<&T>, on_select: impl Fn(T) -> M) -> ComboBox
+// T: Clone + ToString
+```
+
+Campo com lista que filtra enquanto se digita (contém, sem diferenciar maiúsculas nem acentos). ↑/↓ andam na lista, Enter ou clique escolhe, Esc fecha. Sem foco mostra `selected`. A busca fica no estado do widget: o app não guarda nada. Métodos: `.width(l)`, `.size(Num)`, `.padding(p)` e `.menu_height(Num)`.
 
 ### `slider`
 
@@ -641,13 +725,20 @@ Usado dentro de um `canvas` ou de um widget próprio. Tudo em pixels lógicos.
 | `record()` / `changes() -> Changes` | — | grava o quadro e compara com o anterior. `Changes::None`, `All` ou `Regions(Vec<Rect>)`. |
 | `window_size() -> Size` / `scale() -> f32` | — | tamanho lógico e escala atuais |
 | `changed_rows() -> Option<(u32, u32)>` | — | linhas que o último quadro mudou (`None` = todas) |
-| `measure(text, size, font, max_width) -> Size` | texto | o tamanho que ele ocupa. Com `max_width`, quebra linha. |
+| `measure(text, size, font, max_width) -> Size` | texto | o tamanho que ele ocupa. Com `max_width`, quebra linha. `measure_lh(.., line_height)` com a altura da linha em vezes o tamanho (padrão 1,3). |
 | `carets(text, size, font) -> Vec<(byte, x_ini, x_fim)>` | texto | posição de cada caractere da primeira linha |
-| `draw_text(text, size, font, color, at, max_width)` | — | escreve |
+| `draw_text(text, size, font, color, at, max_width)` | — | escreve; `draw_text_lh(.., line_height)` com outra altura de linha |
 | `fill_quad(rect, Option<&Background>, Border, Option<Shadow>)` | — | caixa com fundo, borda e sombra |
-| `draw_image(&Image, rect, radius: [f32; 4])` | — | imagem esticada e recortada pelos cantos |
+| `draw_image(&Image, rect, radius: [f32; 4])` | — | imagem esticada e recortada pelos cantos (com transformação, girada; aí sem cantos) |
 | `draw_svg(&Svg, rect, Option<Color>)` | — | SVG, opcionalmente numa cor só |
 | `stroke(pontos: &[Point], largura, cor)` | — | linha com pontas e junções redondas |
+| `fill_path(&Path, fundo, FillRule)` | cor ou degradê (`impl Into<Background>`) | preenche; `NonZero` ou `EvenOdd` |
+| `Path::new(\|b\| ..)`, `Path::line/rect/circle/polyline` | `PathBuilder`: `move_to`, `line_to`, `quadratic_to`, `bezier_to`, `arc(centro, raios, ini, fim)`, `rect`, `circle`, `ellipse`, `close` | uma forma; `.bounds()`, `.transform(t)`, `.segments()` (iterador de `Segment::{MoveTo, LineTo, QuadTo, CubicTo, Close}`) |
+| `stroke_path(&Path, &Stroke, cor)` | `Stroke::new(largura).cap(..).join(..).dash(vec![..])` | contorna |
+| `push_transform(Transform)` / `pop_transform()` | `Transform::translate/scale/rotate/rotate_around/from_row`, `a.then(b)`, `.apply(p)`, `.invert()` | caminhos, imagens e `fill_text` saem transformados |
+| `text_path(text, size, font, at, max_width) -> Option<Path>` | — | os contornos das letras (WordArt, texto vazado) |
+| `fill_text(text, size, font, color, at)` | — | texto que segue a transformação (girado, inclinado) |
+| `draw_image_nearest(&Image, rect)` | — | imagem sem suavizar (página 1:1, pixel art) |
 | `blur(rect, raio, cantos)` | — | desfoca o que já está desenhado ali (vidro) |
 | `push_clip(rect, radius)` / `pop_clip()` | — | nada sai de `rect` até o `pop_clip` |
 | campo `pixmap` | — | o `tiny_skia::Pixmap` do quadro. Desenho direto nele não entra no `changes()`. |

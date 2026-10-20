@@ -2,7 +2,7 @@
 use crate::access::{accesskit, Access};
 use crate::anim::{animar, Lerp, Transition};
 use crate::{Align, Background, Border, Captured, Color, Event, Font, Image, Length, MouseButton, Padding, Point, Rect, Renderer, Shadow, Size, States, Status, Svg, Theme, WindowCmd};
-use crate::{Key, NamedKey};
+use crate::{Key, Modifiers, NamedKey};
 use std::borrow::Cow;
 
 pub use winit::window::CursorIcon;
@@ -56,6 +56,10 @@ impl Limits {
             Length::Fill(_) if max.is_finite() => max,
             _ => conteudo.min(max),
         }
+    }
+    /// O tamanho de quem enche tudo: num lado sem limite (dentro de uma rolagem), `padrao`.
+    pub fn fill(&self, padrao: Size) -> Size {
+        Size::new(Limits::resolve(Length::FILL, self.max.width, padrao.width), Limits::resolve(Length::FILL, self.max.height, padrao.height))
     }
 }
 
@@ -540,10 +544,11 @@ pub struct Text<'a> {
     height: Length,
     align_x: Align,
     wrap: bool,
+    line_height: f32,
 }
 
 pub fn text<'a>(s: impl Into<Cow<'a, str>>) -> Text<'a> {
-    Text { content: s.into(), size: 14.0, font: Font::DEFAULT, color: None, width: Length::Shrink, height: Length::Shrink, align_x: Align::Start, wrap: true }
+    Text { content: s.into(), size: 14.0, font: Font::DEFAULT, color: None, width: Length::Shrink, height: Length::Shrink, align_x: Align::Start, wrap: true, line_height: 1.3 }
 }
 
 impl Text<'_> {
@@ -574,6 +579,11 @@ impl Text<'_> {
     /// Uma linha só, sem quebrar (o que passar é cortado pelo pai).
     pub fn no_wrap(mut self) -> Self {
         self.wrap = false;
+        self
+    }
+    /// Altura da linha em múltiplos do tamanho (o `line-height` do CSS); o padrão é 1.3.
+    pub fn line_height(mut self, f: f32) -> Self {
+        self.line_height = f;
         self
     }
     fn max_width(&self, w: f32) -> Option<f32> {
@@ -608,15 +618,15 @@ impl<M> Widget<M> for Text<'_> {
             Length::Fixed(v) => v.min(l.max.width),
             _ => l.max.width,
         };
-        let m = cx.renderer.measure(&self.content, self.size, self.font, self.max_width(largura));
+        let m = cx.renderer.measure_lh(&self.content, self.size, self.font, self.max_width(largura), self.line_height);
         Node::leaf(cx.key(), Size::new(Limits::resolve(self.width, l.max.width, m.width), Limits::resolve(self.height, l.max.height, m.height)))
     }
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
         let r = n.rect;
         let mw = self.max_width(r.width);
-        let w = if self.align_x == Align::Start { 0.0 } else { cx.renderer.measure(&self.content, self.size, self.font, mw).width };
+        let w = if self.align_x == Align::Start { 0.0 } else { cx.renderer.measure_lh(&self.content, self.size, self.font, mw, self.line_height).width };
         let at = Point::new(r.x + self.align_x.offset(r.width, w), r.y);
-        cx.renderer.draw_text(&self.content, self.size, self.font, self.color.unwrap_or(cx.text_color), at, mw);
+        cx.renderer.draw_text_lh(&self.content, self.size, self.font, self.color.unwrap_or(cx.text_color), at, mw, self.line_height);
         cx.access_text(n.key, r, &self.content);
     }
 }
@@ -893,7 +903,12 @@ impl<M> Flex<'_, M> {
 
 impl<M> Widget<M> for Flex<'_, M> {
     fn size(&self) -> (Length, Length) {
-        (self.width, self.height)
+        // Como no Iced: sem tamanho próprio, a linha/coluna enche se algum filho enche.
+        let herda = |own: Length, f: fn((Length, Length)) -> Length| match own {
+            Length::Shrink => self.children.iter().map(|c| f(c.0.size())).find(|l| l.fill() > 0).unwrap_or(own),
+            _ => own,
+        };
+        (herda(self.width, |s| s.0), herda(self.height, |s| s.1))
     }
     fn layout(&self, cx: &mut LayoutCx, l: Limits) -> Node {
         if self.wrap && self.axis == Axis::Row {
@@ -910,16 +925,17 @@ impl<M> Widget<M> for Flex<'_, M> {
         let mut sobra = (max_main - pad_main - gaps).max(0.0);
         let mut nos: Vec<Option<Node>> = (0..self.children.len()).map(|_| None).collect();
         // 1º passo: quem não enche pega o que precisa; 2º: a sobra é dividida entre os que enchem.
-        let fill = |c: &Element<M>| if max_main.is_finite() { self.main_len(c.0.size()).fill() } else { 0 };
-        for (i, c) in self.children.iter().enumerate().filter(|(_, c)| fill(c) == 0) {
+        // Uma vez por filho: o size() de uma linha/coluna percorre os filhos dela.
+        let fill: Vec<u16> = self.children.iter().map(|c| if max_main.is_finite() { self.main_len(c.0.size()).fill() } else { 0 }).collect();
+        for (i, c) in self.children.iter().enumerate().filter(|(i, _)| fill[*i] == 0) {
             let n = cx.child(i, c, Limits::new(self.join(sobra, max_cross_in)));
             sobra = (sobra - self.split(n.size()).0).max(0.0);
             nos[i] = Some(n);
         }
-        let total: u32 = self.children.iter().map(|c| fill(c) as u32).sum();
+        let total: u32 = fill.iter().map(|&f| f as u32).sum();
         let mut resto = sobra;
-        for (i, c) in self.children.iter().enumerate().filter(|(_, c)| fill(c) > 0) {
-            let parte = (sobra * fill(c) as f32 / total as f32).floor().min(resto);
+        for (i, c) in self.children.iter().enumerate().filter(|(i, _)| fill[*i] > 0) {
+            let parte = (sobra * fill[i] as f32 / total as f32).floor().min(resto);
             resto -= parte;
             nos[i] = Some(cx.child(i, c, Limits::new(self.join(parte, max_cross_in))));
         }
@@ -944,6 +960,10 @@ impl<M> Widget<M> for Flex<'_, M> {
     }
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
         for (c, cn) in self.children.iter().zip(&n.children) {
+            // Fora da rolagem (o recorte): não desenha. A folga cobre sombras e o foco.
+            if !cx.accessible() && cx.renderer.clipped_out(cn.rect, 48.0) {
+                continue;
+            }
             c.0.draw(cn, cx);
         }
     }
@@ -1223,16 +1243,42 @@ pub struct MouseArea<'a, M> {
     on_right_press: Option<M>,
     on_double_click: Option<M>,
     icon: Option<CursorIcon>,
+    on_enter: Option<M>,
+    on_exit: Option<M>,
+    on_move: Option<Box<dyn Fn(Point) -> M + 'a>>,
+    on_scroll: Option<Box<dyn Fn(f32, f32, Modifiers) -> M + 'a>>,
 }
+
+/// O mouse estava em cima no último evento ([`MouseArea::on_enter`]).
+#[derive(Default)]
+struct EmCima(bool);
 
 #[derive(Default)]
 struct UltimoClique(Option<std::time::Instant>);
 
 pub fn mouse_area<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> MouseArea<'a, M> {
-    MouseArea { content: content.into(), on_press: None, on_release: None, on_right_press: None, on_double_click: None, icon: None }
+    MouseArea { content: content.into(), on_press: None, on_release: None, on_right_press: None, on_double_click: None, icon: None, on_enter: None, on_exit: None, on_move: None, on_scroll: None }
 }
 
-impl<M> MouseArea<'_, M> {
+impl<'a, M> MouseArea<'a, M> {
+    pub fn on_enter(mut self, m: M) -> Self {
+        self.on_enter = Some(m);
+        self
+    }
+    pub fn on_exit(mut self, m: M) -> Self {
+        self.on_exit = Some(m);
+        self
+    }
+    /// O mouse andou em cima (posição na janela, lógica).
+    pub fn on_move(mut self, f: impl Fn(Point) -> M + 'a) -> Self {
+        self.on_move = Some(Box::new(f));
+        self
+    }
+    /// A roda em cima (`dx`, `dy` como no [`Event::Wheel`]); pega o evento, então o scrollable de fora não rola.
+    pub fn on_scroll(mut self, f: impl Fn(f32, f32, Modifiers) -> M + 'a) -> Self {
+        self.on_scroll = Some(Box::new(f));
+        self
+    }
     pub fn on_press(mut self, m: M) -> Self {
         self.on_press = Some(m);
         self
@@ -1279,11 +1325,28 @@ impl<M: Clone> Widget<M> for MouseArea<'_, M> {
         }
     }
     fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
+        let dentro = cx.cursor.is_some_and(|p| n.rect.contains(p));
+        if (self.on_enter.is_some() || self.on_exit.is_some()) && matches!(ev, Event::CursorMoved(_) | Event::CursorLeft) {
+            let antes = std::mem::replace(&mut cx.states.get_mut::<EmCima>(n.key).0, dentro);
+            match (antes, dentro) {
+                (false, true) => self.on_enter.iter().for_each(|m| cx.publish(m.clone())),
+                (true, false) => self.on_exit.iter().for_each(|m| cx.publish(m.clone())),
+                _ => {}
+            }
+        }
         if self.content.0.event(&n.children[0], ev, cx) == Captured::Yes {
             return Captured::Yes;
         }
-        if !cx.cursor.is_some_and(|p| n.rect.contains(p)) {
+        if !dentro {
             return Captured::No;
+        }
+        match (ev, &self.on_move, &self.on_scroll) {
+            (Event::CursorMoved(p), Some(f), _) => cx.publish(f(*p)),
+            (Event::Wheel { dx, dy, modifiers }, _, Some(f)) => {
+                cx.publish(f(*dx, *dy, *modifiers));
+                return Captured::Yes;
+            }
+            _ => {}
         }
         let m = match ev {
             Event::MousePressed(MouseButton::Left) => {
@@ -1318,22 +1381,76 @@ impl<M: Clone> Widget<M> for MouseArea<'_, M> {
 
 #[derive(Default)]
 struct Rolagem {
-    offset: f32,
-    /// Distância do clique até o topo do polegar, enquanto ele é arrastado.
-    arrastando: Option<f32>,
+    offset: Point,
+    /// Pedido de [`crate::Task::snap_to`] (0 a 1 em cada eixo), que só o layout sabe converter.
+    relativo: Option<Point>,
+    /// O polegar arrastado: vertical ou não, e a distância do clique até o começo dele.
+    arrastando: Option<(bool, f32)>,
+    /// O último deslocamento avisado pelo `on_scroll`.
+    avisado: Option<Point>,
+}
+
+/// Muda a rolagem de `key` (os pedidos de [`crate::Task::scroll_to`]).
+pub(crate) fn rolar(states: &mut States, key: u64, p: Point, relativo: bool) {
+    let r = states.get_mut::<Rolagem>(key);
+    if relativo {
+        r.relativo = Some(p);
+    } else {
+        r.offset = p;
+        r.relativo = None;
+    }
+}
+
+/// Em que eixos um [`Scrollable`] rola.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Direction {
+    #[default]
+    Vertical,
+    Horizontal,
+    Both,
+}
+
+impl Direction {
+    fn x(self) -> bool {
+        self != Direction::Vertical
+    }
+    fn y(self) -> bool {
+        self != Direction::Horizontal
+    }
+}
+
+/// Onde a rolagem está, para o [`Scrollable::on_scroll`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Viewport {
+    pub offset: Point,
+    /// O tamanho da parte visível.
+    pub bounds: Size,
+    /// O tamanho do conteúdo inteiro.
+    pub content: Size,
+}
+
+impl Viewport {
+    /// O deslocamento em fração (0 a 1) de cada eixo; sem o que rolar, 0.
+    pub fn relative(&self) -> Point {
+        let f = |o: f32, c: f32, b: f32| if c > b { o / (c - b) } else { 0.0 };
+        Point::new(f(self.offset.x, self.content.width, self.bounds.width), f(self.offset.y, self.content.height, self.bounds.height))
+    }
 }
 
 pub struct Scrollable<'a, M> {
     content: Element<'a, M>,
     width: Length,
     height: Length,
+    direction: Direction,
+    id: Option<u64>,
+    on_scroll: Option<Box<dyn Fn(Viewport) -> M + 'a>>,
 }
 
 pub fn scrollable<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Scrollable<'a, M> {
-    Scrollable { content: content.into(), width: Length::FILL, height: Length::FILL }
+    Scrollable { content: content.into(), width: Length::FILL, height: Length::FILL, direction: Direction::Vertical, id: None, on_scroll: None }
 }
 
-impl<M> Scrollable<'_, M> {
+impl<'a, M> Scrollable<'a, M> {
     pub fn width(mut self, w: impl Into<Length>) -> Self {
         self.width = w.into();
         self
@@ -1342,12 +1459,42 @@ impl<M> Scrollable<'_, M> {
         self.height = h.into();
         self
     }
-    fn thumb(n: &Node, offset: f32) -> Option<Rect> {
-        let (v, c) = (n.rect.height, n.children[0].rect.height);
-        (c > v).then(|| {
-            let h = (v * v / c).max(24.0);
-            Rect { x: n.rect.x + n.rect.width - 8.0, y: n.rect.y + (v - h) * offset / (c - v), width: 6.0, height: h }
-        })
+    /// Vertical (padrão), horizontal ou os dois. A roda com Shift rola na horizontal.
+    pub fn direction(mut self, d: Direction) -> Self {
+        self.direction = d;
+        self
+    }
+    /// O nome para [`crate::Task::scroll_to`] / [`crate::Task::snap_to`].
+    pub fn id(mut self, id: impl std::hash::Hash) -> Self {
+        self.id = Some(crate::id_hash(&id));
+        self
+    }
+    /// Avisa cada mudança do deslocamento (rolagem do usuário ou pedida).
+    pub fn on_scroll(mut self, f: impl Fn(Viewport) -> M + 'a) -> Self {
+        self.on_scroll = Some(Box::new(f));
+        self
+    }
+    fn viewport(n: &Node) -> Viewport {
+        let c = &n.children[0].rect;
+        Viewport { offset: Point::new(n.rect.x - c.x, n.rect.y - c.y), bounds: n.rect.size(), content: c.size() }
+    }
+    /// O polegar de cada eixo que tem o que rolar: (vertical, horizontal).
+    fn thumbs(&self, n: &Node) -> (Option<Rect>, Option<Rect>) {
+        let v = Self::viewport(n);
+        let (r, c) = (n.rect, v.content);
+        let ambos = self.direction.y() && self.direction.x() && c.height > r.height && c.width > r.width;
+        let canto = if ambos { 8.0 } else { 0.0 };
+        let vertical = (self.direction.y() && c.height > r.height).then(|| {
+            let curso = r.height - canto;
+            let h = (curso * r.height / c.height).max(24.0);
+            Rect { x: r.x + r.width - 8.0, y: r.y + (curso - h) * v.offset.y / (c.height - r.height), width: 6.0, height: h }
+        });
+        let horizontal = (self.direction.x() && c.width > r.width).then(|| {
+            let curso = r.width - canto;
+            let w = (curso * r.width / c.width).max(24.0);
+            Rect { x: r.x + (curso - w) * v.offset.x / (c.width - r.width), y: r.y + r.height - 8.0, width: w, height: 6.0 }
+        });
+        (vertical, horizontal)
     }
 }
 
@@ -1356,13 +1503,23 @@ impl<M> Widget<M> for Scrollable<'_, M> {
         (self.width, self.height)
     }
     fn layout(&self, cx: &mut LayoutCx, l: Limits) -> Node {
+        // No layout (e não no desenho): o Task acha a rolagem mesmo fora da tela.
+        if let Some(id) = self.id {
+            cx.states.ids.borrow_mut().insert(id, cx.key());
+        }
         let w = Limits::resolve(self.width, l.max.width, l.max.width);
-        let mut filho = cx.child(0, &self.content, Limits::new(Size::new(w, f32::INFINITY)));
+        let hmax = Limits::resolve(self.height, l.max.height, l.max.height);
+        let livre = Size::new(if self.direction.x() { f32::INFINITY } else { w }, if self.direction.y() { f32::INFINITY } else { hmax });
+        let mut filho = cx.child(0, &self.content, Limits::new(livre));
         let h = Limits::resolve(self.height, l.max.height, filho.rect.height);
         let w = Limits::resolve(self.width, l.max.width, filho.rect.width);
-        let max_off = (filho.rect.height - h).max(0.0);
-        let off = cx.states.get::<Rolagem>(cx.key()).map_or(0.0, |r| r.offset).clamp(0.0, max_off);
-        filho.place(Point::new(0.0, -off));
+        let max = Point::new((filho.rect.width - w).max(0.0), (filho.rect.height - h).max(0.0));
+        let off = match cx.states.get::<Rolagem>(cx.key()) {
+            Some(Rolagem { relativo: Some(r), .. }) => Point::new(r.x.clamp(0.0, 1.0) * max.x, r.y.clamp(0.0, 1.0) * max.y),
+            Some(r) => Point::new(r.offset.x.clamp(0.0, max.x), r.offset.y.clamp(0.0, max.y)),
+            None => Point::ORIGIN,
+        };
+        filho.place(Point::new(-off.x, -off.y));
         Node { rect: Rect::new(Point::ORIGIN, Size::new(w, h)), key: cx.key(), children: vec![filho], ..Default::default() }
     }
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
@@ -1374,27 +1531,56 @@ impl<M> Widget<M> for Scrollable<'_, M> {
         cx.access_end();
         cx.renderer.pop_clip();
         cx.cursor = cursor;
-        let off = n.rect.y - n.children[0].rect.y;
-        if let Some(t) = Self::thumb(n, off) {
-            let ativo = cx.hovered(&n.rect) || cx.states.get::<Rolagem>(n.key).is_some_and(|r| r.arrastando.is_some());
+        let ativo = cx.hovered(&n.rect) || cx.states.get::<Rolagem>(n.key).is_some_and(|r| r.arrastando.is_some());
+        let (v, h) = self.thumbs(n);
+        for t in [v, h].into_iter().flatten() {
             cx.renderer.fill_quad(t, Some(&cx.theme.text.alpha(if ativo { 0.35 } else { 0.18 }).into()), Border::rounded(3.0), None);
         }
     }
     fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
+        let antes = Self::viewport(n);
+        // Um snap_to já virou posição no layout: guarda ela, e a rolagem segue dali.
+        let r = cx.states.get_mut::<Rolagem>(n.key);
+        if r.relativo.take().is_some() {
+            r.offset = antes.offset;
+        }
+        let c = self.capturar(n, ev, cx, antes);
+        if let Some(f) = &self.on_scroll {
+            let r = cx.states.get_mut::<Rolagem>(n.key);
+            let max = Point::new((antes.content.width - antes.bounds.width).max(0.0), (antes.content.height - antes.bounds.height).max(0.0));
+            let agora = Point::new(r.offset.x.clamp(0.0, max.x), r.offset.y.clamp(0.0, max.y));
+            if r.avisado != Some(agora) {
+                let primeira = r.avisado.is_none();
+                r.avisado = Some(agora);
+                if !primeira || agora != Point::ORIGIN {
+                    cx.publish(f(Viewport { offset: agora, ..antes }));
+                }
+            }
+        }
+        c
+    }
+    fn opaque_at(&self, n: &Node, p: Point) -> bool {
+        n.rect.contains(p) && self.content.0.opaque_at(&n.children[0], p)
+    }
+}
+
+impl<M> Scrollable<'_, M> {
+    fn capturar(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>, v: Viewport) -> Captured {
         let dentro = cx.cursor.is_some_and(|p| n.rect.contains(p));
-        let max_off = (n.children[0].rect.height - n.rect.height).max(0.0);
-        let off = n.rect.y - n.children[0].rect.y;
-        let thumb = Self::thumb(n, off);
+        let max = Point::new((v.content.width - v.bounds.width).max(0.0), (v.content.height - v.bounds.height).max(0.0));
+        let (tv, th) = self.thumbs(n);
         match ev {
             // A rolagem de dentro (lista dentro da página) tem a vez; só o que ela não usar rola esta.
-            Event::Wheel { dy, .. } if dentro && max_off > 0.0 => {
+            Event::Wheel { dx, dy, modifiers } if dentro && (max.x > 0.0 || max.y > 0.0) => {
                 if self.content.0.event(&n.children[0], ev, cx) == Captured::Yes {
                     return Captured::Yes;
                 }
-                let r = cx.states.get_mut::<Rolagem>(n.key);
-                let novo = (off - dy).clamp(0.0, max_off);
-                if novo != off {
-                    r.offset = novo;
+                // Shift troca o eixo da roda (mouse comum só tem a vertical).
+                let (dx, dy) = if modifiers.shift_key() && *dx == 0.0 { (*dy, 0.0) } else { (*dx, *dy) };
+                let (dx, dy) = if !self.direction.y() && dx == 0.0 { (dy, 0.0) } else { (dx, dy) };
+                let novo = Point::new(if self.direction.x() { (v.offset.x - dx).clamp(0.0, max.x) } else { v.offset.x }, if self.direction.y() { (v.offset.y - dy).clamp(0.0, max.y) } else { v.offset.y });
+                if novo != v.offset {
+                    cx.states.get_mut::<Rolagem>(n.key).offset = novo;
                     cx.redraw = true;
                     return Captured::Yes;
                 }
@@ -1402,11 +1588,14 @@ impl<M> Widget<M> for Scrollable<'_, M> {
                 return Captured::No;
             }
             Event::MousePressed(MouseButton::Left) => {
-                if let (Some(t), Some(p)) = (thumb, cx.cursor) {
-                    let alvo = Rect { x: t.x - 4.0, width: t.width + 6.0, ..t };
-                    if alvo.contains(p) {
-                        cx.states.get_mut::<Rolagem>(n.key).arrastando = Some(p.y - t.y);
-                        return Captured::Yes;
+                if let Some(p) = cx.cursor {
+                    for (vertical, t) in [(true, tv), (false, th)] {
+                        let Some(t) = t else { continue };
+                        let alvo = if vertical { Rect { x: t.x - 4.0, width: t.width + 6.0, ..t } } else { Rect { y: t.y - 4.0, height: t.height + 6.0, ..t } };
+                        if alvo.contains(p) {
+                            cx.states.get_mut::<Rolagem>(n.key).arrastando = Some((vertical, if vertical { p.y - t.y } else { p.x - t.x }));
+                            return Captured::Yes;
+                        }
                     }
                 }
             }
@@ -1418,11 +1607,18 @@ impl<M> Widget<M> for Scrollable<'_, M> {
             }
             Event::CursorMoved(p) => {
                 let r = cx.states.get_mut::<Rolagem>(n.key);
-                if let (Some(pega), Some(t)) = (r.arrastando, thumb) {
-                    let curso = n.rect.height - t.height;
-                    r.offset = ((p.y - pega - n.rect.y) / curso * max_off).clamp(0.0, max_off);
-                    cx.redraw = true;
-                    return Captured::Yes;
+                match (r.arrastando, tv, th) {
+                    (Some((true, pega)), Some(t), _) => {
+                        r.offset.y = ((p.y - pega - n.rect.y) / (n.rect.height - t.height).max(1.0) * max.y).clamp(0.0, max.y);
+                        cx.redraw = true;
+                        return Captured::Yes;
+                    }
+                    (Some((false, pega)), _, Some(t)) => {
+                        r.offset.x = ((p.x - pega - n.rect.x) / (n.rect.width - t.width).max(1.0) * max.x).clamp(0.0, max.x);
+                        cx.redraw = true;
+                        return Captured::Yes;
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -1432,9 +1628,6 @@ impl<M> Widget<M> for Scrollable<'_, M> {
             return Captured::No;
         }
         self.content.0.event(&n.children[0], ev, cx)
-    }
-    fn opaque_at(&self, n: &Node, p: Point) -> bool {
-        n.rect.contains(p) && self.content.0.opaque_at(&n.children[0], p)
     }
 }
 
@@ -1455,6 +1648,7 @@ pub struct TextInput<'a, M> {
     secure: bool,
     style: Option<StyleFn<'a>>,
     autofocus: Option<u64>,
+    id: Option<u64>,
 }
 
 /// O último pedido de foco ([`TextInput::autofocus`]) que o widget já atendeu.
@@ -1482,10 +1676,15 @@ pub(crate) fn atender_foco(ev: &Event, states: &mut States, key: u64, pedido: Op
 }
 
 pub fn text_input<'a, M>(placeholder: impl Into<Cow<'a, str>>, value: impl Into<Cow<'a, str>>) -> TextInput<'a, M> {
-    TextInput { placeholder: placeholder.into(), value: value.into(), on_input: None, on_submit: None, size: 14.0, font: Font::DEFAULT, padding: [6u16, 10].into(), width: Length::FILL, secure: false, style: None, autofocus: None }
+    TextInput { placeholder: placeholder.into(), value: value.into(), on_input: None, on_submit: None, size: 14.0, font: Font::DEFAULT, padding: [6u16, 10].into(), width: Length::FILL, secure: false, style: None, autofocus: None, id: None }
 }
 
 impl<'a, M> TextInput<'a, M> {
+    /// O nome para [`crate::Task::focus`].
+    pub fn id(mut self, id: impl std::hash::Hash) -> Self {
+        self.id = Some(crate::id_hash(&id));
+        self
+    }
     pub fn on_input(mut self, f: impl Fn(String) -> M + 'a) -> Self {
         self.on_input = Some(Box::new(f));
         self
@@ -1566,6 +1765,9 @@ impl<M: Clone> Widget<M> for TextInput<'_, M> {
         (self.width, Length::Shrink)
     }
     fn layout(&self, cx: &mut LayoutCx, l: Limits) -> Node {
+        if let Some(id) = self.id {
+            cx.states.ids.borrow_mut().insert(id, cx.key());
+        }
         let h = cx.renderer.measure("Ag", self.size, self.font, None).height + self.padding.vertical();
         let w = Limits::resolve(self.width, l.max.width, 160.0);
         Node::leaf(cx.key(), Size::new(w, h))
@@ -1607,7 +1809,11 @@ impl<M: Clone> Widget<M> for TextInput<'_, M> {
         });
         let dentro = n.rect.shrink(self.padding);
         let cor = st.text_color.unwrap_or(cx.text_color);
-        let cursor = cx.states.get::<Cursor>(n.key).map_or(self.value.len(), |c| c.0).min(self.value.len());
+        let mut cursor = cx.states.get::<Cursor>(n.key).map_or(self.value.len(), |c| c.0).min(self.value.len());
+        // O app pode ter trocado o valor: o cursor velho pode cair no meio de um caractere.
+        while !self.value.is_char_boundary(cursor) {
+            cursor -= 1;
+        }
         let rolar = if focado { self.scroll(cx.renderer, cursor, dentro.width) } else { 0.0 };
         cx.renderer.push_clip(dentro, [0.0; 4]);
         if self.value.is_empty() {
@@ -1891,16 +2097,32 @@ impl<M> Widget<M> for ProgressBar {
 pub enum TooltipPosition {
     Top,
     Bottom,
+    Left,
+    Right,
 }
 
 pub struct Tooltip<'a, M> {
     content: Element<'a, M>,
     tip: Cow<'a, str>,
     position: TooltipPosition,
+    padding: Padding,
+    style: Option<Box<dyn Fn(&Theme) -> Style + 'a>>,
 }
 
 pub fn tooltip<'a, M: 'a>(content: impl Into<Element<'a, M>>, tip: impl Into<Cow<'a, str>>, position: TooltipPosition) -> Tooltip<'a, M> {
-    Tooltip { content: content.into(), tip: tip.into(), position }
+    Tooltip { content: content.into(), tip: tip.into(), position, padding: Padding { top: 4.0, right: 8.0, bottom: 4.0, left: 8.0 }, style: None }
+}
+
+impl<'a, M> Tooltip<'a, M> {
+    pub fn padding(mut self, p: impl Into<Padding>) -> Self {
+        self.padding = p.into();
+        self
+    }
+    /// A caixa do balão: fundo, borda, sombra e cor do texto (o padrão é a superfície do tema).
+    pub fn style(mut self, f: impl Fn(&Theme) -> Style + 'a) -> Self {
+        self.style = Some(Box::new(f));
+        self
+    }
 }
 
 impl<'a, M> Widget<M> for Tooltip<'a, M> {
@@ -1919,20 +2141,27 @@ impl<'a, M> Widget<M> for Tooltip<'a, M> {
         if p <= 0.0 {
             return;
         }
-        let (tip, theme, r, pos) = (self.tip.to_string(), *cx.theme, n.rect, self.position);
+        let theme = *cx.theme;
+        let st = match &self.style {
+            Some(f) => f(&theme),
+            None => Style { background: Some(theme.surface.into()), border: Border::rounded(6.0).color(theme.border, 1.0), shadow: Some(Shadow { color: Color::BLACK.alpha(0.3), offset: Point::new(0.0, 2.0), blur: 6.0 }), ..Default::default() },
+        };
+        let (tip, r, pos, pd) = (self.tip.to_string(), n.rect, self.position, self.padding);
         let janela = cx.renderer.window_size();
         cx.overlay(move |rd| {
             rd.push_opacity(p);
             let t = rd.measure(&tip, 12.0, Font::DEFAULT, Some(320.0));
-            let (w, h) = (t.width + 16.0, t.height + 8.0);
-            let x = (r.x + (r.width - w) / 2.0).clamp(4.0, (janela.width - w - 4.0).max(4.0));
-            let y = match pos {
-                TooltipPosition::Bottom => r.y + r.height + 6.0,
-                TooltipPosition::Top => r.y - h - 6.0,
+            let (w, h) = (t.width + pd.horizontal(), t.height + pd.vertical());
+            let (x, y) = match pos {
+                TooltipPosition::Bottom => (r.x + (r.width - w) / 2.0, r.y + r.height + 6.0),
+                TooltipPosition::Top => (r.x + (r.width - w) / 2.0, r.y - h - 6.0),
+                TooltipPosition::Left => (r.x - w - 6.0, r.y + (r.height - h) / 2.0),
+                TooltipPosition::Right => (r.x + r.width + 6.0, r.y + (r.height - h) / 2.0),
             };
+            let x = x.clamp(4.0, (janela.width - w - 4.0).max(4.0));
             let caixa = Rect { x, y, width: w, height: h };
-            rd.fill_quad(caixa, Some(&theme.surface.into()), Border::rounded(6.0).color(theme.border, 1.0), Some(Shadow { color: Color::BLACK.alpha(0.3), offset: Point::new(0.0, 2.0), blur: 6.0 }));
-            rd.draw_text(&tip, 12.0, Font::DEFAULT, theme.text, Point::new(x + 8.0, y + 4.0), Some(320.0));
+            rd.fill_quad(caixa, st.background.as_ref(), st.border, st.shadow);
+            rd.draw_text(&tip, 12.0, Font::DEFAULT, st.text_color.unwrap_or(theme.text), Point::new(x + pd.left, y + pd.top), Some(320.0));
             rd.pop_opacity();
         });
     }
@@ -1968,5 +2197,136 @@ impl<M> Widget<M> for Canvas<'_> {
         cx.renderer.push_clip(n.rect, [0.0; 4]);
         (self.paint)(cx.renderer, n.rect, cx.theme);
         cx.renderer.pop_clip();
+    }
+}
+
+// ---------- Canvas interativo ----------
+
+/// Um desenho que também recebe eventos e guarda estado próprio (arrastar, selecionar,
+/// zoom): o `canvas::Program` do Iced. O estado fica guardado pela posição na árvore.
+pub trait Program<M> {
+    type State: Default + 'static;
+    fn draw(&self, state: &Self::State, renderer: &mut Renderer, bounds: Rect, theme: &Theme, cursor: Option<Point>);
+    /// Cada evento da janela (também os de fora de `bounds`: soltar o arrasto lá fora).
+    /// `publish` manda mensagens; `Captured::Yes` impede que os de baixo vejam o evento.
+    fn update(&self, state: &mut Self::State, event: &Event, bounds: Rect, cursor: Option<Point>, publish: &mut dyn FnMut(M)) -> Captured {
+        let _ = (state, event, bounds, cursor, publish);
+        Captured::No
+    }
+    /// O ícone do mouse em cima do desenho.
+    fn mouse_interaction(&self, state: &Self::State, bounds: Rect, cursor: Option<Point>) -> CursorIcon {
+        let _ = (state, bounds, cursor);
+        CursorIcon::Default
+    }
+}
+
+pub struct ProgramCanvas<P> {
+    program: P,
+    width: Length,
+    height: Length,
+}
+
+/// O [`Program`] num retângulo; o padrão ocupa todo o espaço.
+pub fn program<P>(program: P) -> ProgramCanvas<P> {
+    ProgramCanvas { program, width: Length::FILL, height: Length::FILL }
+}
+
+impl<P> ProgramCanvas<P> {
+    pub fn width(mut self, w: impl Into<Length>) -> Self {
+        self.width = w.into();
+        self
+    }
+    pub fn height(mut self, h: impl Into<Length>) -> Self {
+        self.height = h.into();
+        self
+    }
+}
+
+impl<M, P: Program<M>> Widget<M> for ProgramCanvas<P> {
+    fn size(&self) -> (Length, Length) {
+        (self.width, self.height)
+    }
+    fn layout(&self, cx: &mut LayoutCx, l: Limits) -> Node {
+        Node::leaf(cx.key(), Size::new(Limits::resolve(self.width, l.max.width, 0.0), Limits::resolve(self.height, l.max.height, 0.0)))
+    }
+    fn draw(&self, n: &Node, cx: &mut DrawCx) {
+        let novo;
+        let st = match cx.states.get::<P::State>(n.key) {
+            Some(s) => s,
+            None => {
+                novo = P::State::default();
+                &novo
+            }
+        };
+        if cx.hovered(&n.rect) {
+            cx.cursor_icon = self.program.mouse_interaction(st, n.rect, cx.cursor);
+        }
+        cx.renderer.push_clip(n.rect, [0.0; 4]);
+        self.program.draw(st, cx.renderer, n.rect, cx.theme, cx.cursor);
+        cx.renderer.pop_clip();
+    }
+    fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
+        let cursor = cx.cursor;
+        let mut msgs = Vec::new();
+        let c = self.program.update(cx.states.get_mut::<P::State>(n.key), ev, n.rect, cursor, &mut |m| msgs.push(m));
+        // O estado pode ter mudado sem mensagem (hover, arrasto): o quadro é gravado e comparado.
+        cx.redraw = true;
+        for m in msgs {
+            cx.publish(m);
+        }
+        c
+    }
+}
+
+impl<'a, M: 'a, P: Program<M> + 'a> From<ProgramCanvas<P>> for Element<'a, M> {
+    fn from(w: ProgramCanvas<P>) -> Self {
+        Element::new(w)
+    }
+}
+
+// ---------- Responsivo ----------
+
+pub struct Responsive<'a, M> {
+    view: Box<dyn Fn(Size) -> Element<'a, M> + 'a>,
+    /// O conteúdo montado no último layout (desenho e eventos usam o mesmo).
+    montado: std::cell::RefCell<Option<Element<'a, M>>>,
+}
+
+/// O conteúdo é montado já sabendo o espaço que tem (caber a página na largura, trocar de
+/// layout em tela estreita). Ocupa todo o espaço.
+pub fn responsive<'a, M>(view: impl Fn(Size) -> Element<'a, M> + 'a) -> Responsive<'a, M> {
+    Responsive { view: Box::new(view), montado: std::cell::RefCell::new(None) }
+}
+
+impl<M> Widget<M> for Responsive<'_, M> {
+    fn size(&self) -> (Length, Length) {
+        (Length::FILL, Length::FILL)
+    }
+    fn layout(&self, cx: &mut LayoutCx, l: Limits) -> Node {
+        let max = l.fill(Size::new(400.0, 300.0));
+        let el = (self.view)(max);
+        let n = cx.child(0, &el, Limits::new(max));
+        *self.montado.borrow_mut() = Some(el);
+        Node { rect: Rect::new(Point::ORIGIN, max), key: cx.key(), children: vec![n], ..Default::default() }
+    }
+    fn draw(&self, n: &Node, cx: &mut DrawCx) {
+        if let Some(el) = &*self.montado.borrow() {
+            el.0.draw(&n.children[0], cx);
+        }
+    }
+    fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
+        match &*self.montado.borrow() {
+            Some(el) => el.0.event(&n.children[0], ev, cx),
+            None => Captured::No,
+        }
+    }
+    fn opaque_at(&self, n: &Node, p: Point) -> bool {
+        self.montado.borrow().as_ref().is_some_and(|el| el.0.opaque_at(&n.children[0], p))
+    }
+}
+
+impl<'a, M: 'a> From<Responsive<'a, M>> for Element<'a, M> {
+    fn from(w: Responsive<'a, M>) -> Self {
+        Element::new(w)
     }
 }
