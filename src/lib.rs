@@ -12,14 +12,16 @@
 //!   recebe o [`Status`] e o [`Theme`] — nada de tema fechado num enum.
 mod app;
 mod controls;
+mod pickers;
 mod render;
 pub mod widget;
 
 pub use app::{run, App, Error, Handle, Settings, Task, WindowCmd};
 /// Canais e fluxos para as tarefas ([`Task::run`]).
 pub use futures;
-pub use render::{Font, Image, Renderer, Svg};
+pub use render::{Changes, Font, Image, Renderer, Svg};
 pub use controls::*;
+pub use pickers::*;
 pub use widget::*;
 pub use winit::keyboard::{Key, ModifiersState as Modifiers, NamedKey};
 pub use winit::window::ResizeDirection;

@@ -1,6 +1,6 @@
 //! Controles prontos: checkbox, toggler, dropdown, slider e régua.
 use crate::widget::{CursorIcon, DrawCx, Element, EventCx, LayoutCx, Limits, Node, Num, Widget};
-use crate::{Border, Captured, Color, Event, Font, Key, Length, MouseButton, NamedKey, Point, Rect, Shadow, Size, Status};
+use crate::{Background, Border, Captured, Color, Event, Font, Key, Length, MouseButton, NamedKey, Point, Rect, Shadow, Size, Status};
 use std::borrow::Cow;
 
 fn status(desabilitado: bool, hover: bool) -> Status {
@@ -17,6 +17,7 @@ fn status(desabilitado: bool, hover: bool) -> Status {
 enum Forma {
     Caixa,
     Chave,
+    Radio,
 }
 
 /// Checkbox e toggler: o mesmo comportamento, só o desenho muda.
@@ -31,6 +32,11 @@ pub struct Toggle<'a, M> {
 
 pub fn checkbox<'a, M>(label: impl Into<Cow<'a, str>>, checked: bool) -> Toggle<'a, M> {
     Toggle { forma: Forma::Caixa, label: label.into(), checked, on_toggle: None, size: 14.0, color: None }
+}
+
+/// Escolha única: marcado quando `selected == Some(value)`; o clique manda `value`.
+pub fn radio<'a, V: Copy + PartialEq + 'a, M>(label: impl Into<Cow<'a, str>>, value: V, selected: Option<V>, on_select: impl Fn(V) -> M + 'a) -> Toggle<'a, M> {
+    Toggle { forma: Forma::Radio, ..checkbox(label, selected == Some(value)) }.on_toggle(move |_| on_select(value))
 }
 
 /// Chave liga/desliga.
@@ -54,7 +60,7 @@ impl<'a, M> Toggle<'a, M> {
     }
     fn marca(&self) -> Size {
         match self.forma {
-            Forma::Caixa => Size::new(16.0, 16.0),
+            Forma::Caixa | Forma::Radio => Size::new(16.0, 16.0),
             Forma::Chave => Size::new(34.0, 18.0),
         }
     }
@@ -86,6 +92,10 @@ impl<M> Widget<M> for Toggle<'_, M> {
                     let p = |x: f32, y: f32| Point::new(r.x + x, r.y + y);
                     cx.renderer.stroke(&[p(4.0, 8.5), p(7.0, 11.5), p(12.0, 5.0)], 2.0, t.on_primary);
                 }
+            }
+            Forma::Radio => {
+                let borda = if self.checked { ativa } else if hover { t.muted } else { t.border };
+                cx.renderer.fill_quad(r, Some(&t.surface.alpha(apagado).into()), Border::rounded(8.0).color(borda.alpha(apagado), if self.checked { 5.0 } else { 1.0 }), None);
             }
             Forma::Chave => {
                 let trilho = if self.checked { ativa } else { t.text.alpha(0.2) };
@@ -147,8 +157,9 @@ impl<'a, T: Clone + PartialEq + ToString, M> PickList<'a, T, M> {
         self.size = s.into().0;
         self
     }
-    fn menu(&self, campo: Rect) -> Rect {
-        Rect { x: campo.x, y: campo.y + campo.height + 4.0, width: campo.width, height: self.options.len() as f32 * ITEM + 8.0 }
+    fn menu(&self, campo: Rect, janela: f32) -> Rect {
+        let altura = self.options.len() as f32 * ITEM + 8.0;
+        Rect { x: campo.x, y: crate::pickers::painel_y(campo, altura, janela), width: campo.width, height: altura }
     }
 }
 
@@ -189,7 +200,7 @@ impl<'a, T: Clone + PartialEq + ToString + 'a, M> Widget<M> for PickList<'a, T, 
         if !aberto {
             return;
         }
-        let menu = self.menu(n.rect);
+        let menu = self.menu(n.rect, cx.renderer.window_size().height);
         let itens: Vec<(String, bool)> = self.options.iter().map(|o| (o.to_string(), self.selected.as_ref() == Some(o))).collect();
         let (cursor, size) = (cx.cursor, self.size);
         cx.overlay(move |rd| {
@@ -213,7 +224,7 @@ impl<'a, T: Clone + PartialEq + ToString + 'a, M> Widget<M> for PickList<'a, T, 
             Event::MousePressed(MouseButton::Left) if aberto => {
                 cx.states.get_mut::<Aberto>(n.key).0 = false;
                 cx.redraw = true;
-                let menu = self.menu(n.rect);
+                let menu = self.menu(n.rect, cx.renderer.window_size().height);
                 if let Some(p) = p.filter(|p| menu.contains(*p)) {
                     let i = ((p.y - menu.y - 4.0) / ITEM).floor().max(0.0) as usize;
                     if let Some(o) = self.options.get(i) {
@@ -256,10 +267,11 @@ pub struct Slider<'a, M> {
     step: f32,
     on_change: Box<dyn Fn(f32) -> M + 'a>,
     width: Length,
+    color: Option<Color>,
 }
 
 pub fn slider<'a, M>(range: std::ops::RangeInclusive<f32>, value: f32, on_change: impl Fn(f32) -> M + 'a) -> Slider<'a, M> {
-    Slider { range, value, step: 0.0, on_change: Box::new(on_change), width: Length::FILL }
+    Slider { range, value, step: 0.0, on_change: Box::new(on_change), width: Length::FILL, color: None }
 }
 
 impl<M> Slider<'_, M> {
@@ -270,6 +282,11 @@ impl<M> Slider<'_, M> {
     }
     pub fn width(mut self, w: impl Into<Length>) -> Self {
         self.width = w.into();
+        self
+    }
+    /// A cor da parte preenchida e da borda da bolinha.
+    pub fn color(mut self, c: Color) -> Self {
+        self.color = Some(c);
         self
     }
     fn valor_em(&self, n: &Node, x: f32) -> f32 {
@@ -297,14 +314,15 @@ impl<M> Widget<M> for Slider<'_, M> {
         let frac = if b > a { ((self.value - a) / (b - a)).clamp(0.0, 1.0) } else { 0.0 };
         let trilho = Rect { x: n.rect.x + 8.0, y: n.rect.y + 8.0, width: n.rect.width - 16.0, height: 4.0 };
         cx.renderer.fill_quad(trilho, Some(&t.text.alpha(0.15).into()), Border::rounded(2.0), None);
-        cx.renderer.fill_quad(Rect { width: trilho.width * frac, ..trilho }, Some(&t.primary.into()), Border::rounded(2.0), None);
+        let cor = self.color.unwrap_or(t.primary);
+        cx.renderer.fill_quad(Rect { width: trilho.width * frac, ..trilho }, Some(&cor.into()), Border::rounded(2.0), None);
         let ativo = cx.hovered(&n.rect) || cx.states.get::<Arrastando>(n.key).is_some_and(|d| d.0);
         if ativo {
             cx.cursor_icon = CursorIcon::Pointer;
         }
         let d = if ativo { 16.0 } else { 14.0 };
         let bola = Rect { x: trilho.x + trilho.width * frac - d / 2.0, y: n.rect.y + 10.0 - d / 2.0, width: d, height: d };
-        cx.renderer.fill_quad(bola, Some(&Color::WHITE.into()), Border::rounded(d / 2.0).color(t.primary, 2.0), Some(Shadow { color: Color::BLACK.alpha(0.2), offset: Point::new(0.0, 1.0), blur: 2.0 }));
+        cx.renderer.fill_quad(bola, Some(&Color::WHITE.into()), Border::rounded(d / 2.0).color(cor, 2.0), Some(Shadow { color: Color::BLACK.alpha(0.2), offset: Point::new(0.0, 1.0), blur: 2.0 }));
     }
     fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
         let arrastando = cx.states.get::<Arrastando>(n.key).is_some_and(|d| d.0);
@@ -394,4 +412,38 @@ impl<'a, M: 'a> From<Rule> for Element<'a, M> {
     fn from(w: Rule) -> Self {
         Element::new(w)
     }
+}
+
+// ---------- Abas e número (montados com os widgets prontos) ----------
+
+/// Abas com sublinhado na ativa.
+pub fn tabs<'a, M: Clone + 'a>(labels: &[&'a str], active: usize, on_select: impl Fn(usize) -> M + 'a) -> Element<'a, M> {
+    let abas = labels.iter().enumerate().map(|(i, l)| {
+        let ativa = i == active;
+        let rotulo = crate::text(*l).size(14).font(if ativa { Font::SEMIBOLD } else { Font::DEFAULT });
+        crate::button(rotulo).on_press(on_select(i)).padding([8u16, 14]).style(move |t, s| {
+            let cor = if ativa { t.text } else if s == Status::Hovered { t.text.alpha(0.85) } else { t.muted };
+            let fundo = if s == Status::Hovered && !ativa { t.text.alpha(0.05) } else { Color::TRANSPARENT };
+            // O sublinhado é o fim do próprio fundo: um filho "encher" ao lado esticaria a aba.
+            let barra = if ativa { t.primary } else { fundo };
+            let bg = Background::Linear { angle: std::f32::consts::FRAC_PI_2, stops: vec![(0.0, fundo), (0.94, fundo), (0.95, barra), (1.0, barra)] };
+            crate::Style::default().text_color(cor).background(bg).border(Border { radius: [6.0, 6.0, 0.0, 0.0], ..Border::default() })
+        })
+        .into()
+    });
+    let linha = crate::row(abas);
+    crate::column([linha.into(), horizontal_rule(1.0).into()]).into()
+}
+
+/// Número com botões − e +, preso em `range`, andando de `step`.
+pub fn number_input<'a, M: Clone + 'a>(value: f64, range: std::ops::RangeInclusive<f64>, step: f64, on_change: impl Fn(f64) -> M + 'a) -> Element<'a, M> {
+    let (min, max) = (*range.start(), *range.end());
+    let menos = (value > min).then(|| on_change((value - step).max(min)));
+    let mais = (value < max).then(|| on_change((value + step).min(max)));
+    let casas = if step.fract() == 0.0 { 0 } else { 2 };
+    let botao = |s: &'static str, m: Option<M>| crate::button(crate::text(s).size(15)).on_press_maybe(m).width(32.0).height(32.0).padding(0.0).style(crate::button_text);
+    let valor = crate::container(crate::text(format!("{value:.casas$}")).size(14)).width(56.0).height(32.0).align_x(crate::Align::Center).align_y(crate::Align::Center);
+    crate::container(crate::row([botao("−", menos).into(), valor.into(), botao("+", mais).into()]).align(crate::Align::Center))
+        .style(|t| crate::Style::default().background(t.surface).border(Border::rounded(6.0).color(t.border, 1.0)))
+        .into()
 }

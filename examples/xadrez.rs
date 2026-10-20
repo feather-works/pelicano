@@ -232,8 +232,17 @@ impl Xadrez {
         let tema = self.tema;
         container(column![container(grade).clip(true).style(|_| Style::default().border(Border::rounded(10.0))), letras].spacing(4))
             .padding(16.0)
-            .style(move |t| if tema.vidro { Style::glass(18.0) } else { Style::default().background(t.surface).border(Border::rounded(18.0)).shadow(Shadow { color: Color::BLACK.alpha(0.35), offset: Point::new(0.0, 10.0), blur: 30.0 }) })
+            .style(move |t| cartao(tema, t))
             .into()
+    }
+}
+
+/// Cartão sólido; vidro só no tema Vidro.
+fn cartao(tema: Tema, t: &Theme) -> Style {
+    if tema.vidro {
+        Style::glass(16.0)
+    } else {
+        Style::default().background(t.surface).border(Border::rounded(16.0).color(t.border, 1.0)).shadow(Shadow { color: Color::BLACK.alpha(0.3), offset: Point::new(0.0, 6.0), blur: 20.0 })
     }
 }
 
@@ -271,11 +280,15 @@ impl App for Xadrez {
         .width(240.0)
         .height(560.0);
         let tema = self.tema;
-        container(row![self.tabuleiro(), container(painel).padding(20.0).style(|_| Style::glass(16.0))].spacing(24).align(Align::Center))
+        container(row![self.tabuleiro(), container(painel).padding(20.0).style(move |t| cartao(tema, t))].spacing(24).align(Align::Center))
             .center()
-            .style(move |_| {
-                let (a, b) = if tema.vidro { (Color::rgb8(0x4c, 0x1d, 0x95), Color::rgb8(0x0e, 0x74, 0x90)) } else { (Color::rgb8(0x1c, 0x19, 0x17), Color::rgb8(0x29, 0x25, 0x24)) };
-                Style::default().background(Background::Linear { angle: 0.7, stops: vec![(0.0, a), (1.0, b)] })
+            .style(move |t| {
+                if tema.vidro {
+                    // O vidro precisa de algo colorido atrás para aparecer.
+                    Style::default().background(Background::Linear { angle: 0.7, stops: vec![(0.0, Color::rgb8(0x4c, 0x1d, 0x95)), (1.0, Color::rgb8(0x0e, 0x74, 0x90))] })
+                } else {
+                    Style::default().background(t.background)
+                }
             })
             .into()
     }

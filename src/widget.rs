@@ -96,6 +96,7 @@ pub struct DrawCx<'a> {
 }
 
 impl<'a> DrawCx<'a> {
+    /// O cursor está em `r` (e não coberto)?
     pub fn hovered(&self, r: &Rect) -> bool {
         self.cursor.is_some_and(|p| r.contains(p))
     }
@@ -223,8 +224,7 @@ pub fn layout<M>(el: &Element<'_, M>, size: Size, renderer: &mut Renderer, state
 pub fn draw<M>(el: &Element<'_, M>, node: &Node, renderer: &mut Renderer, states: &States, theme: &Theme, cursor: Option<Point>, debug: bool) -> CursorIcon {
     let mut cx = DrawCx { renderer, states, theme, cursor, text_color: theme.text, cursor_icon: CursorIcon::Default, overlays: Vec::new() };
     el.0.draw(node, &mut cx);
-    let overlays = std::mem::take(&mut cx.overlays);
-    for o in overlays {
+    for o in std::mem::take(&mut cx.overlays) {
         o(cx.renderer);
     }
     if debug {
@@ -273,7 +273,7 @@ pub fn inspect(node: &Node, r: &mut Renderer, cursor: Option<Point>) {
         rotulo += &format!("\nmargin {}", lado(alvo.margin));
     }
     let t = r.measure(&rotulo, 11.0, Font::MONO, None);
-    let janela_h = r.pixmap.height() as f32 / r.scale();
+    let janela_h = r.window_size().height;
     let y = if alvo.rect.y + alvo.rect.height + t.height + 12.0 < janela_h { alvo.rect.y + alvo.rect.height + 4.0 } else { (alvo.rect.y - t.height - 12.0).max(0.0) };
     let caixa = Rect { x: alvo.rect.x.max(0.0), y, width: t.width + 12.0, height: t.height + 8.0 };
     r.fill_quad(caixa, Some(&Color::rgb8(0x11, 0x18, 0x27).alpha(0.92).into()), Border::rounded(4.0), None);
@@ -659,12 +659,6 @@ impl<'a, M: 'a> Flex<'a, M> {
     pub fn align(mut self, a: Align) -> Self {
         self.align = a;
         self
-    }
-    pub fn align_y(self, a: Align) -> Self {
-        self.align(a)
-    }
-    pub fn align_x(self, a: Align) -> Self {
-        self.align(a)
     }
     /// Quebra em várias linhas quando não cabe (grade de cartões). Só em `row`.
     pub fn wrap(mut self) -> Self {
@@ -1185,7 +1179,11 @@ impl<M> Widget<M> for Scrollable<'_, M> {
         let off = n.rect.y - n.children[0].rect.y;
         let thumb = Self::thumb(n, off);
         match ev {
+            // A rolagem de dentro (lista dentro da página) tem a vez; só o que ela não usar rola esta.
             Event::Wheel { dy, .. } if dentro && max_off > 0.0 => {
+                if self.content.0.event(&n.children[0], ev, cx) == Captured::Yes {
+                    return Captured::Yes;
+                }
                 let r = cx.states.get_mut::<Rolagem>(n.key);
                 let novo = (off - dy).clamp(0.0, max_off);
                 if novo != off {
@@ -1193,6 +1191,8 @@ impl<M> Widget<M> for Scrollable<'_, M> {
                     cx.redraw = true;
                     return Captured::Yes;
                 }
+                // O conteúdo já viu o evento: não manda de novo lá embaixo.
+                return Captured::No;
             }
             Event::MousePressed(MouseButton::Left) => {
                 if let (Some(t), Some(p)) = (thumb, cx.cursor) {
@@ -1635,7 +1635,7 @@ impl<'a, M> Widget<M> for Tooltip<'a, M> {
             return;
         }
         let (tip, theme, r, pos) = (self.tip.to_string(), *cx.theme, n.rect, self.position);
-        let janela = Size::new(cx.renderer.pixmap.width() as f32 / cx.renderer.scale(), cx.renderer.pixmap.height() as f32 / cx.renderer.scale());
+        let janela = cx.renderer.window_size();
         cx.overlay(move |rd| {
             let t = rd.measure(&tip, 12.0, Font::DEFAULT, Some(320.0));
             let (w, h) = (t.width + 16.0, t.height + 8.0);

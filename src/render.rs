@@ -3,7 +3,7 @@ use crate::{Background, Border, Color, Point, Rect, Shadow, Size};
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tiny_skia::{FillRule, FilterQuality, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pattern, Pixmap, PixmapPaint, SpreadMode, Transform};
+use tiny_skia::{FillRule, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, SpreadMode, Transform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Font {
@@ -26,9 +26,16 @@ impl Default for Font {
     }
 }
 
+/// Número único de cada imagem/SVG criado: a chave dos caches. O endereço não serve,
+/// porque o de uma imagem já liberada volta para a próxima.
+fn novo_id() -> u64 {
+    static PROXIMO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    PROXIMO.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Imagem já decodificada, compartilhada barato entre quadros.
 #[derive(Clone)]
-pub struct Image(Arc<Pixmap>);
+pub struct Image(Arc<Pixmap>, u64);
 
 impl Image {
     /// Pixels RGBA8 sem pré-multiplicar, linha a linha. `None` se o tamanho não bate.
@@ -42,10 +49,10 @@ impl Image {
                 *c = ((*c as u16 * a + 127) / 255) as u8;
             }
         }
-        Some(Image(Arc::new(Pixmap::from_vec(rgba, tiny_skia::IntSize::from_wh(width, height)?)?)))
+        Some(Image(Arc::new(Pixmap::from_vec(rgba, tiny_skia::IntSize::from_wh(width, height)?)?), novo_id()))
     }
     pub fn from_png(bytes: &[u8]) -> Option<Self> {
-        Pixmap::decode_png(bytes).ok().map(|p| Image(Arc::new(p)))
+        Pixmap::decode_png(bytes).ok().map(|p| Image(Arc::new(p), novo_id()))
     }
     pub fn size(&self) -> Size {
         Size::new(self.0.width() as f32, self.0.height() as f32)
@@ -54,11 +61,11 @@ impl Image {
 
 /// SVG analisado uma vez; a rasterização fica em cache por tamanho e cor.
 #[derive(Clone)]
-pub struct Svg(Arc<resvg::usvg::Tree>);
+pub struct Svg(Arc<resvg::usvg::Tree>, u64);
 
 impl Svg {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok().map(|t| Svg(Arc::new(t)))
+        resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok().map(|t| Svg(Arc::new(t), novo_id()))
     }
     pub fn size(&self) -> Size {
         let s = self.0.size();
@@ -76,7 +83,7 @@ struct TextKey {
 
 #[derive(PartialEq, Eq, Hash)]
 struct SvgKey {
-    tree: usize,
+    tree: u64,
     w: u32,
     h: u32,
     color: Option<[u8; 4]>,
@@ -92,8 +99,37 @@ struct ShadowKey {
 }
 
 struct Clip {
+    /// O retângulo visível: este recorte já cruzado com os de fora.
     rect: Rect,
+    own: Rect,
+    radius: [f32; 4],
+    /// Algum recorte da pilha tem canto arredondado: aí só a máscara resolve.
+    rounded: bool,
+    /// Feita só quando um desenho pode sair do recorte; vale até o `pop_clip`.
     mask: Option<Mask>,
+}
+
+/// A máscara do recorte atual, só se o desenho em `area` (pixels físicos) puder sair dele.
+/// `None` em `area` = sempre (texto, que não sabe o tamanho antes).
+fn clip_mask(clips: &mut [Clip], w: u32, h: u32, s: f32, area: Option<tiny_skia::Rect>) -> Option<&Mask> {
+    let (r, rounded) = clips.last().map(|c| (c.rect, c.rounded))?;
+    let dentro = area.is_some_and(|a| a.left() >= r.x * s && a.top() >= r.y * s && a.right() <= (r.x + r.width) * s && a.bottom() <= (r.y + r.height) * s);
+    if !rounded && dentro {
+        return None;
+    }
+    let n = clips.len();
+    if clips[n - 1].mask.is_none() {
+        let mut m = Mask::new(w, h)?;
+        m.data_mut().fill(255);
+        for c in clips.iter() {
+            match rounded_path(c.own, c.radius, s) {
+                Some(p) => m.intersect_path(&p, FillRule::Winding, true, Transform::identity()),
+                None => m.data_mut().fill(0),
+            }
+        }
+        clips[n - 1].mask = Some(m);
+    }
+    clips[n - 1].mask.as_ref()
 }
 
 pub struct Renderer {
@@ -104,7 +140,29 @@ pub struct Renderer {
     texts: HashMap<TextKey, Buffer>,
     svgs: HashMap<SvgKey, Pixmap>,
     shadows: HashMap<ShadowKey, Pixmap>,
+    imagens: HashMap<(u64, u32, u32), Pixmap>,
     clips: Vec<Clip>,
+    /// Num quadro parcial: onde o `pixmap` (pequeno) começa, em lógico e em pixels, e o
+    /// quadro cheio que espera a região redesenhada.
+    origem: Point,
+    desloc: (i32, i32),
+    parcial: Option<Parcial>,
+    /// Os vidros (área lógica e raio) do quadro anterior: só perto deles o quadro parcial
+    /// precisa redesenhar uma margem a mais.
+    vidros: Vec<(Rect, f32)>,
+    /// Gravando: os desenhos só anotam área e impressão digital (veja [`Renderer::record`]).
+    gravando: bool,
+    lista: Vec<(Rect, u64)>,
+    /// O que o quadro que está no `pixmap` desenhou.
+    anterior: Vec<(Rect, u64)>,
+    /// As linhas (pixels) que o último quadro mudou: `None` = todas.
+    mudou: Option<(u32, u32)>,
+}
+
+struct Parcial {
+    cheio: Pixmap,
+    /// A parte que vale de verdade (a margem em volta só serve ao desfoque), em pixels.
+    dentro: (i32, i32, i32, i32),
 }
 
 impl Renderer {
@@ -117,12 +175,22 @@ impl Renderer {
             texts: HashMap::new(),
             svgs: HashMap::new(),
             shadows: HashMap::new(),
+            imagens: HashMap::new(),
             clips: Vec::new(),
+            origem: Point::ORIGIN,
+            desloc: (0, 0),
+            parcial: None,
+            vidros: Vec::new(),
+            gravando: false,
+            lista: Vec::new(),
+            anterior: Vec::new(),
+            mudou: None,
         }
     }
 
     /// Prepara um quadro novo de `size` lógico na escala `scale`, limpo com `fundo`.
     pub fn begin(&mut self, size: Size, scale: f32, fundo: Color) {
+        self.end();
         let (w, h) = (((size.width * scale).round() as u32).max(1), ((size.height * scale).round() as u32).max(1));
         if self.pixmap.width() != w || self.pixmap.height() != h {
             self.pixmap = Pixmap::new(w, h).expect("tamanho válido");
@@ -133,7 +201,114 @@ impl Renderer {
         }
         self.scale = scale;
         self.clips.clear();
+        self.vidros.clear();
+        self.mudou = None;
         self.pixmap.fill(skia_color(fundo));
+    }
+
+    /// Redesenha só `sujo` (lógico) sobre o quadro anterior: tudo que for desenhado até o
+    /// [`end`](Self::end) cai num pixmap do tamanho da região. `false` se não dá (o tamanho
+    /// ou a escala mudou, ou não há quadro anterior): aí use [`begin`](Self::begin).
+    pub fn begin_parcial(&mut self, size: Size, scale: f32, fundo: Color, sujo: Rect) -> bool {
+        self.end();
+        let (w, h) = (((size.width * scale).round() as i32).max(1), ((size.height * scale).round() as i32).max(1));
+        if self.pixmap.width() as i32 != w || self.pixmap.height() as i32 != h || self.scale != scale {
+            return false;
+        }
+        let (x0, y0) = (((sujo.x * scale).floor() as i32).max(0), ((sujo.y * scale).floor() as i32).max(0));
+        let (x1, y1) = ((((sujo.x + sujo.width) * scale).ceil() as i32).min(w), (((sujo.y + sujo.height) * scale).ceil() as i32).min(h));
+        if x0 >= x1 || y0 >= y1 {
+            return false;
+        }
+        // O desfoque lê o entorno: perto de um vidro, a região cresce o raio dele.
+        let raio = self.vidros.iter().filter(|(v, r)| cruza(*v, crescer(sujo, *r))).fold(0.0f32, |a, (_, r)| a.max(*r));
+        let m = if raio > 0.0 { ((raio + 12.0) * scale).ceil() as i32 } else { 0 };
+        let (ex0, ey0) = (((x0 - m).max(0) / 12) * 12, ((y0 - m).max(0) / 12) * 12);
+        let (ex1, ey1) = ((x1 + m).min(w), (y1 + m).min(h));
+        let mut peq = Pixmap::new((ex1 - ex0) as u32, (ey1 - ey0) as u32).expect("região não vazia");
+        peq.fill(skia_color(fundo));
+        let cheio = std::mem::replace(&mut self.pixmap, peq);
+        self.parcial = Some(Parcial { cheio, dentro: (x0, y0, x1, y1) });
+        self.origem = Point::new(ex0 as f32 / scale, ey0 as f32 / scale);
+        self.desloc = (ex0, ey0);
+        self.clips.clear();
+        true
+    }
+
+    /// Fecha um quadro parcial, colando a região no quadro cheio (sem efeito num quadro cheio).
+    pub fn end(&mut self) {
+        let Some(Parcial { mut cheio, dentro: (x0, y0, x1, y1) }) = self.parcial.take() else { return };
+        let (ex, ey) = self.desloc;
+        let (pw, cw) = (self.pixmap.width() as usize * 4, cheio.width() as usize * 4);
+        let (src, dst) = (self.pixmap.data(), cheio.data_mut());
+        for y in y0..y1 {
+            let s0 = (y - ey) as usize * pw + (x0 - ex) as usize * 4;
+            let d0 = y as usize * cw + x0 as usize * 4;
+            let n = (x1 - x0) as usize * 4;
+            dst[d0..d0 + n].copy_from_slice(&src[s0..s0 + n]);
+        }
+        self.pixmap = cheio;
+        // Várias regiões no mesmo quadro: as linhas mudadas são a união delas.
+        self.mudou = Some(self.mudou.map_or((y0 as u32, y1 as u32), |(a, b)| (a.min(y0 as u32), b.max(y1 as u32))));
+        self.origem = Point::ORIGIN;
+        self.desloc = (0, 0);
+    }
+
+    /// Tamanho lógico da janela inteira (mesmo durante um quadro parcial).
+    pub fn window_size(&self) -> Size {
+        let p = self.parcial.as_ref().map_or(&self.pixmap, |p| &p.cheio);
+        Size::new(p.width() as f32 / self.scale, p.height() as f32 / self.scale)
+    }
+
+    /// As linhas que o último quadro mudou (`None` = o quadro todo): só elas precisam subir para a GPU.
+    pub fn changed_rows(&self) -> Option<(u32, u32)> {
+        self.mudou
+    }
+
+    /// Começa a gravar o quadro: até o [`changes`](Self::changes), cada desenho só anota a
+    /// área que pinta e uma impressão digital de tudo que muda o resultado. Comparar com o
+    /// quadro anterior diz o que redesenhar (nada, se o mouse andou sem mudar o hover).
+    pub fn record(&mut self) {
+        self.end();
+        self.gravando = true;
+        self.mudou = Some((u32::MAX, 0));
+        self.lista.clear();
+        self.vidros.clear();
+        self.clips.clear();
+    }
+
+    /// Fecha a gravação e compara com o que está no `pixmap`.
+    /// shortcut: o `pixmap` mexido direto (num canvas) não entra na comparação; use os métodos de desenho.
+    pub fn changes(&mut self) -> Changes {
+        self.gravando = false;
+        self.clips.clear();
+        let novo = std::mem::take(&mut self.lista);
+        let c = comparar(&self.anterior, &novo, &self.vidros);
+        self.lista = std::mem::replace(&mut self.anterior, novo);
+        c
+    }
+
+    /// Gravando, anota o desenho (área lógica, já cortada pelo recorte, e a chave) e diz
+    /// para não pintar.
+    fn gravou(&mut self, area: Rect, mut k: Chave) -> bool {
+        if !self.gravando {
+            return false;
+        }
+        let mut area = crescer(area, 2.0);
+        for c in &self.clips {
+            k.r(c.own).h(c.radius.map(f32::to_bits));
+        }
+        if let Some(c) = self.clips.last() {
+            area = area.intersect(&c.rect);
+        }
+        if area.width > 0.0 && area.height > 0.0 {
+            self.lista.push((area, k.0.finish()));
+        }
+        true
+    }
+
+    fn local(&self, r: Rect) -> Rect {
+        Rect { x: r.x - self.origem.x, y: r.y - self.origem.y, ..r }
     }
 
     pub fn scale(&self) -> f32 {
@@ -180,6 +355,14 @@ impl Renderer {
     }
 
     pub fn draw_text(&mut self, text: &str, size: f32, font: Font, color: Color, at: Point, max_width: Option<f32>) {
+        if self.gravando {
+            let m = self.measure(text, size, font, max_width);
+            let mut k = Chave::new(1);
+            k.h(text).f(size).h(font).c(color).f(at.x).f(at.y).h(max_width.map(f32::to_bits));
+            self.gravou(Rect::new(at, m), k);
+            return;
+        }
+        let at = Point::new(at.x - self.origem.x, at.y - self.origem.y);
         let s = self.scale;
         let (ox, oy) = ((at.x * s).round() as i32, (at.y * s).round() as i32);
         let clip = self.clips.last().map(|c| c.rect);
@@ -192,7 +375,9 @@ impl Renderer {
             Some(r) => ((r.x * s).floor() as i32, (r.y * s).floor() as i32, ((r.x + r.width) * s).ceil() as i32, ((r.y + r.height) * s).ceil() as i32),
             None => (0, 0, w, h),
         };
-        let mask = self.clips.last().and_then(|c| c.mask.as_ref()).map(|m| m.data());
+        let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
+        let precisa = self.clips.last().is_some_and(|c| c.rounded);
+        let mask = if precisa { clip_mask(&mut self.clips, pw, ph, s, None).map(|m| m.data()) } else { None };
         let px = self.pixmap.pixels_mut();
         b.draw(&mut self.fonts, &mut self.swash, cor, |x, y, gw, gh, c| {
             let a = c.a() as u32;
@@ -214,12 +399,35 @@ impl Renderer {
 
     /// Retângulo com fundo, borda e sombra; o raio vale para os três.
     pub fn fill_quad(&mut self, r: Rect, bg: Option<&Background>, border: Border, shadow: Option<Shadow>) {
+        if self.gravando {
+            let mut k = Chave::new(2);
+            k.r(r).borda(border);
+            match bg {
+                None => k.h(0u8),
+                Some(Background::Color(c)) => k.h(1u8).c(*c),
+                Some(Background::Linear { angle, stops }) => {
+                    k.h(2u8).f(*angle);
+                    for (t, c) in stops.iter() {
+                        k.f(*t).c(*c);
+                    }
+                    &mut k
+                }
+            };
+            let mut area = r;
+            if let Some(sh) = shadow.filter(|sh| sh.color.a > 0.0) {
+                k.c(sh.color).f(sh.offset.x).f(sh.offset.y).f(sh.blur);
+                area = uniao(area, crescer(Rect { x: r.x + sh.offset.x, y: r.y + sh.offset.y, ..r }, sh.blur));
+            }
+            self.gravou(area, k);
+            return;
+        }
+        let r = self.local(r);
         let s = self.scale;
         if let Some(sh) = shadow.filter(|sh| sh.color.a > 0.0) {
             self.shadow(r, border.radius, sh);
         }
-        let Some(path) = rounded(r, border.radius, s) else { return };
-        if let Some(bg) = bg {
+        let Some(path) = rounded_path(r, border.radius, s) else { return };
+        if let Some(bg) = bg.filter(|_| self.preencher(r, bg, border.radius)) {
             let p = match bg {
                 Background::Color(c) => paint(*c),
                 Background::Linear { angle, stops } => {
@@ -240,17 +448,65 @@ impl Renderer {
             let w = border.width;
             let dentro = Rect { x: r.x + w, y: r.y + w, width: r.width - 2.0 * w, height: r.height - 2.0 * w };
             let mut pb = PathBuilder::new();
-            push_rounded(&mut pb, r, border.radius, s);
-            push_rounded(&mut pb, dentro, border.radius.map(|v| (v - w).max(0.0)), s);
+            push_rounded_path(&mut pb, r, border.radius, s);
+            push_rounded_path(&mut pb, dentro, border.radius.map(|v| (v - w).max(0.0)), s);
             if let Some(anel) = pb.finish() {
-                let mask = self.clips.last().and_then(|c| c.mask.as_ref());
+                let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
+                let mask = clip_mask(&mut self.clips, pw, ph, s, Some(anel.bounds()));
                 self.pixmap.fill_path(&anel, &paint(border.color), FillRule::EvenOdd, Transform::identity(), mask);
             }
         }
     }
 
+    /// Fundo liso ou degradê na horizontal/vertical pintado direto em inteiros (o caso comum,
+    /// e o tiny-skia é lento nele em área grande). `false` se já pintou; senão fica pro tiny-skia.
+    fn preencher(&mut self, r: Rect, bg: Option<&Background>, cantos: [f32; 4]) -> bool {
+        let s = self.scale;
+        let Some(f) = tiny_skia::Rect::from_xywh(r.x * s, r.y * s, r.width * s, r.height * s) else { return false };
+        let pre = |c: Color| {
+            let a = c.a.clamp(0.0, 1.0);
+            [c.r, c.g, c.b].map(|v| (v.clamp(0.0, 1.0) * a * 255.0 + 0.5) as u8).into_iter().chain([(a * 255.0 + 0.5) as u8]).collect::<Vec<_>>().try_into().unwrap_or([0; 4])
+        };
+        // Cor por posição ao longo do eixo do degradê (uma por linha ou coluna).
+        let (vertical, cores): (bool, Vec<[u8; 4]>) = match bg {
+            None => return true,
+            Some(Background::Color(c)) => (true, vec![pre(*c)]),
+            Some(Background::Linear { angle, stops }) if !stops.is_empty() => {
+                let (dx, dy) = (angle.cos(), angle.sin());
+                let vertical = dx.abs() < 1e-4;
+                if !vertical && dy.abs() >= 1e-4 {
+                    return true;
+                }
+                let n = if vertical { f.height() } else { f.width() }.ceil().max(1.0) as usize;
+                let inverte = if vertical { dy < 0.0 } else { dx < 0.0 };
+                let cor = |t: f32| {
+                    let t = if inverte { 1.0 - t } else { t };
+                    let i = stops.iter().position(|(p, _)| *p >= t).unwrap_or(stops.len());
+                    match i {
+                        0 => stops[0].1,
+                        i if i == stops.len() => stops[i - 1].1,
+                        i => {
+                            let ((p0, c0), (p1, c1)) = (stops[i - 1], stops[i]);
+                            let k = if p1 > p0 { (t - p0) / (p1 - p0) } else { 1.0 };
+                            Color { r: c0.r + (c1.r - c0.r) * k, g: c0.g + (c1.g - c0.g) * k, b: c0.b + (c1.b - c0.b) * k, a: c0.a + (c1.a - c0.a) * k }
+                        }
+                    }
+                };
+                (vertical, (0..n).map(|i| pre(cor((i as f32 + 0.5) / n as f32))).collect())
+            }
+            Some(_) => return true,
+        };
+        let (x, y) = (f.left().floor() as i32, f.top().floor() as i32);
+        let tam = ((f.right().ceil() as i32 - x), (f.bottom().ceil() as i32 - y));
+        let ultima = cores.len() - 1;
+        let amostra = |px: usize, py: usize| cores[if vertical { py } else { px }.min(ultima)];
+        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, Some((f, cantos.map(|v| v * s))), false, false, self.parcial.is_none(), amostra);
+        false
+    }
+
     fn fill_path(&mut self, p: &tiny_skia::Path, paint: &Paint) {
-        let mask = self.clips.last().and_then(|c| c.mask.as_ref());
+        let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
+        let mask = clip_mask(&mut self.clips, pw, ph, self.scale, Some(p.bounds()));
         self.pixmap.fill_path(p, paint, FillRule::Winding, Transform::identity(), mask);
     }
 
@@ -258,57 +514,90 @@ impl Renderer {
     fn shadow(&mut self, r: Rect, radius: [f32; 4], sh: Shadow) {
         let s = self.scale;
         let m = (sh.blur * s).ceil();
-        let (w, h) = ((r.width * s).ceil() + 2.0 * m, (r.height * s).ceil() + 2.0 * m);
-        if w < 1.0 || h < 1.0 {
+        let (bw, bh) = ((r.width * s).ceil(), (r.height * s).ceil());
+        if bw < 1.0 || bh < 1.0 {
             return;
         }
+        // Caixa grande: basta a sombra de uma caixa pequena com os mesmos cantos, esticada
+        // pelo meio (nine-slice); o miolo é constante. Assim o cache não depende do tamanho.
+        let mr = radius.iter().fold(0.0f32, |a, &v| a.max(v * s)).ceil();
+        let lado = 2.0 * (mr + m) + 2.0;
+        let nove = bw >= lado && bh >= lado;
+        let (bw, bh) = if nove { (lado, lado) } else { (bw, bh) };
+        let (w, h) = (bw + 2.0 * m, bh + 2.0 * m);
         let cor = skia_color(sh.color).to_color_u8();
         let key = ShadowKey { w: w as u32, h: h as u32, radius: radius.map(|v| (v * s) as u32), blur: m as u32, color: [cor.red(), cor.green(), cor.blue(), cor.alpha()] };
-        if self.shadows.len() > 256 {
+        if self.shadows.len() > 256 || bytes(&self.shadows) > 64 << 20 {
             self.shadows.clear();
         }
         let pm = self.shadows.entry(key).or_insert_with(|| {
             let mut pm = Pixmap::new(w as u32, h as u32).expect("w, h >= 1");
-            let caixa = Rect { x: m / s, y: m / s, width: r.width, height: r.height };
-            if let Some(p) = rounded(caixa, radius, s) {
+            let caixa = Rect { x: m / s, y: m / s, width: bw / s, height: bh / s };
+            if let Some(p) = rounded_path(caixa, radius, s) {
                 pm.fill_path(&p, &paint(sh.color), FillRule::Winding, Transform::identity(), None);
             }
-            if m >= 1.0 {
-                let mut px: Vec<[u32; 4]> = pm.pixels().iter().map(|p| [p.red() as u32, p.green() as u32, p.blue() as u32, p.alpha() as u32]).collect();
-                let k = (m / 3.0).round().max(1.0) as usize;
-                for _ in 0..3 {
-                    box_blur(&mut px, w as usize, h as usize, k, true);
-                    box_blur(&mut px, w as usize, h as usize, k, false);
-                }
-                let bytes: Vec<u8> = px.iter().flat_map(|p| p.map(|c| c.min(255) as u8)).collect();
-                pm = Pixmap::from_vec(bytes, tiny_skia::IntSize::from_wh(w as u32, h as u32).expect("w, h >= 1")).expect("mesmo tamanho");
+            if m < 1.0 {
+                return pm;
             }
-            pm
+            let px: Vec<[u32; 4]> = pm.pixels().iter().map(|p| [p.red() as u32, p.green() as u32, p.blue() as u32, p.alpha() as u32]).collect();
+            let (pq, d) = desfocar(px, w as usize, h as usize, (m / 3.0).round().max(1.0) as usize);
+            if d > 1.0 { escalar(&pq, w as u32, h as u32, None) } else { pq }
         });
-        let mask = self.clips.last().and_then(|c| c.mask.as_ref());
         let (x, y) = (((r.x + sh.offset.x) * s - m).round() as i32, ((r.y + sh.offset.y) * s - m).round() as i32);
-        self.pixmap.draw_pixmap(x, y, pm.as_ref(), &PixmapPaint::default(), Transform::identity(), mask);
+        let caixa = tiny_skia::Rect::from_xywh(r.x * s, r.y * s, r.width * s, r.height * s).map(|f| (f, radius.map(|v| v * s)));
+        let fatia = |alvo: usize, n: usize| -> Vec<usize> {
+            let c = n / 2;
+            (0..alvo).map(|i| if i < c { i } else if i >= alvo - c { i + n - alvo } else { c }).collect()
+        };
+        let (xs, ys);
+        let mapa = if nove {
+            xs = fatia((r.width * s).ceil() as usize + 2 * m as usize, w as usize);
+            ys = fatia((r.height * s).ceil() as usize + 2 * m as usize, h as usize);
+            Some((&xs[..], &ys[..]))
+        } else {
+            None
+        };
+        let (tam, amostra) = de(pm, mapa);
+        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, caixa, true, false, self.parcial.is_none(), amostra);
     }
 
     /// Imagem esticada em `r`, já recortada pelos cantos `radius`.
     pub fn draw_image(&mut self, img: &Image, r: Rect, radius: [f32; 4]) {
+        let mut k = Chave::new(3);
+        k.h(img.1).r(r).h(radius.map(f32::to_bits));
+        if self.gravou(r, k) {
+            return;
+        }
+        let r = self.local(r);
         let s = self.scale;
-        let (iw, ih) = (img.0.width() as f32, img.0.height() as f32);
-        let Some(path) = rounded(r, radius, s) else { return };
-        let t = Transform::from_row(r.width * s / iw, 0.0, 0.0, r.height * s / ih, r.x * s, r.y * s);
-        let shader = Pattern::new(img.0.as_ref().as_ref(), SpreadMode::Pad, FilterQuality::Bilinear, 1.0, t);
-        self.fill_path(&path, &Paint { shader, anti_alias: true, ..Default::default() });
+        let (x, y, w, h) = ((r.x * s).round() as i32, (r.y * s).round() as i32, (r.width * s).round() as u32, (r.height * s).round() as u32);
+        if w == 0 || h == 0 {
+            return;
+        }
+        if self.imagens.len() > 32 || bytes(&self.imagens) > 32 << 20 {
+            self.imagens.clear();
+        }
+        let pm = self.imagens.entry((img.1, w, h)).or_insert_with(|| escalar(&img.0, w, h, None));
+        let forma = tiny_skia::Rect::from_xywh(x as f32, y as f32, w as f32, h as f32).map(|f| (f, radius.map(|v| v * s)));
+        let (tam, amostra) = de(pm, None);
+        compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, forma, false, false, self.parcial.is_none(), amostra);
     }
 
     /// SVG em `r`; com `color`, troca a cor de tudo mantendo o alfa (ícones de um traço só).
     pub fn draw_svg(&mut self, svg: &Svg, r: Rect, color: Option<Color>) {
+        let mut k = Chave::new(4);
+        k.h(svg.1).r(r).h(color.map(|c| [c.r, c.g, c.b, c.a].map(f32::to_bits)));
+        if self.gravou(r, k) {
+            return;
+        }
+        let r = self.local(r);
         let s = self.scale;
         let (w, h) = ((r.width * s).round() as u32, (r.height * s).round() as u32);
         if w == 0 || h == 0 {
             return;
         }
         let cor = color.map(|c| skia_color(c).to_color_u8()).map(|c| [c.red(), c.green(), c.blue(), c.alpha()]);
-        let key = SvgKey { tree: Arc::as_ptr(&svg.0) as usize, w, h, color: cor };
+        let key = SvgKey { tree: svg.1, w, h, color: cor };
         if self.svgs.len() > 512 {
             self.svgs.clear();
         }
@@ -325,15 +614,32 @@ impl Renderer {
             }
             pm
         });
-        let mask = self.clips.last().and_then(|c| c.mask.as_ref());
-        self.pixmap.draw_pixmap((r.x * s).round() as i32, (r.y * s).round() as i32, pm.as_ref(), &PixmapPaint::default(), Transform::identity(), mask);
+        let (x, y) = ((r.x * s).round() as i32, (r.y * s).round() as i32);
+        let area = tiny_skia::Rect::from_xywh(x as f32, y as f32, w as f32, h as f32);
+        let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
+        let mask = clip_mask(&mut self.clips, pw, ph, s, area);
+        self.pixmap.draw_pixmap(x, y, pm.as_ref(), &PixmapPaint::default(), Transform::identity(), mask);
     }
 
     /// Linha passando pelos `pontos`, com pontas e junções redondas.
     pub fn stroke(&mut self, pontos: &[Point], largura: f32, cor: Color) {
+        if self.gravando {
+            let mut k = Chave::new(5);
+            k.f(largura).c(cor);
+            let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for p in pontos {
+                k.f(p.x).f(p.y);
+                (x0, y0, x1, y1) = (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y));
+            }
+            if !pontos.is_empty() {
+                self.gravou(crescer(Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }, largura / 2.0), k);
+            }
+            return;
+        }
         let s = self.scale;
         let mut pb = PathBuilder::new();
         for (i, p) in pontos.iter().enumerate() {
+            let p = &Point::new(p.x - self.origem.x, p.y - self.origem.y);
             if i == 0 {
                 pb.move_to(p.x * s, p.y * s);
             } else {
@@ -342,16 +648,33 @@ impl Renderer {
         }
         let Some(path) = pb.finish() else { return };
         let traco = tiny_skia::Stroke { width: largura * s, line_cap: tiny_skia::LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Default::default() };
-        let mask = self.clips.last().and_then(|c| c.mask.as_ref());
+        let area = path.bounds();
+        let meia = traco.width / 2.0;
+        let area = tiny_skia::Rect::from_ltrb(area.left() - meia, area.top() - meia, area.right() + meia, area.bottom() + meia);
+        let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
+        let mask = clip_mask(&mut self.clips, pw, ph, s, area);
         self.pixmap.stroke_path(&path, &paint(cor), &traco, Transform::identity(), mask);
     }
 
     /// Desfoca o que já está desenhado em `r` (vidro), respeitando os cantos.
     pub fn blur(&mut self, r: Rect, raio: f32, cantos: [f32; 4]) {
+        // Num quadro parcial os vidros já vêm da gravação (e servem às outras regiões).
+        if self.parcial.is_none() {
+            self.vidros.push((r, raio));
+        }
+        let mut k = Chave::new(6);
+        k.r(r).f(raio).h(cantos.map(f32::to_bits));
+        if self.gravou(r, k) {
+            return;
+        }
+        let r = self.local(r);
         let s = self.scale;
         let (pw, ph) = (self.pixmap.width() as i32, self.pixmap.height() as i32);
-        let x0 = ((r.x * s).floor() as i32).clamp(0, pw);
-        let y0 = ((r.y * s).floor() as i32).clamp(0, ph);
+        // Começa num múltiplo de 12 na janela inteira: o desfoque reduzido cai na mesma grade
+        // no quadro cheio e no parcial (`begin_parcial`), e não aparece emenda.
+        let grade = |v: f32, o: i32| (v.floor() as i32 + o).div_euclid(12) * 12 - o;
+        let x0 = grade(r.x * s, self.desloc.0).clamp(0, pw);
+        let y0 = grade(r.y * s, self.desloc.1).clamp(0, ph);
         let x1 = (((r.x + r.width) * s).ceil() as i32).clamp(0, pw);
         let y1 = (((r.y + r.height) * s).ceil() as i32).clamp(0, ph);
         let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
@@ -366,47 +689,21 @@ impl Renderer {
                 px.push([p.red() as u32, p.green() as u32, p.blue() as u32, p.alpha() as u32]);
             }
         }
-        // Três caixas seguidas aproximam uma gaussiana.
-        let k = ((raio * s) / 3.0).round().max(1.0) as usize;
-        for _ in 0..3 {
-            box_blur(&mut px, w, h, k, true);
-            box_blur(&mut px, w, h, k, false);
-        }
-        let bytes: Vec<u8> = px.iter().flat_map(|p| p.map(|c| c.min(255) as u8)).collect();
-        let Some(pm) = Pixmap::from_vec(bytes, tiny_skia::IntSize::from_wh(w as u32, h as u32).expect("w, h > 0")) else { return };
-        let Some(path) = rounded(r, cantos, s) else { return };
-        let shader = Pattern::new(pm.as_ref(), SpreadMode::Pad, FilterQuality::Nearest, 1.0, Transform::from_translate(x0 as f32, y0 as f32));
-        let mut paint = Paint { shader, anti_alias: true, ..Default::default() };
-        paint.blend_mode = tiny_skia::BlendMode::Source;
-        self.fill_path(&path, &paint);
+        let (pq, d) = desfocar(px, w, h, ((raio * s) / 3.0).round().max(1.0) as usize);
+        let pm = if d > 1.0 { escalar(&pq, w as u32, h as u32, Some(d as i64)) } else { pq };
+        let forma = tiny_skia::Rect::from_xywh(r.x * s, r.y * s, r.width * s, r.height * s).map(|f| (f, cantos.map(|v| v * s)));
+        let (tam, amostra) = de(&pm, None);
+        compor(&mut self.pixmap, &mut self.clips, s, x0, y0, tam, forma, false, true, self.parcial.is_none(), amostra);
     }
 
     /// Daqui até o `pop_clip`, nada sai de `r` (nem dos cantos arredondados).
     pub fn push_clip(&mut self, r: Rect, radius: [f32; 4]) {
-        let s = self.scale;
-        let rect = match self.clips.last() {
-            Some(c) => c.rect.intersect(&r),
-            None => r,
+        let r = self.local(r);
+        let (rect, fora_rounded) = match self.clips.last() {
+            Some(c) => (c.rect.intersect(&r), c.rounded),
+            None => (r, false),
         };
-        let mut mask = match self.clips.last().and_then(|c| c.mask.clone()) {
-            Some(m) => m,
-            None => {
-                let mut m = Mask::new(self.pixmap.width(), self.pixmap.height()).expect("pixmap > 0");
-                m.data_mut().fill(255);
-                m
-            }
-        };
-        let mask = match rounded(r, radius, s) {
-            Some(p) => {
-                mask.intersect_path(&p, FillRule::Winding, true, Transform::identity());
-                Some(mask)
-            }
-            None => {
-                mask.data_mut().fill(0);
-                Some(mask)
-            }
-        };
-        self.clips.push(Clip { rect, mask });
+        self.clips.push(Clip { rect, own: r, radius, rounded: fora_rounded || radius.iter().any(|v| *v > 0.0), mask: None });
     }
 
     pub fn pop_clip(&mut self) {
@@ -421,6 +718,194 @@ impl Default for Renderer {
 }
 
 /// Média móvel de largura `2k+1` numa direção, com a borda repetida.
+fn bytes<K>(m: &HashMap<K, Pixmap>) -> usize {
+    m.values().map(|p| p.data().len()).sum()
+}
+
+/// Bilinear em inteiros (8 bits de fração): `src` esticado para `w`×`h`.
+/// Com `razao`, cada pixel de origem vale exatamente `razao` de destino (não depende de `w`, `h`).
+fn escalar(src: &Pixmap, w: u32, h: u32, razao: Option<i64>) -> Pixmap {
+    let (sw, sh) = (src.width() as i64, src.height() as i64);
+    // Para cada coordenada de destino: os dois vizinhos na origem e o peso do segundo.
+    let eixo = |n: u32, sn: i64| -> Vec<(usize, usize, u32)> {
+        let (num, den) = razao.map_or((sn, n as i64), |d| (1, d));
+        (0..n as i64)
+            .map(|i| {
+                let f = (((2 * i + 1) * num << 8) / (2 * den) - 128).clamp(0, (sn - 1) << 8);
+                ((f >> 8) as usize, ((f >> 8) + 1).min(sn - 1) as usize, (f & 255) as u32)
+            })
+            .collect()
+    };
+    let (xs, ys) = (eixo(w, sw), eixo(h, sh));
+    let mut out = Pixmap::new(w, h).expect("w, h > 0");
+    let (sd, sw) = (src.data(), sw as usize);
+    // Faixas de linhas em paralelo: no resize a foto de fundo é refeita a cada quadro.
+    let linhas = (h as usize).div_ceil(std::thread::available_parallelism().map_or(1, |n| n.get()).min(4));
+    std::thread::scope(|e| {
+        for (i, faixa) in out.data_mut().chunks_mut(linhas * w as usize * 4).enumerate() {
+            let (xs, ys) = (&xs, &ys[i * linhas..]);
+            e.spawn(move || {
+                for (linha, &(y0, y1, fy)) in faixa.chunks_mut(w as usize * 4).zip(ys) {
+                    let (l0, l1) = (&sd[y0 * sw * 4..], &sd[y1 * sw * 4..]);
+                    for (p, &(x0, x1, fx)) in linha.chunks_mut(4).zip(xs) {
+                        for c in 0..4 {
+                            let cima = l0[x0 * 4 + c] as u32 * (256 - fx) + l0[x1 * 4 + c] as u32 * fx;
+                            let baixo = l1[x0 * 4 + c] as u32 * (256 - fx) + l1[x1 * 4 + c] as u32 * fx;
+                            p[c] = ((cima * (256 - fy) + baixo * fy) >> 16) as u8;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    out
+}
+
+/// Quanto (0..=255) do pixel `(px, py)` cai no retângulo `r` com cantos `c` (tudo em pixels).
+fn cobertura(r: tiny_skia::Rect, c: [f32; 4], px: i32, py: i32) -> u32 {
+    let (cx, cy) = (px as f32 + 0.5, py as f32 + 0.5);
+    let max = r.width().min(r.height()) / 2.0;
+    let c = c.map(|v| v.clamp(0.0, max));
+    let fx = (cx + 0.5 - r.left()).min(r.right() - cx + 0.5).clamp(0.0, 1.0);
+    let fy = (cy + 0.5 - r.top()).min(r.bottom() - cy + 0.5).clamp(0.0, 1.0);
+    let mut cov = fx * fy;
+    let canto = if cx < r.left() + c[0] && cy < r.top() + c[0] {
+        Some((c[0], r.left() + c[0], r.top() + c[0]))
+    } else if cx > r.right() - c[1] && cy < r.top() + c[1] {
+        Some((c[1], r.right() - c[1], r.top() + c[1]))
+    } else if cx > r.right() - c[2] && cy > r.bottom() - c[2] {
+        Some((c[2], r.right() - c[2], r.bottom() - c[2]))
+    } else if cx < r.left() + c[3] && cy > r.bottom() - c[3] {
+        Some((c[3], r.left() + c[3], r.bottom() - c[3]))
+    } else {
+        None
+    };
+    if let Some((k, ox, oy)) = canto {
+        cov *= (k - ((cx - ox).powi(2) + (cy - oy).powi(2)).sqrt() + 0.5).clamp(0.0, 1.0);
+    }
+    (cov * 255.0 + 0.5) as u32
+}
+
+/// Pixels de `pm`, opcionalmente esticados pelos índices de `mapa` (nine-slice).
+fn de<'a>(pm: &'a Pixmap, mapa: Option<(&'a [usize], &'a [usize])>) -> ((i32, i32), impl Fn(usize, usize) -> [u8; 4] + Sync + 'a) {
+    let (d, w) = (pm.data(), pm.width() as usize);
+    let tam = mapa.map_or((pm.width() as i32, pm.height() as i32), |(xs, ys)| (xs.len() as i32, ys.len() as i32));
+    (tam, move |x, y| {
+        let (x, y) = mapa.map_or((x, y), |(xs, ys)| (xs[x], ys[y]));
+        let i = (y * w + x) * 4;
+        [d[i], d[i + 1], d[i + 2], d[i + 3]]
+    })
+}
+
+/// Escreve em `(x, y)` uma área `sw`×`sh` cujos pixels (pré-multiplicados) vêm de `amostra`,
+/// em inteiros, sem o pipeline de pattern do tiny-skia, que é lento em área grande. `forma` limita a um retângulo arredondado;
+/// `fora` inverte a forma (sombra só do lado de fora da caixa, como no CSS);
+/// `fonte` substitui o que havia em vez de sobrepor.
+#[allow(clippy::too_many_arguments)]
+fn compor(dst: &mut Pixmap, clips: &mut [Clip], s: f32, x: i32, y: i32, (sw, sh): (i32, i32), forma: Option<(tiny_skia::Rect, [f32; 4])>, fora: bool, fonte: bool, paralelo: bool, amostra: impl Fn(usize, usize) -> [u8; 4] + Sync) {
+    let (pw, ph) = (dst.width() as i32, dst.height() as i32);
+    let area = tiny_skia::Rect::from_xywh(x as f32, y as f32, sw as f32, sh as f32);
+    let mask = clip_mask(clips, pw as u32, ph as u32, s, area).map(|m| m.data());
+    let (ya, yb) = (y.max(0), (y + sh).min(ph));
+    if ya >= yb {
+        return;
+    }
+    // Área grande de um quadro cheio vai em faixas paralelas (o resize precisa da latência);
+    // no hover (quadro parcial) criar as threads gasta mais CPU do que economiza.
+    let n = if paralelo && (yb - ya) * sw > 1 << 16 { std::thread::available_parallelism().map_or(1, |n| n.get()).min(4) } else { 1 };
+    let faixa = (yb - ya + n as i32 - 1) / n as i32;
+    let linhas = &mut dst.data_mut()[(ya * pw * 4) as usize..(yb * pw * 4) as usize];
+    let amostra = &amostra;
+    std::thread::scope(|e| {
+        for (i, dd) in linhas.chunks_mut((faixa * pw * 4) as usize).enumerate() {
+            let ya = ya + i as i32 * faixa;
+            let mut trabalho = move || compor_linhas(dd, ya, pw, x, y, sw, mask, forma, fora, fonte, amostra);
+            if n == 1 {
+                trabalho();
+            } else {
+                e.spawn(trabalho);
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compor_linhas(dd: &mut [u8], ya: i32, pw: i32, x: i32, y: i32, sw: i32, mask: Option<&[u8]>, forma: Option<(tiny_skia::Rect, [f32; 4])>, fora: bool, fonte: bool, amostra: &(impl Fn(usize, usize) -> [u8; 4] + Sync)) {
+    for py in ya..ya + (dd.len() / (pw as usize * 4)) as i32 {
+        // Linhas longe dos cantos e das bordas ficam inteiras dentro da forma.
+        let meio = forma.is_some_and(|(r, c)| py as f32 >= r.top() + c[0].max(c[1]) + 1.0 && py as f32 + 1.0 <= r.bottom() - c[2].max(c[3]) - 1.0);
+        let (mut px, fim) = (x.max(0), (x + sw).min(pw));
+        while px < fim {
+            let mut cov = match forma {
+                Some((r, _)) if meio && px as f32 >= r.left() + 1.0 && px as f32 + 1.0 <= r.right() - 1.0 => {
+                    if fora {
+                        px = px.max((r.right() - 1.0).floor() as i32);
+                        continue;
+                    }
+                    255
+                }
+                Some((r, c)) if fora => 255 - cobertura(r, c, px, py),
+                Some((r, c)) => cobertura(r, c, px, py),
+                None => 255,
+            };
+            px += 1;
+            let px = px - 1;
+            if let Some(m) = mask {
+                cov = cov * m[(py * pw + px) as usize] as u32 / 255;
+            }
+            if cov == 0 {
+                continue;
+            }
+            let sp = amostra((px - x) as usize, (py - y) as usize);
+            let di = (((py - ya) * pw + px) * 4) as usize;
+            if cov == 255 && (fonte || sp[3] == 255) {
+                dd[di..di + 4].copy_from_slice(&sp);
+            } else if fonte {
+                for c in 0..4 {
+                    dd[di + c] = ((sp[c] as u32 * cov + dd[di + c] as u32 * (255 - cov)) / 255) as u8;
+                }
+            } else {
+                let a = sp[3] as u32 * cov / 255;
+                for c in 0..4 {
+                    dd[di + c] = (sp[c] as u32 * cov / 255 + dd[di + c] as u32 * (255 - a) / 255) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// Desfoque gaussiano (três caixas) feito em resolução reduzida: devolve o resultado e
+/// o fator para esticá-lo de volta. Num desfoque largo a perda de detalhe não aparece.
+fn desfocar(px: Vec<[u32; 4]>, w: usize, h: usize, k: usize) -> (Pixmap, f32) {
+    let d = (k / 2).clamp(1, 4);
+    let (sw, sh) = (w.div_ceil(d), h.div_ceil(d));
+    let mut pq = vec![[0u32; 4]; sw * sh];
+    if d == 1 {
+        pq = px;
+    } else {
+        for y in 0..sh {
+            for x in 0..sw {
+                let (mut soma, mut n) = ([0u32; 4], 0);
+                for yy in y * d..((y + 1) * d).min(h) {
+                    for xx in x * d..((x + 1) * d).min(w) {
+                        let v = px[yy * w + xx];
+                        (0..4).for_each(|c| soma[c] += v[c]);
+                        n += 1;
+                    }
+                }
+                pq[y * sw + x] = soma.map(|v| v / n);
+            }
+        }
+    }
+    let k = (k / d).max(1);
+    for _ in 0..3 {
+        box_blur(&mut pq, sw, sh, k, true);
+        box_blur(&mut pq, sw, sh, k, false);
+    }
+    let bytes: Vec<u8> = pq.iter().flat_map(|p| p.map(|c| c.min(255) as u8)).collect();
+    (Pixmap::from_vec(bytes, tiny_skia::IntSize::from_wh(sw as u32, sh as u32).expect("w, h > 0")).expect("mesmo tamanho"), d as f32)
+}
+
 fn box_blur(px: &mut [[u32; 4]], w: usize, h: usize, k: usize, horizontal: bool) {
     let (linhas, n) = if horizontal { (h, w) } else { (w, h) };
     let idx = |l: usize, i: usize| if horizontal { l * w + i } else { i * w + l };
@@ -461,13 +946,13 @@ fn paint(c: Color) -> Paint<'static> {
     p
 }
 
-fn rounded(r: Rect, radius: [f32; 4], s: f32) -> Option<tiny_skia::Path> {
+fn rounded_path(r: Rect, radius: [f32; 4], s: f32) -> Option<tiny_skia::Path> {
     let mut pb = PathBuilder::new();
-    push_rounded(&mut pb, r, radius, s);
+    push_rounded_path(&mut pb, r, radius, s);
     pb.finish()
 }
 
-fn push_rounded(pb: &mut PathBuilder, r: Rect, radius: [f32; 4], s: f32) {
+fn push_rounded_path(pb: &mut PathBuilder, r: Rect, radius: [f32; 4], s: f32) {
     if r.width <= 0.0 || r.height <= 0.0 {
         return;
     }
@@ -486,4 +971,101 @@ fn push_rounded(pb: &mut PathBuilder, r: Rect, radius: [f32; 4], s: f32) {
     pb.line_to(x, y + tl);
     pb.cubic_to(x, y + tl * K, x + tl * K, y, x + tl, y);
     pb.close();
+}
+
+/// O que mudou de um quadro para o outro.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Changes {
+    /// Nada: o quadro na tela continua valendo.
+    None,
+    /// Redesenhar tudo (primeiro quadro, ou a ordem dos desenhos mudou).
+    All,
+    /// Só estas regiões (lógicas).
+    Regions(Vec<Rect>),
+}
+
+/// Impressão digital de um desenho: tudo que muda o resultado entra no hash.
+struct Chave(std::collections::hash_map::DefaultHasher);
+
+impl Chave {
+    fn new(tipo: u8) -> Self {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&tipo, &mut h);
+        Chave(h)
+    }
+    fn h(&mut self, v: impl std::hash::Hash) -> &mut Self {
+        v.hash(&mut self.0);
+        self
+    }
+    fn f(&mut self, v: f32) -> &mut Self {
+        self.h(v.to_bits())
+    }
+    fn r(&mut self, r: Rect) -> &mut Self {
+        self.f(r.x).f(r.y).f(r.width).f(r.height)
+    }
+    fn c(&mut self, c: Color) -> &mut Self {
+        self.f(c.r).f(c.g).f(c.b).f(c.a)
+    }
+    fn borda(&mut self, b: Border) -> &mut Self {
+        self.c(b.color).f(b.width).h(b.radius.map(f32::to_bits))
+    }
+}
+
+use std::hash::{Hash, Hasher};
+
+/// Regiões a redesenhar: as áreas dos desenhos que só um dos dois quadros tem. Perto de um
+/// vidro a mudança se espalha pelo raio do desfoque, dentro dele.
+fn comparar(velho: &[(Rect, u64)], novo: &[(Rect, u64)], vidros: &[(Rect, f32)]) -> Changes {
+    if velho.is_empty() {
+        return Changes::All;
+    }
+    // Contagem por chave: a mesma chave é o mesmo desenho, na mesma área.
+    let mut conta: HashMap<u64, (i32, Rect)> = HashMap::new();
+    for (r, k) in velho {
+        conta.entry(*k).or_insert((0, *r)).0 += 1;
+    }
+    for (r, k) in novo {
+        conta.entry(*k).or_insert((0, *r)).0 -= 1;
+    }
+    let mut sujos: Vec<Rect> = conta.values().filter(|(n, _)| *n != 0).map(|(_, r)| *r).collect();
+    if sujos.is_empty() {
+        // Os mesmos desenhos em outra ordem (camadas trocadas) mudam o resultado.
+        return if velho.iter().map(|d| d.1).eq(novo.iter().map(|d| d.1)) { Changes::None } else { Changes::All };
+    }
+    let espalhados: Vec<Rect> = vidros.iter().flat_map(|(v, raio)| sujos.iter().filter(|s| cruza(**s, *v)).map(move |s| crescer(*s, *raio).intersect(v))).collect();
+    sujos.extend(espalhados);
+    // Junta as que se encostam; muitas pedaços viram uma só.
+    let mut juntou = true;
+    while juntou {
+        juntou = false;
+        'fora: for i in 0..sujos.len() {
+            for j in i + 1..sujos.len() {
+                if cruza(crescer(sujos[i], 8.0), sujos[j]) {
+                    sujos[i] = uniao(sujos[i], sujos[j]);
+                    sujos.swap_remove(j);
+                    juntou = true;
+                    break 'fora;
+                }
+            }
+        }
+    }
+    if sujos.len() > 4 {
+        let u = sujos.iter().copied().reduce(uniao).expect("não vazio");
+        sujos = vec![u];
+    }
+    Changes::Regions(sujos)
+}
+
+fn crescer(r: Rect, m: f32) -> Rect {
+    Rect { x: r.x - m, y: r.y - m, width: r.width + 2.0 * m, height: r.height + 2.0 * m }
+}
+
+fn cruza(a: Rect, b: Rect) -> bool {
+    let i = a.intersect(&b);
+    i.width > 0.0 && i.height > 0.0
+}
+
+fn uniao(a: Rect, b: Rect) -> Rect {
+    let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+    Rect { x, y, width: (a.x + a.width).max(b.x + b.width) - x, height: (a.y + a.height).max(b.y + b.height) - y }
 }

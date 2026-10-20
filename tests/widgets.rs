@@ -357,3 +357,128 @@ fn vidro_desfoca_o_que_esta_atras() {
     assert_eq!(pixel(&h, 198, 5)[0], 0);
     assert_eq!(pixel(&h, 202, 5)[0], 255);
 }
+
+#[test]
+fn quadro_parcial_igual_ao_cheio() {
+    // Degradê, sombra, vidro desfocado e texto: redesenhar só um pedaço tem que dar os mesmos pixels.
+    let cena = || -> Element<'static, ()> {
+        let fundo = container(Space::new(Length::FILL, Length::FILL))
+            .style(|_| Style::default().background(Background::Linear { angle: 0.0, stops: vec![(0.0, Color::rgb8(200, 30, 90)), (1.0, Color::rgb8(20, 40, 200))] }));
+        let vidro = container(text("vidro"))
+            .margin(60.0)
+            .padding(20.0)
+            .style(|_| Style::default().backdrop_blur(20.0).border(Border::rounded(14.0)).shadow(Shadow { color: Color::BLACK.alpha(0.5), offset: Point::new(0.0, 6.0), blur: 20.0 }));
+        stack![fundo, vidro].into()
+    };
+    let (size, tema, st) = (Size::new(400.0, 300.0), Theme::dark(), States::default());
+    let mut r = Renderer::new();
+    let el = cena();
+    r.begin(size, 1.0, Color::BLACK);
+    let n = layout(&el, size, &mut r, &st, &tema);
+    draw(&el, &n, &mut r, &st, &tema, None, false);
+    let cheio = r.pixmap.data().to_vec();
+    assert!(r.begin_parcial(size, 1.0, Color::BLACK, Rect { x: 37.0, y: 21.0, width: 150.0, height: 110.0 }));
+    let n = layout(&el, size, &mut r, &st, &tema);
+    draw(&el, &n, &mut r, &st, &tema, None, false);
+    r.end();
+    let pior = cheio.iter().zip(r.pixmap.data()).map(|(a, b)| a.abs_diff(*b)).max();
+    assert_eq!(pior, Some(0), "o pedaço redesenhado tem que bater com o quadro cheio");
+}
+
+#[test]
+fn hover_redesenha_so_o_que_mudou_e_bate_com_o_cheio() {
+    // Botão sobre um vidro: gravar, comparar e pintar só as regiões tem que dar o mesmo que o quadro cheio.
+    let el: Element<()> = stack![
+        container(Space::new(Length::FILL, Length::FILL)).style(|_| Style::default().background(Background::Linear { angle: 0.0, stops: vec![(0.0, Color::rgb8(200, 30, 90)), (1.0, Color::rgb8(20, 40, 200))] })),
+        container(button("ok").on_press(())).margin(60.0).padding(20.0).style(|_| Style::default().backdrop_blur(20.0).border(Border::rounded(14.0)))
+    ]
+    .into();
+    let (size, tema, st) = (Size::new(400.0, 300.0), Theme::dark(), States::default());
+    let n = { let mut r = Renderer::new(); layout(&el, size, &mut r, &st, &tema) };
+    let quadro = |r: &mut Renderer, cursor: Option<Point>| {
+        r.record();
+        draw(&el, &n, r, &st, &tema, cursor, false);
+        let c = r.changes();
+        match &c {
+            Changes::Regions(rs) => {
+                for x in rs {
+                    assert!(r.begin_parcial(size, 1.0, Color::BLACK, *x));
+                    draw(&el, &n, r, &st, &tema, cursor, false);
+                    r.end();
+                }
+            }
+            Changes::All => {
+                r.begin(size, 1.0, Color::BLACK);
+                draw(&el, &n, r, &st, &tema, cursor, false);
+            }
+            Changes::None => {}
+        }
+        c
+    };
+    let mut r = Renderer::new();
+    assert_eq!(quadro(&mut r, None), Changes::All);
+    assert_eq!(quadro(&mut r, Some(Point::new(5.0, 5.0))), Changes::None, "mouse no vazio não muda nada");
+    let botao = Point::new(85.0, 85.0);
+    assert!(matches!(quadro(&mut r, Some(botao)), Changes::Regions(_)));
+    let mut cheio = Renderer::new();
+    cheio.begin(size, 1.0, Color::BLACK);
+    draw(&el, &n, &mut cheio, &st, &tema, Some(botao), false);
+    assert_ne!(r.pixmap.data(), { let mut v = Renderer::new(); v.begin(size, 1.0, Color::BLACK); draw(&el, &n, &mut v, &st, &tema, None, false); v.pixmap.data().to_vec() }.as_slice(), "o hover tem que mudar algo");
+    let pior = cheio.pixmap.data().iter().zip(r.pixmap.data()).map(|(a, b)| a.abs_diff(*b)).max();
+    assert_eq!(pior, Some(0), "as regiões redesenhadas têm que bater com o quadro cheio");
+}
+
+#[test]
+fn rolagem_de_dentro_tem_a_vez() {
+    // Uma lista que rola dentro de uma página que também rola: a roda sobre a lista move a lista.
+    let el: Element<M> = scrollable(column![Space::new(10.0, 20.0), lista(), Space::new(10.0, 800.0)]).into();
+    let mut h = H::new();
+    let rolagens = |h: &mut H| {
+        let pagina = h.node(&el);
+        let lista = &pagina.children[0].children[1];
+        (pagina.rect.y - pagina.children[0].rect.y, lista.rect.y - lista.children[0].rect.y)
+    };
+    h.ev(&el, Point::new(100.0, 100.0), Event::Wheel { dx: 0.0, dy: -120.0 });
+    assert_eq!(rolagens(&mut h), (0.0, 120.0), "só a lista rolou");
+    // No fim da lista a página não rola por tabela (o evento já foi da lista).
+    h.ev(&el, Point::new(100.0, 100.0), Event::Wheel { dx: 0.0, dy: -100_000.0 });
+    assert_eq!(rolagens(&mut h).1, 800.0);
+    // Fora da lista, rola a página.
+    h.ev(&el, Point::new(350.0, 100.0), Event::Wheel { dx: 0.0, dy: -50.0 });
+    assert_eq!(rolagens(&mut h).0, 50.0);
+}
+
+#[test]
+fn imagem_nova_nao_herda_o_cache_da_velha() {
+    // A imagem liberada deixa o endereço para a próxima; o cache não pode confundir as duas.
+    let mut h = H::new();
+    for cor in [[255, 0, 0, 255], [0, 0, 255, 255], [0, 255, 0, 255]] {
+        let img = Image::from_rgba(4, 4, cor.repeat(16)).expect("4x4");
+        let el: Element<()> = image(img).width(40.0).height(40.0).content_fit(ContentFit::Fill).into();
+        h.desenhar(&el, None);
+        assert_eq!(pixel(&h, 20, 20), cor);
+    }
+}
+
+#[test]
+fn sombra_grande_sem_emenda() {
+    // A sombra de caixa grande é a de uma pequena esticada pelo meio: não pode ter degrau.
+    let mut r = Renderer::new();
+    let tam = Size::new(400.0, 300.0);
+    r.begin(tam, 1.0, Color::TRANSPARENT);
+    let sombra = Shadow { color: Color::BLACK, offset: Point::ORIGIN, blur: 12.0 };
+    r.fill_quad(Rect { x: 50.0, y: 50.0, width: 300.0, height: 200.0 }, None, Border::rounded(10.0), Some(sombra));
+    let alfa = |r: &Renderer, x: u32, y: u32| r.pixmap.pixel(x, y).expect("dentro").alpha() as i32;
+    // Uma linha acima da caixa: o valor varia aos poucos no canto e fica igual no meio.
+    for y in [40, 46] {
+        let linha: Vec<i32> = (40..360).map(|x| alfa(&r, x, y)).collect();
+        let salto = linha.windows(2).map(|w| (w[1] - w[0]).abs()).max().unwrap_or(0);
+        assert!(salto <= 12, "degrau de {salto} na linha {y}");
+        assert_eq!(alfa(&r, 150, y), alfa(&r, 250, y), "o meio da borda é constante");
+    }
+    // O canto da grande bate com o de uma caixa pequena (sem esticar).
+    let canto = alfa(&r, 48, 48);
+    r.begin(tam, 1.0, Color::TRANSPARENT);
+    r.fill_quad(Rect { x: 50.0, y: 50.0, width: 45.0, height: 45.0 }, None, Border::rounded(10.0), Some(sombra));
+    assert!((alfa(&r, 48, 48) - canto).abs() <= 8, "canto {} x {}", alfa(&r, 48, 48), canto);
+}

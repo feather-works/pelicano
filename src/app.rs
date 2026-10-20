@@ -1,6 +1,6 @@
 //! A janela, o laço de eventos, as tarefas assíncronas e a apresentação do quadro.
 use crate::widget::{self, CursorIcon, Element, EventCx};
-use crate::{Color, Event, Modifiers, Point, Renderer, ResizeDirection, Size, States, Theme};
+use crate::{Changes, Color, Event, Modifiers, Point, Renderer, ResizeDirection, Size, States, Theme};
 use futures::future::{AbortHandle, Abortable, BoxFuture};
 use futures::stream::BoxStream;
 use futures::{FutureExt, Stream, StreamExt};
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
 /// Um aplicativo: estado, como ele muda (`update`) e como aparece (`view`).
@@ -170,7 +170,7 @@ pub fn run<A: App>(settings: Settings, init: impl FnOnce() -> (A, Task<A::Msg>))
     let event_loop = EventLoop::<A::Msg>::with_user_event().build().map_err(Error::EventLoop)?;
     let pool = futures::executor::ThreadPool::new().map_err(|e| Error::Window(e.to_string()))?;
     let (app, task) = init();
-    let mut rt = Runtime { app, settings, proxy: event_loop.create_proxy(), pool, window: None, gpu: None, renderer: Renderer::new(), states: States::default(), cursor: None, modifiers: Modifiers::empty(), icon: CursorIcon::Default, pendentes: Vec::new(), erro: None, sair: false, inspecionar: false };
+    let mut rt = Runtime { app, settings, proxy: event_loop.create_proxy(), pool, window: None, gpu: None, renderer: Renderer::new(), states: States::default(), cursor: None, modifiers: Modifiers::empty(), icon: CursorIcon::Default, pendentes: Vec::new(), erro: None, sair: false, inspecionar: false, tudo: true, mover: false, ultimo_mover: std::time::Instant::now(), intervalo: None };
     if std::env::var_os("PELICANO_DEBUG").is_some_and(|v| v != "0") {
         rt.settings.debug = true;
         rt.inspecionar = true;
@@ -198,6 +198,14 @@ struct Runtime<A: App> {
     sair: bool,
     /// O inspetor está à mostra (F12, só com `Settings::debug`).
     inspecionar: bool,
+    /// O próximo quadro precisa ser inteiro (janela nova, resize, quadro perdido).
+    tudo: bool,
+    /// Um movimento do mouse ainda não entregue: chegam até 1000 por segundo, entregamos no
+    /// máximo um por quadro do monitor (o último).
+    mover: bool,
+    ultimo_mover: std::time::Instant,
+    /// Um quadro do monitor (perguntar a cada evento custa caro); some quando a janela muda de tela.
+    intervalo: Option<std::time::Duration>,
 }
 
 impl<A: App> Runtime<A> {
@@ -270,13 +278,23 @@ impl<A: App> Runtime<A> {
             widget::dispatch(&el, &node, &ev, &mut cx);
             cx.redraw
         };
+        // O mouse andou: o quadro é gravado e comparado; se nada mudou, nem pinta.
+        let mexeu = matches!(ev, Event::CursorMoved(_) | Event::CursorLeft);
         msgs.extend(self.app.on_event(&ev));
         for c in cmds {
             self.window_cmd(c);
         }
-        // shortcut: todo movimento do mouse redesenha o quadro inteiro; comparar o hover antes/depois se pesar em telas 4K.
-        if !msgs.is_empty() || redraw || matches!(ev, Event::CursorMoved(_) | Event::CursorLeft | Event::Resized(_)) {
+        if !msgs.is_empty() || redraw || mexeu || matches!(ev, Event::Resized(_)) {
             self.update(msgs);
+        }
+    }
+
+    fn entregar_mover(&mut self) {
+        if std::mem::take(&mut self.mover) {
+            self.ultimo_mover = std::time::Instant::now();
+            if let Some(p) = self.cursor {
+                self.event(Event::CursorMoved(p));
+            }
         }
     }
 
@@ -285,18 +303,41 @@ impl<A: App> Runtime<A> {
         let size = self.logical_size();
         let theme = self.app.theme();
         let fundo = if self.settings.transparent { Color::TRANSPARENT } else { theme.background };
-        self.renderer.begin(size, w.scale_factor() as f32, fundo);
-        let icon = {
-            let el = self.app.view();
-            let node = widget::layout(&el, size, &mut self.renderer, &self.states, &theme);
-            widget::draw(&el, &node, &mut self.renderer, &self.states, &theme, self.cursor, self.inspecionar)
+        let escala = w.scale_factor() as f32;
+        let tudo = std::mem::replace(&mut self.tudo, false);
+        let el = self.app.view();
+        let node = widget::layout(&el, size, &mut self.renderer, &self.states, &theme);
+        let pintar = |r: &mut Renderer| widget::draw(&el, &node, r, &self.states, &theme, self.cursor, self.inspecionar);
+        // Primeiro grava (barato: só áreas e hashes) e compara com o quadro na tela.
+        self.renderer.record();
+        let icon = pintar(&mut self.renderer);
+        let mudou = self.renderer.changes();
+        if std::env::var_os("PELICANO_DANO").is_some() { eprintln!("[dano] {mudou:?}"); }
+        let regioes = match mudou {
+            _ if tudo => None,
+            Changes::None => Some(Vec::new()),
+            Changes::All => None,
+            Changes::Regions(r) => Some(r),
         };
+        let parcial = regioes.as_ref().is_some_and(|rs| rs.iter().all(|r| self.renderer.begin_parcial(size, escala, fundo, *r) && {
+            pintar(&mut self.renderer);
+            self.renderer.end();
+            true
+        }));
+        if !parcial {
+            self.renderer.begin(size, escala, fundo);
+            pintar(&mut self.renderer);
+        }
         if icon != self.icon {
             self.icon = icon;
             w.set_cursor(icon);
         }
-        if let Some(gpu) = &mut self.gpu {
-            gpu.present(&self.renderer.pixmap);
+        // Quadro perdido (superfície velha no meio do resize): pede outro, senão a janela
+        // fica com o conteúdo antigo até o próximo evento.
+        let nada = parcial && regioes.is_some_and(|r| r.is_empty());
+        if !nada && self.gpu.as_mut().is_some_and(|g| !g.present(&self.renderer.pixmap, self.renderer.changed_rows())) {
+            self.tudo = true;
+            w.request_redraw();
         }
     }
 }
@@ -344,6 +385,28 @@ impl<A: App> ApplicationHandler<A::Msg> for Runtime<A> {
         self.window.as_ref().expect("acabou de abrir").request_redraw();
     }
 
+    // shortcut: entre dois quadros só o último ponto do mouse chega aos widgets; um traço de caneta quer todos (guardar a lista quando houver canvas de desenho).
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if !self.mover {
+            return el.set_control_flow(ControlFlow::Wait);
+        }
+        let janela = self.window.as_ref();
+        let intervalo = *self.intervalo.get_or_insert_with(|| {
+            let hz = janela.and_then(|w| w.current_monitor()).and_then(|m| m.refresh_rate_millihertz()).unwrap_or(60_000);
+            std::time::Duration::from_micros(1_000_000_000 / hz.max(1000) as u64)
+        });
+        let prox = self.ultimo_mover + intervalo;
+        if std::time::Instant::now() >= prox {
+            self.entregar_mover();
+            el.set_control_flow(ControlFlow::Wait);
+        } else {
+            el.set_control_flow(ControlFlow::WaitUntil(prox));
+        }
+        if self.sair {
+            el.exit();
+        }
+    }
+
     fn user_event(&mut self, el: &ActiveEventLoop, m: A::Msg) {
         self.update(vec![m]);
         if self.sair {
@@ -365,13 +428,15 @@ impl<A: App> ApplicationHandler<A::Msg> for Runtime<A> {
                 if let Some(g) = &mut self.gpu {
                     g.resize(s.width, s.height);
                 }
+                self.tudo = true;
                 let l = s.to_logical::<f32>(escala);
                 Some(Event::Resized(Size::new(l.width, l.height)))
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let p = position.to_logical::<f32>(escala);
                 self.cursor = Some(Point::new(p.x, p.y));
-                Some(Event::CursorMoved(Point::new(p.x, p.y)))
+                self.mover = true;
+                None
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = None;
@@ -392,12 +457,20 @@ impl<A: App> ApplicationHandler<A::Msg> for Runtime<A> {
             WindowEvent::KeyboardInput { event, .. } => Some(Event::Key { key: event.logical_key.clone(), text: event.text.map(|t| t.to_string()), modifiers: self.modifiers, pressed: event.state.is_pressed() }),
             WindowEvent::Focused(f) => Some(Event::Focused(f)),
             WindowEvent::ScaleFactorChanged { .. } => {
+                self.tudo = true;
+                self.intervalo = None;
                 self.window.as_ref().map(|w| w.request_redraw());
                 None
             }
             _ => None,
         };
         if let Some(ev) = ev {
+            // Clique e tecla veem o mouse onde ele está.
+            self.entregar_mover();
+            // Com o modo debug, o que chega da janela vai para o stderr (para achar tecla ou clique perdido).
+            if self.settings.debug && !matches!(ev, Event::CursorMoved(_)) {
+                eprintln!("[pelicano] {ev:?} cursor={:?}", self.cursor);
+            }
             self.event(ev);
         }
         if self.sair {
@@ -415,6 +488,9 @@ struct Gpu {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     textura: Option<(wgpu::Texture, wgpu::BindGroup)>,
+    /// O último quadro não chegou à tela: não pede de novo em seguida (janela minimizada
+    /// falha sempre e viraria um laço).
+    falhou: bool,
 }
 
 const SHADER: &str = r#"
@@ -475,7 +551,7 @@ impl Gpu {
             fragment: Some(wgpu::FragmentState { module: &modulo, entry_point: "fs", targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
             multiview: None,
         });
-        Ok(Gpu { surface, device, queue, config, pipeline, layout, textura: None })
+        Ok(Gpu { surface, device, queue, config, pipeline, layout, textura: None, falhou: false })
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -486,13 +562,17 @@ impl Gpu {
         }
     }
 
-    fn present(&mut self, pm: &tiny_skia::Pixmap) {
+    /// `false` se o quadro não chegou à tela e vale tentar de novo (só na primeira falha seguida).
+    fn present(&mut self, pm: &tiny_skia::Pixmap, linhas: Option<(u32, u32)>) -> bool {
         let (w, h) = (pm.width(), pm.height());
         if (w, h) != (self.config.width, self.config.height) {
             self.resize(w, h);
         }
         let extent = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+        // Textura nova (ou quadro anterior perdido) precisa do quadro todo; senão só as linhas que mudaram.
+        let mut linhas = linhas.filter(|_| !self.falhou).unwrap_or((0, h));
         if self.textura.as_ref().map_or(true, |(t, _)| t.size() != extent) {
+            linhas = (0, h);
             let t = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: None,
                 size: extent,
@@ -508,18 +588,19 @@ impl Gpu {
             self.textura = Some((t, bg));
         }
         let (t, bg) = self.textura.as_ref().expect("criada acima");
+        let (y0, y1) = (linhas.0.min(h), linhas.1.min(h));
         self.queue.write_texture(
-            wgpu::ImageCopyTexture { texture: t, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            pm.data(),
-            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
-            extent,
+            wgpu::ImageCopyTexture { texture: t, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: y0, z: 0 }, aspect: wgpu::TextureAspect::All },
+            &pm.data()[(y0 * 4 * w) as usize..(y1 * 4 * w) as usize],
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(y1 - y0) },
+            wgpu::Extent3d { height: y1 - y0, ..extent },
         );
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             // Superfície velha (janela mudou de tamanho no meio): reconfigura e espera o próximo quadro.
             Err(_) => {
                 self.surface.configure(&self.device, &self.config);
-                return;
+                return std::mem::replace(&mut self.falhou, true);
             }
         };
         let view = frame.texture.create_view(&Default::default());
@@ -538,5 +619,39 @@ impl Gpu {
         }
         self.queue.submit([enc.finish()]);
         frame.present();
+        self.falhou = false;
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::widget::{self, button, container, Element};
+    use crate::{Changes, Color, Point, Renderer, Size, States, Theme};
+
+    /// Grava um quadro com o mouse em `cursor` e diz o que mudou desde o anterior.
+    fn quadro(r: &mut Renderer, el: &Element<'_, ()>, cursor: Option<Point>) -> Changes {
+        let (st, tema, tam) = (States::default(), Theme::dark(), Size::new(400.0, 300.0));
+        r.begin(tam, 1.0, Color::BLACK);
+        let n = widget::layout(el, tam, r, &st, &tema);
+        r.record();
+        widget::draw(el, &n, r, &st, &tema, cursor, false);
+        r.changes()
+    }
+
+    #[test]
+    fn mouse_so_redesenha_o_botao_em_que_entra() {
+        let el: Element<()> = container(button("ok").on_press(())).padding(50.0).into();
+        let mut r = Renderer::new();
+        assert_eq!(quadro(&mut r, &el, Some(Point::new(5.0, 5.0))), Changes::All);
+        // Andar no vazio não redesenha nada.
+        assert_eq!(quadro(&mut r, &el, Some(Point::new(20.0, 20.0))), Changes::None);
+        // Entrar no botão redesenha só perto dele.
+        let Changes::Regions(rs) = quadro(&mut r, &el, Some(Point::new(55.0, 55.0))) else { panic!("devia ser regiões") };
+        assert_eq!(rs.len(), 1);
+        assert!(rs[0].contains(Point::new(55.0, 55.0)) && rs[0].width < 200.0 && rs[0].height < 120.0, "{:?}", rs[0]);
+        // Sair de novo também.
+        assert!(matches!(quadro(&mut r, &el, None), Changes::Regions(_)));
+        assert_eq!(quadro(&mut r, &el, None), Changes::None);
     }
 }
