@@ -137,10 +137,10 @@ pub struct Renderer {
     scale: f32,
     fonts: FontSystem,
     swash: SwashCache,
-    texts: HashMap<TextKey, Buffer>,
-    svgs: HashMap<SvgKey, Pixmap>,
-    shadows: HashMap<ShadowKey, Pixmap>,
-    imagens: HashMap<(u64, u32, u32), Pixmap>,
+    texts: Cache<TextKey, Buffer>,
+    svgs: Cache<SvgKey, Pixmap>,
+    shadows: Cache<ShadowKey, Pixmap>,
+    imagens: Cache<(u64, u32, u32), Pixmap>,
     clips: Vec<Clip>,
     /// Num quadro parcial: onde o `pixmap` (pequeno) começa, em lógico e em pixels, e o
     /// quadro cheio que espera a região redesenhada.
@@ -172,10 +172,10 @@ impl Renderer {
             scale: 1.0,
             fonts: FontSystem::new(),
             swash: SwashCache::new(),
-            texts: HashMap::new(),
-            svgs: HashMap::new(),
-            shadows: HashMap::new(),
-            imagens: HashMap::new(),
+            texts: Cache::default(),
+            svgs: Cache::default(),
+            shadows: Cache::default(),
+            imagens: Cache::default(),
             clips: Vec::new(),
             origem: Point::ORIGIN,
             desloc: (0, 0),
@@ -198,6 +198,16 @@ impl Renderer {
         if self.scale != scale {
             self.texts.clear();
             self.svgs.clear();
+        }
+        // Um quadro cheio desenha tudo o que está à mostra: o que nem ele nem o layout usaram
+        // (outro tamanho de janela no meio de um resize, um menu que fechou) sai do cache.
+        let antes = self.svgs.bytes() + self.shadows.bytes() + self.imagens.bytes();
+        self.texts.virar();
+        self.svgs.virar();
+        self.shadows.virar();
+        self.imagens.virar();
+        if antes - (self.svgs.bytes() + self.shadows.bytes() + self.imagens.bytes()) > 4 << 20 {
+            devolver_memoria();
         }
         self.scale = scale;
         self.clips.clear();
@@ -322,7 +332,7 @@ impl Renderer {
             self.texts.clear();
         }
         let fonts = &mut self.fonts;
-        self.texts.entry(key).or_insert_with(|| {
+        self.texts.pegar(key, || {
             let mut b = Buffer::new(fonts, Metrics::new(size * s, (size * 1.3 * s).ceil()));
             b.set_size(fonts, max_width.map(|w| w * s), None);
             let attrs = Attrs::new().weight(Weight(font.weight)).family(match font.family {
@@ -369,7 +379,7 @@ impl Renderer {
         let cor = cosmic_text::Color::rgba((color.r * 255.0) as u8, (color.g * 255.0) as u8, (color.b * 255.0) as u8, (color.a * 255.0) as u8);
         self.buffer(text, size, font, max_width);
         let key = TextKey { text: text.to_owned(), size: (size * s * 64.0) as u32, font, width: max_width.map(|w| (w * s) as u32) };
-        let b = &self.texts[&key];
+        let b = self.texts.get(&key).expect("criado pelo buffer");
         let (w, h) = (self.pixmap.width() as i32, self.pixmap.height() as i32);
         let (cx0, cy0, cx1, cy1) = match clip {
             Some(r) => ((r.x * s).floor() as i32, (r.y * s).floor() as i32, ((r.x + r.width) * s).ceil() as i32, ((r.y + r.height) * s).ceil() as i32),
@@ -527,10 +537,10 @@ impl Renderer {
         let (w, h) = (bw + 2.0 * m, bh + 2.0 * m);
         let cor = skia_color(sh.color).to_color_u8();
         let key = ShadowKey { w: w as u32, h: h as u32, radius: radius.map(|v| (v * s) as u32), blur: m as u32, color: [cor.red(), cor.green(), cor.blue(), cor.alpha()] };
-        if self.shadows.len() > 256 || bytes(&self.shadows) > 64 << 20 {
+        if self.shadows.len() > 256 || self.shadows.bytes() > 64 << 20 {
             self.shadows.clear();
         }
-        let pm = self.shadows.entry(key).or_insert_with(|| {
+        let pm = self.shadows.pegar(key, || {
             let mut pm = Pixmap::new(w as u32, h as u32).expect("w, h >= 1");
             let caixa = Rect { x: m / s, y: m / s, width: bw / s, height: bh / s };
             if let Some(p) = rounded_path(caixa, radius, s) {
@@ -574,10 +584,10 @@ impl Renderer {
         if w == 0 || h == 0 {
             return;
         }
-        if self.imagens.len() > 32 || bytes(&self.imagens) > 32 << 20 {
+        if self.imagens.len() > 32 || self.imagens.bytes() > 32 << 20 {
             self.imagens.clear();
         }
-        let pm = self.imagens.entry((img.1, w, h)).or_insert_with(|| escalar(&img.0, w, h, None));
+        let pm = self.imagens.pegar((img.1, w, h), || escalar(&img.0, w, h, None));
         let forma = tiny_skia::Rect::from_xywh(x as f32, y as f32, w as f32, h as f32).map(|f| (f, radius.map(|v| v * s)));
         let (tam, amostra) = de(pm, None);
         compor(&mut self.pixmap, &mut self.clips, s, x, y, tam, forma, false, false, self.parcial.is_none(), amostra);
@@ -601,7 +611,7 @@ impl Renderer {
         if self.svgs.len() > 512 {
             self.svgs.clear();
         }
-        let pm = self.svgs.entry(key).or_insert_with(|| {
+        let pm = self.svgs.pegar(key, || {
             let mut pm = Pixmap::new(w, h).expect("tamanho > 0");
             let t = svg.0.size();
             resvg::render(&svg.0, Transform::from_scale(w as f32 / t.width(), h as f32 / t.height()), &mut pm.as_mut());
@@ -718,8 +728,59 @@ impl Default for Renderer {
 }
 
 /// Média móvel de largura `2k+1` numa direção, com a borda repetida.
-fn bytes<K>(m: &HashMap<K, Pixmap>) -> usize {
-    m.values().map(|p| p.data().len()).sum()
+/// Um cache que lembra em que geração cada item foi usado; `virar` (a cada quadro cheio)
+/// esquece o que ficou sem uso desde o anterior.
+struct Cache<K, V> {
+    mapa: HashMap<K, (V, u64)>,
+    geracao: u64,
+}
+
+impl<K, V> Default for Cache<K, V> {
+    fn default() -> Self {
+        Cache { mapa: HashMap::new(), geracao: 0 }
+    }
+}
+
+impl<K: Hash + Eq, V> Cache<K, V> {
+    fn pegar(&mut self, k: K, novo: impl FnOnce() -> V) -> &mut V {
+        let g = self.geracao;
+        let e = self.mapa.entry(k).or_insert_with(|| (novo(), g));
+        e.1 = g;
+        &mut e.0
+    }
+    fn get(&self, k: &K) -> Option<&V> {
+        self.mapa.get(k).map(|e| &e.0)
+    }
+    fn len(&self) -> usize {
+        self.mapa.len()
+    }
+    fn clear(&mut self) {
+        self.mapa.clear();
+    }
+    fn virar(&mut self) {
+        let g = self.geracao;
+        self.mapa.retain(|_, e| e.1 == g);
+        self.geracao += 1;
+    }
+}
+
+impl<K> Cache<K, Pixmap> {
+    fn bytes(&self) -> usize {
+        self.mapa.values().map(|e| e.0.data().len()).sum()
+    }
+}
+
+/// O glibc guarda a memória dos pixmaps soltos para reusar, e o processo segue com ela:
+/// depois de largar vários MB, devolve ao sistema.
+fn devolver_memoria() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: função do glibc sem pré-condições.
+        unsafe { malloc_trim(0) };
+    }
 }
 
 /// Bilinear em inteiros (8 bits de fração): `src` esticado para `w`×`h`.
@@ -1068,4 +1129,28 @@ fn cruza(a: Rect, b: Rect) -> bool {
 fn uniao(a: Rect, b: Rect) -> Rect {
     let (x, y) = (a.x.min(b.x), a.y.min(b.y));
     Rect { x, y, width: (a.x + a.width).max(b.x + b.width) - x, height: (a.y + a.height).max(b.y + b.height) - y }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_nao_acumula_cache() {
+        // Foto esticada na janela, caixa com sombra e texto: cada largura gera cópias novas.
+        let img = Image::from_rgba(64, 64, vec![200; 64 * 64 * 4]).expect("tamanho confere");
+        let mut r = Renderer::new();
+        for i in 0..30 {
+            let w = 600.0 + i as f32 * 7.0;
+            r.begin(Size::new(w, 400.0), 1.0, Color::BLACK);
+            r.draw_image(&img, Rect { x: 0.0, y: 0.0, width: w, height: 400.0 }, [0.0; 4]);
+            let caixa = Rect { x: 20.0, y: 20.0, width: w - 40.0, height: 60.0 + i as f32 };
+            r.fill_quad(caixa, None, Border::default(), Some(Shadow { color: Color::BLACK, offset: Point::new(0.0, 4.0), blur: 12.0 }));
+            r.draw_text(&format!("largura {w}"), 14.0, Font::default(), Color::WHITE, Point::new(30.0, 30.0), Some(w - 60.0));
+        }
+        // Só o quadro anterior e o atual ficam.
+        assert!(r.imagens.len() <= 2, "{} imagens", r.imagens.len());
+        assert!(r.texts.len() <= 2, "{} textos", r.texts.len());
+        assert!(r.shadows.len() <= 2, "{} sombras", r.shadows.len());
+    }
 }
