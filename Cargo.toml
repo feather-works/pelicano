@@ -1,0 +1,20 @@
+[package]
+name = "pelicano"
+version = "0.1.0"
+description = "Biblioteca de interface da suíte FeatherWorks: widgets, layout e janela próprios, sem Iced"
+authors = ["FeatherWorks"]
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/feather-works/pelicano"
+publish = false
+
+[dependencies]
+# Janela e eventos.
+winit = "0.30"
+# Desenho na CPU: o mesmo quadro sai na janela e no PNG dos testes.
+tiny-skia = "0.11"
+cosmic-text = "0.12"
+resvg = "0.42"
+# Só apresenta o quadro pronto: é o que dá janela transparente (cantos arredondados) no Wayland.
+wgpu = "0.19"
+futures = { version = "0.3", features = ["thread-pool"] }
