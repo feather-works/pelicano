@@ -98,7 +98,7 @@ Checklist dos seis pilares de um motor de interface, com o estado do pelicano ve
 |---|---|---|---|---|---|
 | Tk | Imperativo/retido | APIs nativas legadas/X11/GDI | Leveza, maturidade | Estética datada, sem GPU, estado manual | Elm (`update`/`view`) com estado por caminho, sem estado manual solto. Sombra, desfoque e transparência prontos. Mas é jovem (0.1.0), com um só app de referência, e sem Tab, IME, clipboard nem a11y. |
 | Iced | Elm reativo | WGPU + Tiny-Skia | Rust puro, sem DSL | Boilerplate de mensagens, widgets custom difíceis, API instável | Mesmo modelo Elm, então o boilerplate de `Msg` continua. Widgets custom saem da trait pública `Widget`. A API ainda muda. Desenho na CPU: sem damage tracking nem batching, e o quadro inteiro é refeito a cada evento. Menus, bandeja e DnD ausentes, como no Iced. |
-| Slint | DSL compilada | OpenGL/Vulkan/Skia/Software | Performance, embarcados | DSL própria, ecossistema pequeno, licença dual | Sem DSL: tudo é Rust. Sem a limitação da DSL, mas sem o ganho de performance do código compilado para embarcado. Licença GPL-3.0-only, sem licença dual. Ecossistema é só a suíte FeatherWorks. |
+| Slint | DSL compilada | OpenGL/Vulkan/Skia/Software | Performance, embarcados | DSL própria, ecossistema pequeno, licença dual | Sem DSL: tudo é Rust. Sem a limitação da DSL, mas sem o ganho de performance do código compilado para embarcado. Licença MIT. Ecossistema é só a suíte FeatherWorks. |
 
 ## Próximos passos
 

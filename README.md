@@ -50,4 +50,4 @@ pré-multiplicado — é isso que dá a transparência no Wayland.
 Seleção no `text_input`, navegação por Tab, assinaturas de tempo (`every`),
 executor tokio (para `reqwest`) e grid.
 
-Licença GPL-3.0-only.
+Licença MIT.

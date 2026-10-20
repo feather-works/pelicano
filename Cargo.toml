@@ -4,7 +4,7 @@ version = "0.1.5"
 description = "Biblioteca de interface da suíte FeatherWorks: widgets, layout e janela próprios, sem Iced"
 authors = ["FeatherWorks"]
 edition = "2021"
-license = "GPL-3.0-only"
+license = "MIT"
 repository = "https://github.com/feather-works/pelicano"
 publish = false
 
