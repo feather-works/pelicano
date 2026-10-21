@@ -1241,6 +1241,7 @@ pub struct MouseArea<'a, M> {
     on_press: Option<M>,
     on_release: Option<M>,
     on_right_press: Option<M>,
+    on_right_press_at: Option<Box<dyn Fn(Point) -> M + 'a>>,
     on_double_click: Option<M>,
     icon: Option<CursorIcon>,
     on_enter: Option<M>,
@@ -1257,7 +1258,7 @@ struct EmCima(bool);
 struct UltimoClique(Option<std::time::Instant>);
 
 pub fn mouse_area<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> MouseArea<'a, M> {
-    MouseArea { content: content.into(), on_press: None, on_release: None, on_right_press: None, on_double_click: None, icon: None, on_enter: None, on_exit: None, on_move: None, on_scroll: None }
+    MouseArea { content: content.into(), on_press: None, on_release: None, on_right_press: None, on_right_press_at: None, on_double_click: None, icon: None, on_enter: None, on_exit: None, on_move: None, on_scroll: None }
 }
 
 impl<'a, M> MouseArea<'a, M> {
@@ -1289,6 +1290,11 @@ impl<'a, M> MouseArea<'a, M> {
     }
     pub fn on_right_press(mut self, m: M) -> Self {
         self.on_right_press = Some(m);
+        self
+    }
+    /// Clique direito com a posição na janela (lógica): onde abrir o menu de contexto.
+    pub fn on_right_press_at(mut self, f: impl Fn(Point) -> M + 'a) -> Self {
+        self.on_right_press_at = Some(Box::new(f));
         self
     }
     /// Duplo clique (até 400 ms): na barra de título, maximizar.
@@ -1347,6 +1353,10 @@ impl<M: Clone> Widget<M> for MouseArea<'_, M> {
                 return Captured::Yes;
             }
             _ => {}
+        }
+        if let (Event::MousePressed(MouseButton::Right), Some(f), Some(p)) = (ev, &self.on_right_press_at, cx.cursor) {
+            cx.publish(f(p));
+            return Captured::Yes;
         }
         let m = match ev {
             Event::MousePressed(MouseButton::Left) => {

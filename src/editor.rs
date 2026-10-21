@@ -15,6 +15,8 @@ struct Interno {
     ed: Option<Editor<'static>>,
     /// O texto antes do primeiro desenho (sem fontes ainda não dá para montar o buffer).
     inicial: String,
+    /// A linha pedida por [`Content::go_to_line`] antes do primeiro desenho.
+    linha_inicial: Option<usize>,
     /// Sobe a cada mudança do texto: o app compara para saber se há algo a salvar.
     versao: u64,
     desfazer: Vec<Change>,
@@ -43,7 +45,7 @@ impl Content {
     }
 
     pub fn with_text(texto: &str) -> Self {
-        Content(RefCell::new(Interno { ed: None, inicial: texto.to_owned(), versao: 0, desfazer: Vec::new(), refazer: Vec::new(), digitando: None, config: None, cercas: None, #[cfg(feature = "highlighter")] realce: Default::default() }))
+        Content(RefCell::new(Interno { ed: None, inicial: texto.to_owned(), linha_inicial: None, versao: 0, desfazer: Vec::new(), refazer: Vec::new(), digitando: None, config: None, cercas: None, #[cfg(feature = "highlighter")] realce: Default::default() }))
     }
 
     /// O texto inteiro, com as quebras de linha que o arquivo tinha.
@@ -140,9 +142,13 @@ impl Content {
     }
 
     /// Leva o cursor ao começo da linha `linha` (contando de 1; passa do fim, vai à última).
+    /// Antes do primeiro desenho, vale quando o editor for montado.
     pub fn go_to_line(&self, linha: usize) {
         let mut i = self.0.borrow_mut();
-        let Some(ed) = i.ed.as_mut() else { return };
+        let Some(ed) = i.ed.as_mut() else {
+            i.linha_inicial = Some(linha);
+            return;
+        };
         let n = ed.with_buffer(|b| b.lines.len());
         ed.set_selection(Selection::None);
         ed.set_cursor(Cursor::new(linha.clamp(1, n) - 1, 0));
@@ -380,7 +386,12 @@ impl Interno {
             // Sem altura, o set_text monta todas as linhas; com zero, nenhuma (o desenho monta as visíveis).
             b.set_size(fonts, None, Some(0.0));
             b.set_text(fonts, &std::mem::take(&mut self.inicial), attrs, Shaping::Advanced);
-            Editor::new(b)
+            let mut ed = Editor::new(b);
+            if let Some(linha) = self.linha_inicial.take() {
+                let n = ed.with_buffer(|b| b.lines.len());
+                ed.set_cursor(Cursor::new(linha.clamp(1, n) - 1, 0));
+            }
+            ed
         });
         if self.config != Some(config) {
             let outra_fonte = self.config.is_some_and(|(_, _, f, _)| f != fonte);
@@ -689,6 +700,9 @@ pub struct TextEditor<'a, M> {
     placeholder: &'a str,
     id: Option<u64>,
     on_key: Option<Box<dyn Fn(&Key, crate::Modifiers) -> Option<M> + 'a>>,
+    idle_focus: bool,
+    current_line: Option<Color>,
+    stripes: Option<Color>,
     warnings: Vec<Warning>,
     on_link: Option<Box<dyn Fn(String) -> M + 'a>>,
     #[cfg(feature = "highlighter")]
@@ -707,7 +721,7 @@ pub struct Warning {
 /// Editor de várias linhas sobre um [`Content`]. Edita o conteúdo direto e avisa com
 /// `on_change` (para o app marcar "não salvo").
 pub fn text_editor<'a, M>(content: &'a Content) -> TextEditor<'a, M> {
-    TextEditor { content, size: 15.0, font: Font::DEFAULT, wrap: true, line_numbers: false, padding: Padding::from(12.0), on_change: None, style: None, autofocus: None, invisibles: false, markdown: false, line_height: None, placeholder: "", id: None, on_key: None, warnings: Vec::new(), on_link: None, #[cfg(feature = "highlighter")] highlight: None }
+    TextEditor { content, size: 15.0, font: Font::DEFAULT, wrap: true, line_numbers: false, padding: Padding::from(12.0), on_change: None, style: None, autofocus: None, invisibles: false, markdown: false, line_height: None, placeholder: "", id: None, on_key: None, idle_focus: true, current_line: None, stripes: None, warnings: Vec::new(), on_link: None, #[cfg(feature = "highlighter")] highlight: None }
 }
 
 impl<'a, M> TextEditor<'a, M> {
@@ -765,6 +779,22 @@ impl<'a, M> TextEditor<'a, M> {
     fn altura(&self) -> f32 {
         self.line_height.unwrap_or(self.size * 1.45)
     }
+    /// Sem nenhum campo focado, o editor pega a digitação (o padrão). `false` para quando há
+    /// mais de um editor na tela: cada um só escreve depois de clicado ou de um [`crate::Task::focus`].
+    pub fn idle_focus(mut self, f: bool) -> Self {
+        self.idle_focus = f;
+        self
+    }
+    /// Faixa desta cor na linha do cursor (com foco).
+    pub fn current_line(mut self, c: Color) -> Self {
+        self.current_line = Some(c);
+        self
+    }
+    /// Faixa desta cor nas linhas pares (2, 4, 6…), para seguir a linha com os olhos.
+    pub fn stripes(mut self, c: Color) -> Self {
+        self.stripes = Some(c);
+        self
+    }
     /// Sublinha estes trechos em onda (aviso, erro de ortografia); a dica de cada um aparece com o
     /// mouse em cima. Trecho fora do texto é ignorado.
     pub fn warnings(mut self, w: Vec<Warning>) -> Self {
@@ -800,7 +830,24 @@ impl<'a, M> TextEditor<'a, M> {
         self
     }
 
+    fn focado(&self, foco: Option<u64>, key: u64) -> bool {
+        foco == Some(key) || self.idle_focus && foco.is_none()
+    }
+
     /// Onde fica a calha dos números e onde começa o texto.
+    /// O polegar da barra de rolagem, se o texto não cabe; `topo` é a primeira linha à vista (com fração).
+    // shortcut: conta linhas do texto, não as visuais; com `wrap` a barra fica aproximada, contar layout_runs se incomodar.
+    fn polegar(&self, n: &Node, area: Rect, total: usize, topo: f32) -> Option<Rect> {
+        let visiveis = area.height / self.altura();
+        let total = total as f32;
+        if total <= visiveis {
+            return None;
+        }
+        let altura = (area.height * visiveis / total).max(24.0).min(area.height);
+        let fracao = (topo / (total - visiveis)).clamp(0.0, 1.0);
+        let t = trilho(n);
+        Some(Rect { x: t.x, y: area.y + (area.height - altura) * fracao, width: t.width, height: altura })
+    }
     fn areas(&self, n: &Node, r: &mut crate::Renderer) -> (Rect, Rect) {
         let dentro = n.rect.shrink(self.padding);
         let calha = if self.line_numbers {
@@ -813,9 +860,16 @@ impl<'a, M> TextEditor<'a, M> {
     }
 }
 
+/// A faixa da barra de rolagem, na borda direita do editor.
+fn trilho(n: &Node) -> Rect {
+    Rect { x: n.rect.x + n.rect.width - 10.0, width: 10.0, ..n.rect }
+}
+
 #[derive(Default)]
 struct Mouse {
     arrastando: bool,
+    /// Arrastando a barra de rolagem: a distância do clique ao topo do polegar.
+    barra: Option<f32>,
     /// O último clique marcou uma caixinha: o próximo não vira clique duplo.
     caixa: bool,
     /// Ctrl apertado: o link sob o mouse vira mãozinha e abre no clique.
@@ -835,7 +889,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
     }
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
         // Sem outro campo focado, o editor recebe a digitação (abrir e já escrever).
-        let focado = cx.states.focus.is_none_or(|f| f == n.key) || crate::widget::foco_pendente(cx.states, n.key, self.autofocus);
+        let focado = self.focado(cx.states.focus, n.key) || crate::widget::foco_pendente(cx.states, n.key, self.autofocus);
         let hover = cx.hovered(&n.rect);
         if hover {
             cx.cursor_icon = CursorIcon::Text;
@@ -906,6 +960,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         let mut tracos: Vec<(Rect, usize)> = Vec::new();
         let mut tarefas: Vec<(Rect, bool, usize)> = Vec::new();
         let mut enfeites: Vec<(Rect, usize)> = Vec::new();
+        let mut faixas: Vec<(usize, f32, f32)> = Vec::new();
         let mut ondas: Vec<(Rect, usize)> = Vec::new();
         let (mouse, mut link_sob_mouse) = (cx.cursor, None::<(Rect, String)>);
         let (rolagem, altura_linha) = ed.with_buffer(|b| {
@@ -978,6 +1033,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                         realces.push(Rect { x: area.x + (x - h) / s, y, width: w / s, height: run.line_height / s });
                     }
                 }
+                faixas.push((run.line_i, y, run.line_height / s));
                 if run.line_i != anterior {
                     numeros.push((run.line_i + 1, y));
                     anterior = run.line_i;
@@ -986,6 +1042,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             marcar_fim(fim, &mut marcas);
             (b.scroll(), b.metrics().line_height / s)
         });
+        let (total, topo) = ed.with_buffer(|b| (b.lines.len(), b.scroll().line as f32 + b.scroll().vertical / (self.altura() * s)));
         let caret = focado.then(|| ed.cursor_position()).flatten().map(|(x, y)| Point::new(area.x + (x as f32 - rolagem.horizontal) / s, area.y + y as f32 / s));
         let mut chave = std::collections::hash_map::DefaultHasher::new();
         (versao, rolagem.line, rolagem.vertical.to_bits(), rolagem.horizontal.to_bits(), (area.width * s) as u32, (self.size * s * 64.0) as u32, self.wrap, self.invisibles, self.markdown).hash(&mut chave);
@@ -994,6 +1051,13 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         self.highlight.hash(&mut chave);
 
         cx.renderer.push_clip(area, [0.0; 4]);
+        let linha_cursor = ed.cursor().line;
+        for &(linha, y, h) in &faixas {
+            let tom = if focado && linha == linha_cursor { self.current_line } else { self.stripes.filter(|_| linha % 2 == 1) };
+            if let Some(tom) = tom {
+                cx.renderer.fill_quad(Rect { x: area.x, y, width: area.width, height: h }, Some(&tom.into()), Border::default(), None);
+            }
+        }
         let cor_selecao = cx.theme.primary.alpha(if focado { 0.30 } else { 0.18 });
         for r in &realces {
             cx.renderer.fill_quad(*r, Some(&cor_selecao.into()), Border::default(), None);
@@ -1102,11 +1166,16 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             let fio = Rect { x: calha.x + calha.width - 8.0, y: n.rect.y, width: 1.0, height: n.rect.height };
             cx.renderer.fill_quad(fio, Some(&cx.theme.border.into()), Border::default(), None);
         }
+        if let Some(p) = self.polegar(n, area, total, topo) {
+            let em_cima = cx.cursor.is_some_and(|c| trilho(n).contains(c)) || cx.states.get::<Mouse>(n.key).is_some_and(|m| m.barra.is_some());
+            let cor = cx.theme.muted.alpha(if em_cima { 0.55 } else { 0.3 });
+            cx.renderer.fill_quad(Rect { x: p.x + 2.0, width: p.width - 4.0, ..p }, Some(&cor.into()), Border::rounded(3.0), None);
+        }
     }
     fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
         crate::widget::atender_foco(ev, cx.states, n.key, self.autofocus);
         // Sem outro campo focado, o editor recebe a digitação (abrir e já escrever).
-        let focado = cx.states.focus.is_none_or(|f| f == n.key);
+        let focado = self.focado(cx.states.focus, n.key);
         let (_, area) = self.areas(n, cx.renderer);
         let s = cx.renderer.scale();
         let ponto = |p: Point| (((p.x - area.x) * s) as i32, ((p.y - area.y) * s) as i32);
@@ -1115,6 +1184,20 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         // O primeiro evento pode vir antes do primeiro desenho (testes): monta já.
         i.editor(cx.renderer.fonts(), self.size, self.altura(), s, self.font, self.wrap);
         let antes = i.versao;
+        let (total, topo) = i.ed.as_ref().expect("montado acima").with_buffer(|b| (b.lines.len(), b.scroll().line as f32 + b.scroll().vertical / (self.altura() * s)));
+        let polegar = self.polegar(n, area, total, topo);
+        let barra = cx.states.get::<Mouse>(n.key).and_then(|m| m.barra);
+        // Rola para que o topo do polegar fique em `y` (posição na janela).
+        let rolar_para = |i: &mut Interno, p: Rect, y: f32| {
+            let livre = (area.height - p.height).max(1.0);
+            let linha = ((y - area.y) / livre).clamp(0.0, 1.0) * (total as f32 - area.height / self.altura()).max(0.0);
+            i.ed.as_mut().expect("montado acima").with_buffer_mut(|b| {
+                let mut sc = b.scroll();
+                sc.line = linha as usize;
+                sc.vertical = linha.fract() * self.altura() * s;
+                b.set_scroll(sc);
+            });
+        };
         // Ctrl+clique num link: o endereço vai para o app e o cursor fica onde estava.
         let ctrl = cx.states.get::<Mouse>(n.key).is_some_and(|m| m.ctrl);
         let mut link = None;
@@ -1134,6 +1217,25 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             }
             Event::MousePressed(MouseButton::Left) if link.is_some() => {
                 cx.publish((self.on_link.as_ref().expect("conferido"))(link.clone().expect("conferido")));
+                Captured::Yes
+            }
+            // A barra vem antes do texto: clicar nela não mexe no cursor.
+            Event::MousePressed(MouseButton::Left) if polegar.is_some() && cx.cursor.is_some_and(|c| trilho(n).contains(c)) => {
+                let (p, y) = (polegar.expect("conferido"), cx.cursor.expect("conferido").y);
+                // No polegar, segura onde pegou; fora dele, o polegar pula para centrar no clique.
+                let pega = if (p.y..p.y + p.height).contains(&y) { y - p.y } else { p.height / 2.0 };
+                rolar_para(&mut i, p, y - pega);
+                cx.states.get_mut::<Mouse>(n.key).barra = Some(pega);
+                Captured::Yes
+            }
+            Event::CursorMoved(c) if barra.is_some() => {
+                if let Some(p) = polegar {
+                    rolar_para(&mut i, p, c.y - barra.unwrap_or(0.0));
+                }
+                Captured::Yes
+            }
+            Event::MouseReleased(MouseButton::Left) if barra.is_some() => {
+                cx.states.get_mut::<Mouse>(n.key).barra = None;
                 Captured::Yes
             }
             Event::MousePressed(MouseButton::Left) if dentro => {
@@ -1297,6 +1399,21 @@ impl<'a, M: Clone + 'a> From<TextEditor<'a, M>> for crate::Element<'a, M> {
 #[cfg(test)]
 mod testes {
     use super::*;
+
+    #[test]
+    fn polegar_da_barra_de_rolagem() {
+        let c = Content::new();
+        let ed: TextEditor<'_, ()> = text_editor(&c).line_height(20.0);
+        let n = Node { rect: Rect { x: 0.0, y: 0.0, width: 300.0, height: 200.0 }, ..Default::default() };
+        let area = n.rect;
+        // 10 linhas à vista: com 8 linhas não há barra.
+        assert!(ed.polegar(&n, area, 8, 0.0).is_none());
+        let cima = ed.polegar(&n, area, 100, 0.0).expect("100 linhas não cabem");
+        assert_eq!((cima.y, cima.height), (0.0, 24.0));
+        let baixo = ed.polegar(&n, area, 100, 90.0).expect("idem");
+        assert_eq!(baixo.y + baixo.height, 200.0);
+        assert_eq!(baixo.x, 290.0);
+    }
 
     struct Visto {
         weight: Weight,

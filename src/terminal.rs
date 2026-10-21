@@ -149,13 +149,18 @@ impl Terminal {
 
     /// Os avisos deste terminal enquanto ele existir. Mapeie para a mensagem do app.
     pub fn subscription(&self) -> Subscription<TerminalEvent> {
+        Subscription::run_with_id(("pelicano::terminal", self.id), self.events())
+    }
+
+    /// Os mesmos avisos como fluxo, para o app montar a própria assinatura (com o [`Terminal::id`]
+    /// na mensagem, que o `Subscription::map` não deixa capturar). Só o primeiro fluxo recebe.
+    pub fn events(&self) -> impl futures::Stream<Item = TerminalEvent> + Send + 'static {
         let eventos = self.eventos.clone();
-        // O receptor só é tirado quando a assinatura começa de fato (nas outras vezes o fluxo é descartado).
-        let fluxo = futures::stream::once(async move { eventos.lock().unwrap_or_else(|e| e.into_inner()).take() }).flat_map(|rx| match rx {
+        // O receptor só é tirado quando o fluxo começa de fato (uma assinatura repetida é descartada sem rodar).
+        futures::stream::once(async move { eventos.lock().unwrap_or_else(|e| e.into_inner()).take() }).flat_map(|rx| match rx {
             Some(rx) => rx.boxed(),
             None => futures::stream::empty().boxed(),
-        });
-        Subscription::run_with_id(("pelicano::terminal", self.id), fluxo)
+        })
     }
 
     /// Manda bytes para o programa, como se fossem digitados.
@@ -267,12 +272,13 @@ pub struct TerminalView<'a> {
     background: Option<Color>,
     palette: Option<[Color; 16]>,
     padding: f32,
+    id: Option<u64>,
 }
 
 /// Mostra um [`Terminal`]. Clique dá o foco; com foco, o teclado vai para o programa
 /// (Ctrl+Shift+C/V copiam e colam, Shift+PageUp/PageDown rolam o histórico).
 pub fn terminal(t: &Terminal) -> TerminalView<'_> {
-    TerminalView { term: t, size: 13.0, font: Font::MONO, text_color: None, background: None, palette: None, padding: 6.0 }
+    TerminalView { term: t, size: 13.0, font: Font::MONO, text_color: None, background: None, palette: None, padding: 6.0, id: None }
 }
 
 impl TerminalView<'_> {
@@ -301,6 +307,11 @@ impl TerminalView<'_> {
     }
     pub fn padding(mut self, p: f32) -> Self {
         self.padding = p;
+        self
+    }
+    /// O nome para [`crate::Task::focus`] (levar o teclado ao terminal sem clicar).
+    pub fn id(mut self, id: impl std::hash::Hash) -> Self {
+        self.id = Some(crate::id_hash(&id));
         self
     }
 
@@ -337,6 +348,9 @@ impl<M> Widget<M> for TerminalView<'_> {
         (Length::FILL, Length::FILL)
     }
     fn layout(&self, cx: &mut LayoutCx, l: Limits) -> Node {
+        if let Some(id) = self.id {
+            cx.states.ids.borrow_mut().insert(id, cx.key());
+        }
         Node::leaf(cx.key(), l.fill(Size::new(400.0, 300.0)))
     }
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
