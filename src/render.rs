@@ -4,6 +4,7 @@ use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCach
 use std::collections::HashMap;
 use std::sync::Arc;
 pub(crate) mod vetor;
+pub(crate) mod gpu;
 use tiny_skia::{FillRule, FilterQuality, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, SpreadMode, Transform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,6 +150,8 @@ struct Clip {
     cantos: Vec<Canto>,
     /// Feita só quando um desenho pode sair do recorte; vale até o `pop_clip`.
     mask: Option<Mask>,
+    /// O mesmo recorte para a GPU (veja [`gpu::SEM_RECORTE`]).
+    gpu: [f32; 12],
 }
 
 /// O quadrado de um canto arredondado e o centro do arco dele (lógicos).
@@ -220,7 +223,9 @@ pub struct Renderer {
     proprios: Cache<u64, Buffer>,
     /// Quantas de [`load_font`] já estão no banco.
     fontes_carregadas: usize,
-    svgs: Cache<SvgKey, Pixmap>,
+    /// [`crate::Settings::text_cache`]: os textos ficam de um quadro para o outro.
+    pub(crate) cache_textos: bool,
+    svgs: Cache<SvgKey, Arc<Pixmap>>,
     shadows: Cache<ShadowKey, Pixmap>,
     imagens: Cache<(u64, u32, u32), Pixmap>,
     clips: Vec<Clip>,
@@ -245,6 +250,13 @@ pub struct Renderer {
     camadas: Vec<Camada>,
     /// As de [`Renderer::push_transform`], já compostas.
     transformacoes: Vec<vetor::Transform>,
+    /// Pintando para a GPU ([`Renderer::begin_gpu`]): os desenhos vão para a lista, não para o `pixmap`.
+    pintando_gpu: bool,
+    pub(crate) gpu: gpu::Lista,
+    /// O primeiro desenho do quadro que a GPU ainda não sabe fazer: aí o quadro todo sai na CPU.
+    pub(crate) falta_gpu: Option<&'static str>,
+    /// O tamanho (pixels) do último quadro desta janela: na GPU o `pixmap` fica para trás.
+    tela: (u32, u32),
 }
 
 /// O que um quadro deixa para o próximo. Com várias janelas, cada uma guarda o seu e troca com
@@ -255,11 +267,12 @@ pub(crate) struct Quadro {
     anterior: Vec<(Rect, u64)>,
     vidros: Vec<(Rect, f32)>,
     mudou: Option<(u32, u32)>,
+    tela: (u32, u32),
 }
 
 impl Default for Quadro {
     fn default() -> Self {
-        Quadro { pixmap: Pixmap::new(1, 1).expect("1x1"), scale: 1.0, anterior: Vec::new(), vidros: Vec::new(), mudou: None }
+        Quadro { pixmap: Pixmap::new(1, 1).expect("1x1"), scale: 1.0, anterior: Vec::new(), vidros: Vec::new(), mudou: None, tela: (1, 1) }
     }
 }
 
@@ -316,6 +329,7 @@ impl Renderer {
             texts: Cache::default(),
             proprios: Cache::default(),
             fontes_carregadas: 0,
+            cache_textos: false,
             svgs: Cache::default(),
             shadows: Cache::default(),
             imagens: Cache::default(),
@@ -332,6 +346,10 @@ impl Renderer {
             opacidades: Vec::new(),
             camadas: Vec::new(),
             transformacoes: Vec::new(),
+            pintando_gpu: false,
+            gpu: gpu::Lista::default(),
+            falta_gpu: None,
+            tela: (1, 1),
         }
     }
 
@@ -340,22 +358,49 @@ impl Renderer {
         self.end();
         // Antes do layout: medir já com a fonte nova.
         self.carregar_fontes();
+        // A janela troca no começo e no fim de cada quadro: cada quadro é uma geração, cheio ou
+        // parcial. Senão, rolando (só quadros parciais), tudo parecia do quadro atual e o cache
+        // de textos crescia sem fim.
+        let manter = if self.cache_textos { 8 } else { 0 };
+        self.texts.esquecer_velhos(manter);
+        self.proprios.esquecer_velhos(manter);
+        self.texts.geracao += 1;
+        self.proprios.geracao += 1;
+        self.svgs.geracao += 1;
+        self.shadows.geracao += 1;
+        self.imagens.geracao += 1;
         std::mem::swap(&mut self.pixmap, &mut q.pixmap);
         std::mem::swap(&mut self.anterior, &mut q.anterior);
         std::mem::swap(&mut self.vidros, &mut q.vidros);
         std::mem::swap(&mut self.mudou, &mut q.mudou);
+        std::mem::swap(&mut self.tela, &mut q.tela);
         // A escala vale do quadro: trocar não limpa os caches (o `begin` limpa se mudar de verdade).
         std::mem::swap(&mut self.scale, &mut q.scale);
     }
 
     /// Prepara um quadro novo de `size` lógico na escala `scale`, limpo com `fundo`.
     pub fn begin(&mut self, size: Size, scale: f32, fundo: Color) {
-        self.end();
-        self.carregar_fontes();
-        let (w, h) = (((size.width * scale).round() as u32).max(1), ((size.height * scale).round() as u32).max(1));
+        let (w, h) = self.preparar(size, scale);
         if self.pixmap.width() != w || self.pixmap.height() != h {
             self.pixmap = Pixmap::new(w, h).expect("tamanho válido");
         }
+        self.pixmap.fill(skia_color(fundo));
+    }
+
+    /// Como o [`begin`](Self::begin), mas os desenhos vão para a lista da GPU ([`gpu::Lista`]),
+    /// que a janela entrega ao [`gpu::Pintor`]. O `pixmap` não muda.
+    pub(crate) fn begin_gpu(&mut self, size: Size, scale: f32, fundo: Color) {
+        let (w, h) = self.preparar(size, scale);
+        self.gpu.limpar(w, h, fundo);
+        self.pintando_gpu = true;
+    }
+
+    /// O comum aos quadros cheios: caches, escala, recortes. Devolve o tamanho em pixels.
+    fn preparar(&mut self, size: Size, scale: f32) -> (u32, u32) {
+        self.end();
+        self.carregar_fontes();
+        let (w, h) = (((size.width * scale).round() as u32).max(1), ((size.height * scale).round() as u32).max(1));
+        self.tela = (w, h);
         if self.scale != scale {
             self.texts.clear();
             self.proprios.clear();
@@ -377,7 +422,7 @@ impl Renderer {
         self.vidros.clear();
         self.mudou = None;
         self.sem_opacidade();
-        self.pixmap.fill(skia_color(fundo));
+        (w, h)
     }
 
     /// Redesenha só `sujo` (lógico) sobre o quadro anterior: tudo que for desenhado até o
@@ -412,6 +457,7 @@ impl Renderer {
 
     /// Fecha um quadro parcial, colando a região no quadro cheio (sem efeito num quadro cheio).
     pub fn end(&mut self) {
+        self.pintando_gpu = false;
         // Uma camada esquecida aberta ainda tem o pixmap de fora guardado.
         while !self.camadas.is_empty() {
             self.pop_layer();
@@ -435,14 +481,34 @@ impl Renderer {
 
     /// Tamanho lógico da janela inteira (mesmo durante um quadro parcial).
     pub fn window_size(&self) -> Size {
-        let camada = self.camadas.first().and_then(|c| c.fora.as_ref()).map(|f| &f.pixmap);
-        let p = self.parcial.as_ref().map(|p| &p.cheio).or(camada).unwrap_or(&self.pixmap);
-        Size::new(p.width() as f32 / self.scale, p.height() as f32 / self.scale)
+        Size::new(self.tela.0 as f32 / self.scale, self.tela.1 as f32 / self.scale)
     }
 
     /// As linhas que o último quadro mudou (`None` = o quadro todo): só elas precisam subir para a GPU.
     pub fn changed_rows(&self) -> Option<(u32, u32)> {
         self.mudou
+    }
+
+    /// Para achar onde a RAM vai (`PELICANO_MEMORIA=1`): o tamanho de cada cache e do quadro.
+    pub(crate) fn memoria(&self) -> String {
+        let mib = |b: usize| b as f64 / 1048576.0;
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        let heap = {
+            #[repr(C)]
+            struct Mallinfo2 { arena: usize, ordblks: usize, smblks: usize, hblks: usize, hblkhd: usize, usmblks: usize, fsmblks: usize, uordblks: usize, fordblks: usize, keepcost: usize }
+            extern "C" {
+                fn mallinfo2() -> Mallinfo2;
+            }
+            // SAFETY: função do glibc sem pré-condições.
+            let m = unsafe { mallinfo2() };
+            format!("heap em uso {:.1} MiB, livre guardado {:.1} MiB, mmap {:.1} MiB · ", mib(m.uordblks), mib(m.fordblks), mib(m.hblkhd))
+        };
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        let heap = String::new();
+        format!("{heap}quadro {:.1} MiB · textos {} + {} · svgs {} ({:.1} MiB) · sombras {} ({:.1} MiB) · imagens {} ({:.1} MiB) · glifos {} · fontes {}",
+            mib(self.pixmap.data().len()), self.texts.mapa.len(), self.proprios.mapa.len(),
+            self.svgs.mapa.len(), mib(self.svgs.bytes()), self.shadows.mapa.len(), mib(self.shadows.bytes()),
+            self.imagens.mapa.len(), mib(self.imagens.bytes()), self.swash.image_cache.len(), self.fonts.db().len())
     }
 
     /// Começa a gravar o quadro: até o [`changes`](Self::changes), cada desenho só anota a
@@ -455,7 +521,13 @@ impl Renderer {
         self.lista.clear();
         self.vidros.clear();
         self.clips.clear();
+        self.falta_gpu = None;
         self.sem_opacidade();
+    }
+
+    /// Este quadro tem um desenho que a GPU ainda não faz: sai todo na CPU.
+    fn falta(&mut self, motivo: &'static str) {
+        self.falta_gpu.get_or_insert(motivo);
     }
 
     fn sem_opacidade(&mut self) {
@@ -480,6 +552,7 @@ impl Renderer {
     /// do centro de `area`, com opacidade `opacity` (o `transform` e o `opacity` do CSS, para o grupo).
     /// shortcut: um vidro dentro da camada não vê o que está atrás dela (desfoca transparente).
     pub fn push_layer(&mut self, area: Rect, scale: f32, rotate: f32, opacity: f32) {
+        self.falta("camada");
         let (sen, cos) = rotate.to_radians().sin_cos();
         let (hw, hh) = (area.width * scale / 2.0, area.height * scale / 2.0);
         let (bw, bh) = (hw * cos.abs() + hh * sen.abs(), hw * sen.abs() + hh * cos.abs());
@@ -659,6 +732,13 @@ impl Renderer {
         let b = self.texts.get(&key).expect("criado pelo buffer");
         let at = Point::new(at.x - self.origem.x, at.y - self.origem.y);
         let color = color.alpha(color.a * self.opacidade);
+        if self.pintando_gpu {
+            let rec = self.clips.last().map_or(gpu::SEM_RECORTE, |c| c.gpu);
+            if !gpu::glifos(&mut self.gpu, b, &mut self.fonts, &mut self.swash, &rec, self.scale, at, color, self.opacidade) {
+                self.falta("atlas de glifos cheio");
+            }
+            return;
+        }
         pintar_glifos(b, &mut self.fonts, &mut self.swash, &mut self.pixmap, &mut self.clips, self.scale, at, color, self.opacidade);
     }
 
@@ -680,6 +760,13 @@ impl Renderer {
         let at = Point::new(at.x - self.origem.x, at.y - self.origem.y);
         let color = self.esmaecer(color);
         let Some(b) = self.proprios.get(&(chave ^ self.scale.to_bits() as u64)) else { return };
+        if self.pintando_gpu {
+            let rec = self.clips.last().map_or(gpu::SEM_RECORTE, |c| c.gpu);
+            if !gpu::glifos(&mut self.gpu, b, &mut self.fonts, &mut self.swash, &rec, self.scale, at, color, self.opacidade) {
+                self.falta("atlas de glifos cheio");
+            }
+            return;
+        }
         pintar_glifos(b, &mut self.fonts, &mut self.swash, &mut self.pixmap, &mut self.clips, self.scale, at, color, self.opacidade);
     }
 
@@ -714,6 +801,13 @@ impl Renderer {
         }
         let at = Point::new(at.x - self.origem.x, at.y - self.origem.y);
         let color = self.esmaecer(color);
+        if self.pintando_gpu {
+            let rec = self.clips.last().map_or(gpu::SEM_RECORTE, |c| c.gpu);
+            if !gpu::glifos(&mut self.gpu, b, &mut self.fonts, &mut self.swash, &rec, self.scale, at, color, self.opacidade) {
+                self.falta("atlas de glifos cheio");
+            }
+            return;
+        }
         pintar_glifos(b, &mut self.fonts, &mut self.swash, &mut self.pixmap, &mut self.clips, self.scale, at, color, self.opacidade);
     }
 }
@@ -768,6 +862,9 @@ fn pintar_glifos(b: &Buffer, fonts: &mut FontSystem, swash: &mut SwashCache, pix
 impl Renderer {
     /// Retângulo com fundo, borda e sombra; o raio vale para os três.
     pub fn fill_quad(&mut self, r: Rect, bg: Option<&Background>, border: Border, shadow: Option<Shadow>) {
+        if matches!(bg, Some(Background::Linear { stops, .. }) if stops.len() > 4) {
+            self.falta("degradê com mais de 4 paradas");
+        }
         if self.gravando {
             let mut k = Chave::new(2);
             k.r(r).borda(border);
@@ -789,6 +886,9 @@ impl Renderer {
             }
             self.gravou(area, k);
             return;
+        }
+        if self.pintando_gpu {
+            return self.quad_gpu(r, bg, border, shadow);
         }
         let r = self.local(r);
         let s = self.scale;
@@ -943,10 +1043,18 @@ impl Renderer {
         if !self.transformacoes.last().is_none_or(|t| t.is_identity()) {
             return self.imagem_transformada(img, r, FilterQuality::Bilinear);
         }
+        if img.0.width().max(img.0.height()) > self.gpu.max_textura {
+            self.falta("imagem maior que a textura");
+        }
         let mut k = Chave::new(3);
         k.h(img.1).r(r).h(radius.map(f32::to_bits));
         if self.gravou(r, k) {
             return;
+        }
+        if self.pintando_gpu {
+            let s = self.scale;
+            let (x, y, w, h) = ((r.x * s).round(), (r.y * s).round(), (r.width * s).round(), (r.height * s).round());
+            return self.imagem_gpu(img.1, &img.0, [x, y, w, h], radius.map(|v| v * s));
         }
         let tela = r;
         let r = self.local(r);
@@ -982,6 +1090,7 @@ impl Renderer {
 
     /// A imagem esticada em `r` pela transformação inteira (a do usuário, a escala, a camada).
     fn imagem_transformada(&mut self, img: &Image, r: Rect, filtro: FilterQuality) {
+        self.falta("imagem transformada ou sem suavizar");
         if self.gravando {
             let mut k = Chave::new(12);
             k.h(img.1).r(r).h(matches!(filtro, FilterQuality::Nearest));
@@ -1005,13 +1114,16 @@ impl Renderer {
 
     /// SVG em `r`; com `color`, troca a cor de tudo mantendo o alfa (ícones de um traço só).
     pub fn draw_svg(&mut self, svg: &Svg, r: Rect, color: Option<Color>) {
+        let s = self.scale;
+        if (r.width * s).round() as u64 * (r.height * s).round() as u64 > 1 << 22 {
+            self.falta("svg maior que 2048²");
+        }
         let mut k = Chave::new(4);
         k.h(svg.1).r(r).h(color.map(|c| [c.r, c.g, c.b, c.a].map(f32::to_bits)));
         if self.gravou(r, k) {
             return;
         }
         let r = self.local(r);
-        let s = self.scale;
         let (w, h) = ((r.width * s).round() as u32, (r.height * s).round() as u32);
         if w == 0 || h == 0 {
             return;
@@ -1035,14 +1147,21 @@ impl Renderer {
         let parte;
         let (pm, x, y) = if w as u64 * h as u64 <= 1 << 22 {
             let key = SvgKey { tree: svg.1, w, h, color: cor };
+            // A mesma chave da textura: o bit de cima não deixa colidir com o número de uma imagem.
+            let id = { let mut hs = std::collections::hash_map::DefaultHasher::new(); key.hash(&mut hs); hs.finish() | 1 << 63 };
             self.svgs.aparar(self.svgs.len() > 512 || self.svgs.bytes() > 64 << 20);
-            (&*self.svgs.pegar(key, || rasterizar(w, h, escala).expect("tamanho > 0")), x, y)
+            let pm = self.svgs.pegar(key, || Arc::new(rasterizar(w, h, escala).expect("tamanho > 0")));
+            if self.pintando_gpu {
+                let pm = pm.clone();
+                return self.imagem_gpu(id, &pm, [x as f32, y as f32, w as f32, h as f32], [0.0; 4]);
+            }
+            (&**pm, x, y)
         } else {
             // Maior que 2048² (zoom): só a parte que cai no pixmap, sem cache.
             let (x0, y0) = (x.max(0), y.max(0));
             let x1 = (x as i64 + w as i64).min(self.pixmap.width() as i64) as i32;
             let y1 = (y as i64 + h as i64).min(self.pixmap.height() as i64) as i32;
-            if x1 <= x0 || y1 <= y0 {
+            if x1 <= x0 || y1 <= y0 || self.pintando_gpu {
                 return;
             }
             let Some(p) = rasterizar((x1 - x0) as u32, (y1 - y0) as u32, escala.post_translate((x - x0) as f32, (y - y0) as f32)) else { return };
@@ -1059,6 +1178,9 @@ impl Renderer {
 
     /// Linha passando pelos `pontos`, com pontas e junções redondas.
     pub fn stroke(&mut self, pontos: &[Point], largura: f32, cor: Color) {
+        if cor.a * self.opacidade < 1.0 && pontos.len() > 2 {
+            self.falta("traço translúcido");
+        }
         if self.gravando {
             let mut k = Chave::new(5);
             k.f(largura).c(cor);
@@ -1071,6 +1193,10 @@ impl Renderer {
                 self.gravou(crescer(Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }, largura / 2.0), k);
             }
             return;
+        }
+        if self.pintando_gpu {
+            let cor = self.esmaecer(cor);
+            return self.traco_gpu(pontos.windows(2).map(|w| (w[0], w[1])), largura, cor);
         }
         let s = self.scale;
         let mut pb = PathBuilder::new();
@@ -1095,6 +1221,7 @@ impl Renderer {
 
     /// Desfoca o que já está desenhado em `r` (vidro), respeitando os cantos.
     pub fn blur(&mut self, r: Rect, raio: f32, cantos: [f32; 4]) {
+        self.falta("vidro");
         // Num quadro parcial os vidros já vêm da gravação (e servem às outras regiões).
         if self.parcial.is_none() {
             self.vidros.push((r, raio));
@@ -1149,7 +1276,8 @@ impl Renderer {
                 cantos.push(Canto { quadrado: Rect { x, y, width: k, height: k }, centro: Point::new(cx, cy), raio: k });
             }
         }
-        self.clips.push(Clip { rect, own: r, radius, rounded: !cantos.is_empty(), cantos, mask: None });
+        let gpu = gpu::recorte(self.clips.last().map_or(&gpu::SEM_RECORTE, |c| &c.gpu), rect, r, radius, self.scale);
+        self.clips.push(Clip { rect, own: r, radius, rounded: !cantos.is_empty(), cantos, mask: None, gpu });
     }
 
     pub fn pop_clip(&mut self) {
@@ -1176,8 +1304,8 @@ impl Default for Renderer {
 }
 
 /// Média móvel de largura `2k+1` numa direção, com a borda repetida.
-/// Um cache que lembra em que geração cada item foi usado; `virar` (a cada quadro cheio)
-/// esquece o que ficou sem uso desde o anterior.
+/// Um cache que lembra em que geração (quadro) cada item foi usado; `virar` (a cada quadro
+/// cheio, ou quando passa do limite) esquece o que ficou sem uso nela.
 struct Cache<K, V> {
     mapa: HashMap<K, (V, u64)>,
     geracao: u64,
@@ -1207,6 +1335,12 @@ impl<K: Hash + Eq, V> Cache<K, V> {
     fn clear(&mut self) {
         self.mapa.clear();
     }
+    /// Fora o que ficou `manter` gerações sem uso (2 trocas por quadro: 8 = 4 quadros, com folga
+    /// para outra janela desenhando no meio; 0 = só o quadro atual): a RAM não sobe e desce.
+    fn esquecer_velhos(&mut self, manter: u64) {
+        let g = self.geracao;
+        self.mapa.retain(|_, e| e.1 + manter >= g);
+    }
     fn virar(&mut self) {
         let g = self.geracao;
         self.mapa.retain(|_, e| e.1 == g);
@@ -1222,11 +1356,13 @@ impl<K: Hash + Eq, V> Cache<K, V> {
     }
 }
 
-impl<K> Cache<K, Pixmap> {
+impl<K, P: Borrow<Pixmap>> Cache<K, P> {
     fn bytes(&self) -> usize {
-        self.mapa.values().map(|e| e.0.data().len()).sum()
+        self.mapa.values().map(|e| e.0.borrow().data().len()).sum()
     }
 }
+
+use std::borrow::Borrow;
 
 /// O glibc guarda a memória dos pixmaps soltos para reusar, e o processo segue com ela:
 /// depois de largar vários MB, devolve ao sistema.
@@ -1674,6 +1810,29 @@ mod tests {
         assert!(r.imagens.len() <= 2, "{} imagens", r.imagens.len());
         assert!(r.texts.len() <= 2, "{} textos", r.texts.len());
         assert!(r.shadows.len() <= 2, "{} sombras", r.shadows.len());
+    }
+
+    #[test]
+    fn rolar_so_com_quadros_parciais_nao_acumula_textos() {
+        // Como a janela: troca, quadro parcial, troca. Cada quadro mede um texto novo (uma linha
+        // que entrou rolando); antes o cache passava de 9000 e seguia.
+        for (cache, max) in [(false, 1), (true, 5)] {
+            let mut r = Renderer { cache_textos: cache, ..Renderer::new() };
+            let mut q = Quadro::default();
+            let tela = Size::new(100.0, 100.0);
+            r.trocar(&mut q);
+            r.begin(tela, 1.0, Color::BLACK);
+            r.trocar(&mut q);
+            for i in 0..9000 {
+                r.trocar(&mut q);
+                r.measure(&format!("linha {i}"), 12.0, Font::DEFAULT, None);
+                r.measure(&format!("linha {i}"), 12.0, Font::DEFAULT, None);
+                assert!(r.begin_parcial(tela, 1.0, Color::BLACK, Rect::new(Point::ORIGIN, Size::new(10.0, 10.0))));
+                r.end();
+                r.trocar(&mut q);
+            }
+            assert!(r.texts.len() <= max, "cache {cache}: {} textos", r.texts.len());
+        }
     }
 
     #[test]

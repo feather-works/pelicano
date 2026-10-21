@@ -36,6 +36,8 @@ pub use futures;
 pub use winit::raw_window_handle;
 pub use render::vetor::{FillRule, LineCap, LineJoin, Path, PathBuilder, Segment, Stroke, Transform};
 pub use render::{load_font, Changes, Font, Image, Renderer, Svg};
+#[doc(hidden)]
+pub use render::gpu::GpuOffscreen;
 pub use controls::*;
 pub use editor::{is_invisible, text_editor, Content, TextEditor};
 pub use pickers::*;

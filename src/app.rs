@@ -1,7 +1,7 @@
 //! A janela, o laço de eventos, as tarefas assíncronas e a apresentação do quadro.
 use crate::access::{accesskit, Access};
 use crate::widget::{self, CursorIcon, Element, EventCx};
-use crate::render::Quadro;
+use crate::render::{gpu, Quadro};
 use crate::{Changes, Color, Event, Modifiers, Point, Renderer, ResizeDirection, Size, States, Theme};
 use futures::future::{AbortHandle, Abortable, BoxFuture};
 use futures::stream::BoxStream;
@@ -97,11 +97,19 @@ pub struct Settings {
     pub start_hidden: bool,
     /// Libera o inspetor de layout no F12. Desligado por padrão; `PELICANO_DEBUG=1` também libera (e já abre ligado).
     pub debug: bool,
+    /// Guarda o texto já preparado de um quadro para o outro (só o da tela, 4 quadros). Rolar
+    /// fica ~2× mais rápido, com um pouco mais de RAM. Desligado (padrão), o texto é reaproveitado
+    /// só dentro do quadro.
+    pub text_cache: bool,
+    /// Desenha na GPU (o padrão). Sem placa de vídeo de verdade (só um rasterizador em software,
+    /// como o llvmpipe), ou com `PELICANO_GPU=0`, desenha na CPU; `PELICANO_GPU=1` força a GPU.
+    /// O quadro com algo que a GPU ainda não faz (camada, vidro, curva) sai na CPU sozinho.
+    pub gpu: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { title: "Pelicano".into(), size: Size::new(1024.0, 720.0), min_size: None, decorations: true, transparent: false, blur: false, resizable: true, close_on_request: true, app_id: None, icon: None, position: None, skip_taskbar: false, x11: false, run_in_background: false, start_hidden: false, debug: false }
+        Settings { title: "Pelicano".into(), size: Size::new(1024.0, 720.0), min_size: None, decorations: true, transparent: false, blur: false, resizable: true, close_on_request: true, app_id: None, icon: None, position: None, skip_taskbar: false, x11: false, run_in_background: false, start_hidden: false, debug: false, text_cache: false, gpu: true }
     }
 }
 
@@ -383,7 +391,9 @@ pub fn run<A: App>(settings: Settings, init: impl FnOnce() -> (A, Task<A::Msg>))
     };
     let tokio = tokio::runtime::Builder::new_multi_thread().thread_name("pelicano").enable_all().build().map_err(|e| Error::Window(e.to_string()))?;
     let (app, task) = init();
-    let mut rt = Runtime { app, settings, proxy: event_loop.create_proxy(), tokio: tokio.handle().clone(), assinaturas: HashMap::new(), clipboard: Box::new(widget::MemoryClipboard::default()), janelas: Vec::new(), gpu: None, renderer: Renderer::new(), modifiers: Modifiers::empty(), abrir: Vec::new(), pendentes: Vec::new(), alcas: Vec::new(), erro: None, sair: false, iniciou: false, inspecionar: false, intervalo: None };
+    let mut renderer = Renderer::new();
+    renderer.cache_textos = settings.text_cache;
+    let mut rt = Runtime { app, settings, proxy: event_loop.create_proxy(), tokio: tokio.handle().clone(), assinaturas: HashMap::new(), clipboard: Box::new(widget::MemoryClipboard::default()), janelas: Vec::new(), gpu: None, renderer, modifiers: Modifiers::empty(), abrir: Vec::new(), pendentes: Vec::new(), alcas: Vec::new(), erro: None, sair: false, iniciou: false, inspecionar: false, intervalo: None, avisados: Default::default() };
     if std::env::var_os("PELICANO_DEBUG").is_some_and(|v| v != "0") {
         rt.settings.debug = true;
         rt.inspecionar = true;
@@ -427,6 +437,8 @@ struct Runtime<A: App> {
     inspecionar: bool,
     /// Um quadro do monitor (perguntar a cada evento custa caro); some quando a janela muda de tela.
     intervalo: Option<std::time::Duration>,
+    /// Os motivos de quadro na CPU já contados no `PELICANO_DANO` (um aviso por motivo).
+    avisados: std::collections::HashSet<&'static str>,
 }
 
 /// Cada janela aberta: o que é dela e não pode ser dividido.
@@ -442,6 +454,9 @@ struct Janela {
     fechar_ao_pedir: bool,
     /// O próximo quadro precisa ser inteiro (janela nova, resize, quadro perdido).
     tudo: bool,
+    /// O último quadro saiu na GPU: o `pixmap` desta janela ficou para trás, e um quadro na CPU
+    /// precisa ser inteiro.
+    na_gpu: bool,
     /// Um movimento do mouse ainda não entregue: chegam até 1000 por segundo, entregamos no
     /// máximo um por quadro do monitor (o último).
     mover: bool,
@@ -452,6 +467,9 @@ struct Janela {
     /// monta a árvore de novo: sem somar, a rolagem ficava atrás do dedo (a barra, que vem pelo
     /// `mover`, já era uma por quadro).
     roda: Option<Event>,
+    /// O que falta andar dos cliques da roda do mouse: vai aos pedaços, um por quadro, para a
+    /// rolagem deslizar em vez de pular 48 px de uma vez.
+    roda_suave: Option<Event>,
     acesso: accesskit_winit::Adapter,
     /// Um leitor de tela pediu a árvore: cada quadro manda a dele (se mudou).
     leitor: bool,
@@ -627,7 +645,8 @@ impl<A: App> Runtime<A> {
             };
             let tela = match &self.gpu {
                 Some(g) => g.tela(w.clone(), s.transparent),
-                None => Gpu::new(w.clone(), s.transparent).map(|(g, t)| {
+                None => Gpu::new(w.clone(), s.transparent, s.gpu).map(|(g, t)| {
+                    self.renderer.gpu.max_textura = g.device.limits().max_texture_dimension_2d;
                     self.gpu = Some(g);
                     t
                 }),
@@ -657,7 +676,7 @@ impl<A: App> Runtime<A> {
             }
             w.set_visible(true);
             w.request_redraw();
-            self.janelas.push(Janela { id, w, tela, quadro: Quadro::default(), states: States::default(), cursor: None, icon: CursorIcon::Default, transparente: s.transparent, fechar_ao_pedir: s.close_on_request, tudo: true, mover: false, ultimo_mover: std::time::Instant::now(), proximo: None, roda: None, acesso, leitor: false, arvore: None, dedo: None });
+            self.janelas.push(Janela { id, w, tela, quadro: Quadro::default(), states: States::default(), cursor: None, icon: CursorIcon::Default, transparente: s.transparent, fechar_ao_pedir: s.close_on_request, tudo: true, na_gpu: false, mover: false, ultimo_mover: std::time::Instant::now(), proximo: None, roda: None, roda_suave: None, acesso, leitor: false, arvore: None, dedo: None });
             let escala = self.janelas.last().map_or(1.0, |j| j.w.scale_factor() as f32);
             let m: Vec<_> = self.app.on_window_event(id, &Event::ScaleChanged(escala)).into_iter().collect();
             self.update(m);
@@ -829,7 +848,29 @@ impl<A: App> Runtime<A> {
             Changes::All => None,
             Changes::Regions(r) => Some(r),
         };
-        let parcial = regioes.as_ref().is_some_and(|rs| rs.iter().all(|r| self.renderer.begin_parcial(size, escala, fundo, *r) && {
+        let nada = regioes.as_ref().is_some_and(|r| r.is_empty());
+        // Na GPU o quadro sai inteiro; o que ela ainda não faz cai na CPU (inteiro logo depois de
+        // um quadro da GPU, que deixou o `pixmap` para trás).
+        let gpu = self.gpu.as_ref().is_some_and(|g| g.pintor.is_some());
+        let mut na_gpu = false;
+        if gpu && !nada {
+            if self.renderer.falta_gpu.is_none() {
+                self.renderer.begin_gpu(size, escala, fundo);
+                pintar(&mut self.renderer);
+                self.renderer.end();
+            }
+            na_gpu = self.renderer.falta_gpu.is_none();
+            if let Some(m) = self.renderer.falta_gpu.filter(|_| dano) {
+                if self.avisados.insert(m) {
+                    eprintln!("[gpu] quadro na CPU: {m}");
+                }
+            }
+        }
+        let regioes = if j.na_gpu { regioes.filter(|r| r.is_empty()) } else { regioes };
+        if !nada {
+            j.na_gpu = na_gpu;
+        }
+        let parcial = na_gpu || regioes.as_ref().is_some_and(|rs| rs.iter().all(|r| self.renderer.begin_parcial(size, escala, fundo, *r) && {
             pintar(&mut self.renderer);
             self.renderer.end();
             true
@@ -856,15 +897,24 @@ impl<A: App> Runtime<A> {
         }
         // Quadro perdido (superfície velha no meio do resize): pede outro, senão a janela
         // fica com o conteúdo antigo até o próximo evento.
-        let nada = parcial && regioes.is_some_and(|r| r.is_empty());
         let t4 = t0.elapsed();
-        if !nada && self.gpu.as_ref().is_some_and(|g| !j.tela.present(g, &self.renderer.pixmap, self.renderer.changed_rows())) {
+        let foi = match self.gpu.as_mut() {
+            _ if nada => true,
+            Some(g) if na_gpu => j.tela.present_gpu(g, &mut self.renderer.gpu),
+            Some(g) => j.tela.present(g, &self.renderer.pixmap, self.renderer.changed_rows()),
+            None => true,
+        };
+        if !foi {
             j.tudo = true;
             w.request_redraw();
         }
         // Os tempos acumulados de cada etapa do quadro (para achar o gargalo).
         if let Some(tipo) = tipo {
-            eprintln!("[quadro] {size:?} view {t1:.1?} layout {t2:.1?} gravar {t3:.1?} pintar {t4:.1?} tela {:.1?} {tipo}", t0.elapsed());
+            let onde = if na_gpu { " gpu" } else { "" };
+            eprintln!("[quadro] {size:?} view {t1:.1?} layout {t2:.1?} gravar {t3:.1?} pintar {t4:.1?} tela {:.1?} {tipo}{onde}", t0.elapsed());
+        }
+        if std::env::var_os("PELICANO_MEMORIA").is_some() {
+            eprintln!("[memória] {}", self.renderer.memoria());
         }
         self.renderer.trocar(&mut j.quadro);
     }
@@ -934,7 +984,7 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
                 None => {}
             }
         }
-        if !self.janelas.iter().any(|j| j.mover || j.roda.is_some()) {
+        if !self.janelas.iter().any(|j| j.mover || j.roda.is_some() || j.roda_suave.is_some()) {
             return el.set_control_flow(prox.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
         }
         let janela = self.janelas.first().map(|j| j.w.clone());
@@ -945,11 +995,16 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
         // Pelos ids: entregar pode fechar janelas.
         let ids: Vec<_> = self.janelas.iter().map(|j| j.id).collect();
         for id in ids {
-            let Some(j) = self.indice(id).map(|i| &self.janelas[i]) else { continue };
+            let Some(j) = self.indice(id).map(|i| &mut self.janelas[i]) else { continue };
             // Mouse e roda: no máximo uma entrega por quadro; o resto soma até lá.
-            if j.mover || j.roda.is_some() {
+            if j.mover || j.roda.is_some() || j.roda_suave.is_some() {
                 match esperar_entrega(j.ultimo_mover, intervalo, agora) {
                     None => {
+                        if let Some(f) = fatia_roda(&mut j.roda_suave) {
+                            if let Some(antes) = juntar_roda(&mut j.roda, f) {
+                                j.roda_suave = j.roda.replace(antes);
+                            }
+                        }
                         self.entregar_mover(id);
                         self.entregar_roda(id);
                     }
@@ -1034,6 +1089,19 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
             }),
             WindowEvent::MouseWheel { delta, .. } => {
                 let ev = match delta {
+                    // Clique de mouse sem Ctrl/Alt (que costumam ser zoom, um passo por clique): desliza.
+                    MouseScrollDelta::LineDelta(x, y) if (self.modifiers - crate::Modifiers::SHIFT).is_empty() => {
+                        let ev = Event::Wheel { dx: x * 48.0, dy: y * 48.0, modifiers: self.modifiers };
+                        if let Some(antes) = juntar_roda(&mut j.roda_suave, ev) {
+                            // Shift mudou no meio: o resto da anterior vai de uma vez.
+                            let nova = j.roda_suave.replace(antes);
+                            if let Some(antes) = juntar_roda(&mut j.roda, j.roda_suave.take().unwrap()) {
+                                j.roda = Some(antes);
+                            }
+                            j.roda_suave = nova;
+                        }
+                        return;
+                    }
                     MouseScrollDelta::LineDelta(x, y) => Event::Wheel { dx: x * 48.0, dy: y * 48.0, modifiers: self.modifiers },
                     MouseScrollDelta::PixelDelta(p) => Event::Wheel { dx: (p.x / escala) as f32, dy: (p.y / escala) as f32, modifiers: self.modifiers },
                 };
@@ -1103,6 +1171,19 @@ fn pedido_do_leitor(a: accesskit::Action) -> Option<Pedido> {
 fn esperar_entrega(ultimo: std::time::Instant, intervalo: std::time::Duration, agora: std::time::Instant) -> Option<std::time::Instant> {
     let quando = ultimo + intervalo;
     (agora < quando).then_some(quando)
+}
+
+/// O pedaço da roda que anda neste quadro: 40% do que falta (uns 100 ms até parar a 60 Hz),
+/// ou tudo quando falta menos de meio pixel.
+fn fatia_roda(resto: &mut Option<Event>) -> Option<Event> {
+    let Some(Event::Wheel { dx, dy, modifiers }) = resto.as_mut() else { return resto.take() };
+    if dx.abs() < 0.5 && dy.abs() < 0.5 {
+        return resto.take();
+    }
+    let (fx, fy) = (*dx * 0.4, *dy * 0.4);
+    *dx -= fx;
+    *dy -= fy;
+    Some(Event::Wheel { dx: fx, dy: fy, modifiers: *modifiers })
 }
 
 /// Soma a roda `nova` à que espera entrega. Com outros modificadores não dá para somar: devolve a
@@ -1177,6 +1258,8 @@ struct Gpu {
     format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
+    /// O desenho na GPU; `None` = na CPU ([`Settings::gpu`]).
+    pintor: Option<gpu::Pintor>,
 }
 
 struct Tela {
@@ -1201,15 +1284,30 @@ const SHADER: &str = r#"
 
 impl Gpu {
     /// O aparelho, escolhido para a primeira janela, e a tela dela.
-    fn new(w: Arc<Window>, transparente: bool) -> Result<(Self, Tela), String> {
+    fn new(w: Arc<Window>, transparente: bool, pintar: bool) -> Result<(Self, Tela), String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(w.clone()).map_err(|e| e.to_string())?;
-        let adapter = futures::executor::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { compatible_surface: Some(&surface), ..Default::default() })).ok_or("nenhum adaptador gráfico")?;
-        let (device, queue) = futures::executor::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()) },
-            None,
-        ))
-        .map_err(|e| e.to_string())?;
+        // A placa dedicada, se houver; o rasterizador em software (llvmpipe) só se não tiver outra.
+        let pedido = wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: Some(&surface), force_fallback_adapter: false };
+        let mut adapter = futures::executor::block_on(instance.request_adapter(&pedido)).ok_or("nenhum adaptador gráfico")?;
+        if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+            if let Some(a) = instance.enumerate_adapters(wgpu::Backends::all()).into_iter().find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu && a.is_surface_supported(&surface)) {
+                adapter = a;
+            }
+        }
+        let info = adapter.get_info();
+        let limites = gpu::limites(&adapter);
+        let env = std::env::var("PELICANO_GPU").ok();
+        let pintar = match env.as_deref() {
+            Some("0") => false,
+            Some("1") => limites.is_some(),
+            _ => pintar && limites.is_some() && info.device_type != wgpu::DeviceType::Cpu,
+        };
+        if std::env::var_os("PELICANO_DANO").is_some() {
+            eprintln!("[gpu] {} ({:?}, {:?}): desenho na {}", info.name, info.device_type, info.backend, if pintar { "GPU" } else { "CPU" });
+        }
+        let limites = limites.filter(|_| pintar).unwrap_or_else(|| wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()));
+        let (device, queue) = futures::executor::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: limites }, None)).map_err(|e| e.to_string())?;
         let caps = surface.get_capabilities(&adapter);
         // O quadro já vem em sRGB: um formato "Srgb" converteria de novo.
         let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).or(caps.formats.first().copied()).ok_or("superfície sem formato")?;
@@ -1234,7 +1332,8 @@ impl Gpu {
             fragment: Some(wgpu::FragmentState { module: &modulo, entry_point: "fs", targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
             multiview: None,
         });
-        let g = Gpu { instance, adapter, device, queue, format, pipeline, layout };
+        let pintor = pintar.then(|| gpu::Pintor::new(&device, format));
+        let g = Gpu { instance, adapter, device, queue, format, pipeline, layout, pintor };
         let t = g.configurar(surface, &w, transparente)?;
         Ok((g, t))
     }
@@ -1277,6 +1376,26 @@ impl Tela {
             self.config.height = h;
             self.surface.configure(&g.device, &self.config);
         }
+    }
+
+    /// O quadro desenhado na GPU direto na tela. `false` como no [`present`](Self::present).
+    fn present_gpu(&mut self, g: &mut Gpu, lista: &mut gpu::Lista) -> bool {
+        let (w, h) = lista.tamanho();
+        self.resize(g, w, h);
+        let frame = match self.surface.get_current_texture() {
+            Ok(f) => f,
+            Err(_) => {
+                self.surface.configure(&g.device, &self.config);
+                return std::mem::replace(&mut self.falhou, true);
+            }
+        };
+        let view = frame.texture.create_view(&Default::default());
+        let Some(p) = g.pintor.as_mut() else { return true };
+        p.desenhar(&g.device, &g.queue, &view, lista);
+        frame.present();
+        g.device.poll(wgpu::Maintain::Poll);
+        self.falhou = false;
+        true
     }
 
     /// `false` se o quadro não chegou à tela e vale tentar de novo (só na primeira falha seguida).
@@ -1456,6 +1575,19 @@ mod testes {
         let Some(Action::Alca(id, f)) = t.0.into_iter().next() else { panic!("alça") };
         let h = winit::raw_window_handle::XcbWindowHandle::new(std::num::NonZeroU32::new(5).unwrap());
         assert_eq!((id, f(RawWindowHandle::Xcb(h))), (WindowId(3), 7));
+    }
+
+    #[test]
+    fn clique_da_roda_desliza_em_pedacos_que_somam_o_clique() {
+        let mut resto = Some(Event::Wheel { dx: 0.0, dy: -48.0, modifiers: crate::Modifiers::empty() });
+        let (mut andou, mut quadros) = (0.0, 0);
+        while let Some(Event::Wheel { dy, .. }) = super::fatia_roda(&mut resto) {
+            assert!(dy.abs() <= 48.0 * 0.4 + 0.01);
+            andou += dy;
+            quadros += 1;
+        }
+        assert!((andou + 48.0f32).abs() < 1e-3, "{andou}");
+        assert!((5..=15).contains(&quadros), "{quadros}");
     }
 
     #[test]

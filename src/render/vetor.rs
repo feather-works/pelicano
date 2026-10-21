@@ -313,6 +313,7 @@ impl Renderer {
                 &mut k
             }
         };
+        self.falta("caminho preenchido");
         if self.anotar(p, 0.0, &mut k) {
             return;
         }
@@ -340,7 +341,40 @@ impl Renderer {
         };
         // Quanto o traço passa do caminho: a ponta da junção em quina vai até 2× a largura (limite 4).
         let sobra = traco.width * escala * if traco.join == LineJoin::Miter { 2.0 } else if traco.cap == LineCap::Square { 0.71 } else { 0.5 };
+        // Na GPU só a linha quebrada (retas) com pontas e junções redondas, de cor lisa: cada reta é uma cápsula.
+        let retas = p.0.segments().all(|s| !matches!(s, tiny_skia::PathSegment::QuadTo(..) | tiny_skia::PathSegment::CubicTo(..)));
+        let cor_lisa = match &cor {
+            Background::Color(c) => Some(self.esmaecer(*c)),
+            Background::Linear { .. } => None,
+        };
+        let opaca = cor_lisa.is_some_and(|c| c.a >= 1.0) || p.0.len() <= 2;
+        if !(retas && opaca && traco.cap == LineCap::Round && traco.join == LineJoin::Round && traco.dash.is_empty() && cor_lisa.is_some()) {
+            self.falta("contorno com curva, ponta reta, tracejado ou translúcido");
+        }
         if self.anotar(p, sobra, &mut k) {
+            return;
+        }
+        if self.pintando_gpu {
+            let (t, mut ini, mut ant) = (self.transformacao(), None, None);
+            let mut segs = Vec::new();
+            for s in p.0.segments() {
+                match s {
+                    tiny_skia::PathSegment::MoveTo(a) => (ini, ant) = (Some(t.apply(Point::new(a.x, a.y))), Some(t.apply(Point::new(a.x, a.y)))),
+                    tiny_skia::PathSegment::LineTo(a) => {
+                        let q = t.apply(Point::new(a.x, a.y));
+                        segs.extend(ant.map(|o| (o, q)));
+                        ant = Some(q);
+                    }
+                    tiny_skia::PathSegment::Close => {
+                        segs.extend(ant.zip(ini));
+                        ant = ini;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(c) = cor_lisa {
+                self.traco_gpu(segs.into_iter(), traco.width * escala, c);
+            }
             return;
         }
         let ts = tiny_skia::Stroke {
