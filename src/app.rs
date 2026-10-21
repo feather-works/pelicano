@@ -104,6 +104,7 @@ pub struct Settings {
     /// Desenha na GPU (o padrão). Sem placa de vídeo de verdade (só um rasterizador em software,
     /// como o llvmpipe), ou com `PELICANO_GPU=0`, desenha na CPU; `PELICANO_GPU=1` força a GPU.
     /// O quadro com algo que a GPU ainda não faz (camada, vidro, curva) sai na CPU sozinho.
+    /// Sem aparelho gráfico nenhum (ou `PELICANO_GPU=nenhuma`), a janela é mostrada sem wgpu.
     pub gpu: bool,
 }
 
@@ -393,7 +394,7 @@ pub fn run<A: App>(settings: Settings, init: impl FnOnce() -> (A, Task<A::Msg>))
     let (app, task) = init();
     let mut renderer = Renderer::new();
     renderer.cache_textos = settings.text_cache;
-    let mut rt = Runtime { app, settings, proxy: event_loop.create_proxy(), tokio: tokio.handle().clone(), assinaturas: HashMap::new(), clipboard: Box::new(widget::MemoryClipboard::default()), janelas: Vec::new(), gpu: None, renderer, modifiers: Modifiers::empty(), abrir: Vec::new(), pendentes: Vec::new(), alcas: Vec::new(), erro: None, sair: false, iniciou: false, inspecionar: false, intervalo: None, avisados: Default::default() };
+    let mut rt = Runtime { app, settings, proxy: event_loop.create_proxy(), tokio: tokio.handle().clone(), assinaturas: HashMap::new(), clipboard: Box::new(widget::MemoryClipboard::default()), janelas: Vec::new(), gpu: None, sem_gpu: std::env::var("PELICANO_GPU").is_ok_and(|v| v == "nenhuma"), renderer, modifiers: Modifiers::empty(), abrir: Vec::new(), pendentes: Vec::new(), alcas: Vec::new(), erro: None, sair: false, iniciou: false, inspecionar: false, intervalo: None, avisados: Default::default() };
     if std::env::var_os("PELICANO_DEBUG").is_some_and(|v| v != "0") {
         rt.settings.debug = true;
         rt.inspecionar = true;
@@ -420,6 +421,8 @@ struct Runtime<A: App> {
     clipboard: Box<dyn widget::Clipboard>,
     janelas: Vec<Janela>,
     gpu: Option<Gpu>,
+    /// Nenhum aparelho gráfico (ou `PELICANO_GPU=nenhuma`): as janelas mostram pela [`Saida::Cpu`].
+    sem_gpu: bool,
     /// Um só para todas as janelas: as fontes e os caches são o que pesa.
     renderer: Renderer,
     modifiers: Modifiers,
@@ -445,7 +448,7 @@ struct Runtime<A: App> {
 struct Janela {
     id: WindowId,
     w: Arc<Window>,
-    tela: Tela,
+    tela: Saida,
     quadro: Quadro,
     states: States,
     cursor: Option<Point>,
@@ -644,12 +647,22 @@ impl<A: App> Runtime<A> {
                 }
             };
             let tela = match &self.gpu {
-                Some(g) => g.tela(w.clone(), s.transparent),
-                None => Gpu::new(w.clone(), s.transparent, s.gpu).map(|(g, t)| {
-                    self.renderer.gpu.max_textura = g.device.limits().max_texture_dimension_2d;
-                    self.gpu = Some(g);
-                    t
-                }),
+                Some(g) => g.tela(w.clone(), s.transparent).map(Saida::Gpu),
+                None if self.sem_gpu => Saida::cpu(&w),
+                None => match Gpu::new(w.clone(), s.transparent, s.gpu) {
+                    Ok((g, t)) => {
+                        self.renderer.gpu.max_textura = g.device.limits().max_texture_dimension_2d;
+                        self.gpu = Some(g);
+                        Ok(Saida::Gpu(t))
+                    }
+                    // Sem placa nem rasterizador em software (VM, Linux sem Mesa): a imagem da CPU
+                    // vai direto para a janela, sem wgpu.
+                    Err(e) => {
+                        eprintln!("[pelicano] sem aparelho gráfico ({e}): mostrando a janela pela CPU");
+                        self.sem_gpu = true;
+                        Saida::cpu(&w)
+                    }
+                },
             };
             let tela = match tela {
                 Ok(t) => t,
@@ -898,11 +911,12 @@ impl<A: App> Runtime<A> {
         // Quadro perdido (superfície velha no meio do resize): pede outro, senão a janela
         // fica com o conteúdo antigo até o próximo evento.
         let t4 = t0.elapsed();
-        let foi = match self.gpu.as_mut() {
+        let foi = match (&mut j.tela, self.gpu.as_mut()) {
             _ if nada => true,
-            Some(g) if na_gpu => j.tela.present_gpu(g, &mut self.renderer.gpu),
-            Some(g) => j.tela.present(g, &self.renderer.pixmap, self.renderer.changed_rows()),
-            None => true,
+            (Saida::Gpu(t), Some(g)) if na_gpu => t.present_gpu(g, &mut self.renderer.gpu),
+            (Saida::Gpu(t), Some(g)) => t.present(g, &self.renderer.pixmap, self.renderer.changed_rows()),
+            (Saida::Cpu(t), _) => mostrar_cpu(t, &self.renderer.pixmap),
+            (Saida::Gpu(_), None) => true,
         };
         if !foi {
             j.tudo = true;
@@ -1260,6 +1274,34 @@ struct Gpu {
     layout: wgpu::BindGroupLayout,
     /// O desenho na GPU; `None` = na CPU ([`Settings::gpu`]).
     pintor: Option<gpu::Pintor>,
+}
+
+/// Por onde o quadro chega à janela.
+enum Saida {
+    Gpu(Tela),
+    /// Sem wgpu: o sistema copia a imagem (softbuffer). Sem transparência.
+    Cpu(softbuffer::Surface<Arc<Window>, Arc<Window>>),
+}
+
+impl Saida {
+    fn cpu(w: &Arc<Window>) -> Result<Saida, String> {
+        let ctx = softbuffer::Context::new(w.clone()).map_err(|e| e.to_string())?;
+        softbuffer::Surface::new(&ctx, w.clone()).map(Saida::Cpu).map_err(|e| e.to_string())
+    }
+}
+
+/// O quadro da CPU na janela sem GPU: o softbuffer quer `0x00RRGGBB` por pixel; o fundo da
+/// janela é opaco, então o premultiplicado já é a cor.
+fn mostrar_cpu(t: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>, pm: &tiny_skia::Pixmap) -> bool {
+    let (Some(w), Some(h)) = (std::num::NonZeroU32::new(pm.width()), std::num::NonZeroU32::new(pm.height())) else { return true };
+    if t.resize(w, h).is_err() {
+        return false;
+    }
+    let Ok(mut buf) = t.buffer_mut() else { return false };
+    for (d, p) in buf.iter_mut().zip(pm.data().chunks_exact(4)) {
+        *d = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
+    }
+    buf.present().is_ok()
 }
 
 struct Tela {
