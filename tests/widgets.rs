@@ -113,6 +113,23 @@ fn clique_no_conteudo_escondido_nao_vale() {
 const OPCOES: [&str; 3] = ["a", "b", "c"];
 
 #[test]
+fn dropdown_com_estilo_e_padding() {
+    let mut h = H::new();
+    let normal: Element<M> = pick_list(&OPCOES[..], None, M::Escolha).width(120.0).into();
+    let alto = h.node(&normal).rect.height;
+    let el: Element<M> = pick_list(&OPCOES[..], None, M::Escolha).width(120.0).padding([2, 6]).style(|_, _| Style::default().background(Color::rgb8(255, 0, 0))).into();
+    let campo = h.node(&el).rect;
+    assert_eq!(campo.height, alto - 10.0, "padding 2 em cima e embaixo no lugar de 7");
+    let mut r = Renderer::new();
+    let st = States::default();
+    let n = layout(&el, Size::new(200.0, 60.0), &mut r, &st, &Theme::dark());
+    r.begin(Size::new(200.0, 60.0), 1.0, Color::BLACK);
+    draw(&el, &n, &mut r, &st, &Theme::dark(), None, false);
+    let px = r.pixmap.pixel(60, (campo.height / 2.0) as u32).expect("dentro");
+    assert_eq!((px.red(), px.green(), px.blue()), (255, 0, 0), "o fundo vem do estilo");
+}
+
+#[test]
 fn dropdown_abre_escolhe_e_fecha() {
     let mut h = H::new();
     let el: Element<M> = pick_list(&OPCOES[..], None, M::Escolha).width(120.0).into();
@@ -349,6 +366,37 @@ fn campo_edita_navega_envia_e_perde_o_foco() {
     c.click(Point::new(5.0, campo.y + campo.height + 50.0));
     assert_eq!(c.digitar("x"), vec![]);
     assert_eq!(c.valor, "Xb");
+}
+
+#[test]
+fn campo_seleciona_com_shift_ctrl_a_e_arrasto() {
+    let mut c = Campo { h: H::new(), valor: "abcd".into() };
+    let campo = c.h.node(&Campo::el("abcd")).children[0].rect;
+    c.click(Point::new(campo.x + 150.0, campo.y + 5.0));
+    let shift = |c: &mut Campo, k: NamedKey| {
+        let el = Campo::el(&c.valor);
+        let m = c.h.ev(&el, Point::ORIGIN, Event::Key { key: Key::Named(k), text: None, modifiers: Modifiers::SHIFT, pressed: true }).0;
+        drop(el);
+        c.aplicar(m)
+    };
+    // Shift+← duas vezes seleciona "cd"; digitar troca o trecho.
+    shift(&mut c, NamedKey::ArrowLeft);
+    shift(&mut c, NamedKey::ArrowLeft);
+    assert_eq!(c.ctrl("c"), vec![]);
+    assert_eq!(c.h.area.0.as_deref(), Some("cd"));
+    assert_eq!(c.digitar("X"), vec![M::Texto("abX".into())]);
+    // Ctrl+A e Backspace esvaziam.
+    c.ctrl("a");
+    assert_eq!(c.tecla(nomeada(NamedKey::Backspace), None), vec![M::Texto(String::new())]);
+    // Arrastar do começo ao fim seleciona tudo.
+    c.valor = "abcd".into();
+    let el = Campo::el("abcd");
+    c.h.ev(&el, Point::new(campo.x + 1.0, campo.y + 5.0), Event::MousePressed(MouseButton::Left));
+    c.h.ev(&el, Point::new(campo.x + 150.0, campo.y + 5.0), Event::CursorMoved(Point::new(campo.x + 150.0, campo.y + 5.0)));
+    c.h.ev(&el, Point::new(campo.x + 150.0, campo.y + 5.0), Event::MouseReleased(MouseButton::Left));
+    drop(el);
+    assert_eq!(c.ctrl("x"), vec![M::Texto(String::new())]);
+    assert_eq!(c.h.area.0.as_deref(), Some("abcd"));
 }
 
 #[test]
@@ -860,4 +908,21 @@ fn clique_na_caixinha_marca_e_o_cursor_fica() {
     // Clicar no texto da tarefa não marca nada.
     h.click(&el, Point::new(x + 80.0, y));
     assert_eq!(c.text(), "a\n- [ ] tarefa");
+}
+
+#[test]
+fn trilho_da_rolagem_como_o_do_iced() {
+    let verde = Color::rgb8(0, 255, 0);
+    let mut h = H::new();
+    // Com espaço próprio o trilho aparece mesmo sem o que rolar.
+    let el: Element<()> = scrollable(Space::new(100.0, 50.0)).width(200.0).height(100.0).scrollbar_width(6).scrollbar_spacing(4).scrollbar_track(verde).into();
+    h.desenhar(&el, None);
+    assert_eq!(pixel(&h, 197, 50), [0, 255, 0, 255]);
+    // Por cima do conteúdo, só quando há o que rolar.
+    let el: Element<()> = scrollable(Space::new(100.0, 50.0)).width(200.0).height(100.0).scrollbar_track(verde).into();
+    h.desenhar(&el, None);
+    assert_ne!(pixel(&h, 195, 50), [0, 255, 0, 255]);
+    let el: Element<()> = scrollable(Space::new(100.0, 500.0)).width(200.0).height(100.0).scrollbar_track(verde).into();
+    h.desenhar(&el, None);
+    assert_eq!(pixel(&h, 195, 95), [0, 255, 0, 255]);
 }

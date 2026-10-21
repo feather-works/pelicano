@@ -9,6 +9,9 @@ use cosmic_text::{Buffer, CacheKey, FontSystem, SwashCache, SwashContent};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+#[path = "faixas.rs"]
+mod faixas;
+
 /// Lado do atlas de glifos (RGBA: a máscara vai como branco pré-multiplicado, o emoji com as cores).
 const ATLAS: u32 = 2048;
 /// A "textura" dos glifos nos lotes.
@@ -223,15 +226,27 @@ pub(crate) fn glifos(l: &mut Lista, b: &Buffer, fonts: &mut FontSystem, swash: &
                 Err(()) => return false,
             };
             let (x, y) = (ox + fis.x + gl.left, oy + run.line_y as i32 + fis.y - gl.top);
-            let c = [cor_g.r() as f32 / 255.0, cor_g.g() as f32 / 255.0, cor_g.b() as f32 / 255.0, fator / 255.0];
+            let c = [linear(cor_g.r() as f32 / 255.0), linear(cor_g.g() as f32 / 255.0), linear(cor_g.b() as f32 / 255.0), fator / 255.0];
             l.textura(DO_ATLAS, [x as f32, y as f32, gl.w as f32, gl.h as f32], [gl.x as f32, gl.y as f32, gl.idx as f32], c, [0.0; 4], if gl.cor { 1.0 } else { 0.0 }, rec);
         }
     }
     true
 }
 
+/// A cor como entra na lista: rgb linear (a mistura é em espaço linear, como no Iced), alfa igual.
 fn rgba(c: Color) -> [f32; 4] {
-    [c.r, c.g, c.b, c.a].map(|v| v.clamp(0.0, 1.0))
+    let [r, g, b, a] = [c.r, c.g, c.b, c.a].map(|v| v.clamp(0.0, 1.0));
+    [linear(r), linear(g), linear(b), a]
+}
+
+/// sRGB (0..1) para linear.
+pub(crate) fn linear(v: f32) -> f32 {
+    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+}
+
+/// Linear (0..1) para sRGB.
+pub(crate) fn srgb(v: f32) -> f32 {
+    if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
 }
 
 impl Renderer {
@@ -245,20 +260,16 @@ impl Renderer {
         let caixa = [r.x * s, r.y * s, r.width * s, r.height * s];
         let raios = border.radius.map(|v| v * s);
         if let Some(sh) = shadow.filter(|sh| sh.color.a > 0.0 && caixa[2] >= 1.0 && caixa[3] >= 1.0) {
-            // O desvio do desfoque da CPU: três caixas de raio k na resolução reduzida d.
-            let m = (sh.blur * s).ceil();
-            let k = ((m / 3.0).round() as usize).max(1);
-            let d = (k / 2).clamp(1, 4);
-            let kd = (k / d).max(1);
-            let sigma = if m < 1.0 { 0.0 } else { ((kd * (kd + 1)) as f32).sqrt() * d as f32 };
+            // O desfoque do Iced: `blur` é até onde a sombra vai, em pixels da tela.
+            let blur = sh.blur * s;
             let mut q = [0.0; QUAD];
             q[..4].copy_from_slice(&[(r.x + sh.offset.x) * s, (r.y + sh.offset.y) * s, caixa[2], caixa[3]]);
             q[4..8].copy_from_slice(&raios);
             q[8..12].copy_from_slice(&rgba(sh.color.alpha(sh.color.a * op)));
-            q[32..36].copy_from_slice(&[0.0, 2.0, 0.0, sigma]);
+            q[32..36].copy_from_slice(&[0.0, 2.0, 0.0, blur]);
             q[36..40].copy_from_slice(&caixa);
             q[40..].copy_from_slice(&rec);
-            let m = 3.0 * sigma + 1.0;
+            let m = blur + 1.0;
             if cruza([q[0] - m, q[1] - m, q[2] + 2.0 * m, q[3] + 2.0 * m], &rec) {
                 self.gpu.por(Tipo::Quad, 0, &q);
             }
@@ -331,6 +342,57 @@ impl Renderer {
     }
 }
 
+impl Renderer {
+    /// A lista do quadro (gravada entre `begin_gpu` e `end`) pintada na CPU, em faixas de
+    /// linhas, uma thread cada; só nas `regioes` lógicas (`None` = o quadro todo).
+    pub(crate) fn pintar_lista_cpu(&mut self, regioes: Option<&[Rect]>) {
+        let (w, h) = self.gpu.tamanho;
+        let mesmo = self.pixmap.width() == w && self.pixmap.height() == h;
+        let s = self.scale;
+        let areas: Vec<[u32; 4]> = match regioes.filter(|_| mesmo) {
+            Some(rs) => rs
+                .iter()
+                .map(|r| {
+                    let px = |v: f32, max: u32| (v * s).max(0.0).min(max as f32);
+                    [px(r.x, w).floor() as u32, px(r.y, h).floor() as u32, px(r.x + r.width, w).ceil() as u32, px(r.y + r.height, h).ceil() as u32]
+                })
+                .collect(),
+            None => {
+                if !mesmo {
+                    self.pixmap = Pixmap::new(w, h).expect("tamanho válido");
+                }
+                vec![[0, 0, w, h]]
+            }
+        };
+        for a in &areas {
+            faixas::pintar(&self.gpu, &mut self.pixmap, *a);
+        }
+        self.mudou = if regioes.is_some() && mesmo { areas.iter().map(|a| (a[1], a[3])).reduce(|a, b| (a.0.min(b.0), a.1.max(b.1))) } else { None };
+    }
+
+    /// O quadro de `desenhar` pela lista pintada em faixas na CPU (para comparar com o tiny-skia,
+    /// `tests/gpu.rs`). `Err` com o motivo se a lista não representa o quadro.
+    #[doc(hidden)]
+    pub fn capture_bands(&mut self, size: crate::Size, scale: f32, fundo: Color, desenhar: impl FnOnce(&mut Renderer)) -> Result<Vec<u8>, &'static str> {
+        self.falta_gpu = None;
+        if self.gpu.max_textura == 0 {
+            self.gpu.max_textura = SEM_LIMITE_TEXTURA;
+        }
+        self.begin_gpu(size, scale, fundo);
+        desenhar(self);
+        self.end();
+        if let Some(m) = self.falta_gpu {
+            return Err(m);
+        }
+        self.pintar_lista_cpu(None);
+        Ok(self.pixmap.data().to_vec())
+    }
+}
+
+/// O "lado máximo de textura" sem GPU: a lista pintada na CPU não tem limite de textura; o que
+/// segura imagens e caminhos enormes são os limites de área de cada desenho.
+pub(crate) const SEM_LIMITE_TEXTURA: u32 = 16384;
+
 /// Os pipelines e o que fica na GPU de um quadro para o outro (atlas, texturas das imagens).
 /// Um só para todas as janelas, como o `Renderer`.
 pub(crate) struct Pintor {
@@ -350,6 +412,7 @@ pub(crate) struct Pintor {
 }
 
 impl Pintor {
+    /// `format`: o do alvo, um "Srgb" (a mistura é em espaço linear).
     pub(crate) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let modulo = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("pelicano"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
         let camada_globais = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -439,9 +502,9 @@ impl Pintor {
             }
             queue.write_buffer(self.buffers[i].as_ref().expect("criado acima"), 0, b);
         }
-        let f = l.fundo;
-        let a = f.a.clamp(0.0, 1.0) as f64;
-        let limpo = wgpu::Color { r: f.r.clamp(0.0, 1.0) as f64 * a, g: f.g.clamp(0.0, 1.0) as f64 * a, b: f.b.clamp(0.0, 1.0) as f64 * a, a };
+        // Linear e pré-multiplicado: o alvo "Srgb" codifica na escrita.
+        let [r, g, b, a] = rgba(l.fundo).map(|v| v as f64);
+        let limpo = wgpu::Color { r: r * a, g: g * a, b: b * a, a };
         let mut enc = device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -524,7 +587,7 @@ impl GpuOffscreen {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let adapter = futures::executor::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() }))?;
         let (device, queue) = futures::executor::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: limites(&adapter)? }, None)).ok()?;
-        let pintor = Pintor::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let pintor = Pintor::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
         Some(GpuOffscreen { device, queue, pintor })
     }
 
@@ -546,7 +609,7 @@ impl GpuOffscreen {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -624,6 +687,14 @@ fn pre(c: vec4<f32>) -> vec4<f32> {
     return vec4<f32>(c.rgb * c.a, c.a);
 }
 
+// Um texel pré-multiplicado em sRGB (imagens, emoji) para pré-multiplicado linear.
+fn linear_pre(t: vec4<f32>) -> vec4<f32> {
+    if t.a <= 0.0 { return vec4<f32>(0.0); }
+    let c = clamp(t.rgb / t.a, vec3<f32>(0.0), vec3<f32>(1.0));
+    let l = select(pow((c + 0.055) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));
+    return vec4<f32>(l * t.a, t.a);
+}
+
 // A caixa (x, y, w, h) crescida m e cortada pelo recorte: só ali o fragmento roda.
 fn vertice(i: u32, r: vec4<f32>, m: f32, ret: vec4<f32>) -> vec2<f32> {
     let lo = max(r.xy - m, ret.xy);
@@ -631,34 +702,12 @@ fn vertice(i: u32, r: vec4<f32>, m: f32, ret: vec4<f32>) -> vec2<f32> {
     return mix(lo, hi, canto(i));
 }
 
-// A sombra de uma caixa arredondada com desfoque gaussiano (Evan Wallace): exata nos lados,
-// integrada em 4 amostras na vertical.
-fn erf2(x: vec2<f32>) -> vec2<f32> {
-    let s = sign(x);
-    let a = abs(x);
-    var y = 1.0 + (0.278393 + (0.230389 + 0.078108 * (a * a)) * a) * a;
-    y = y * y;
-    return s - s / (y * y);
-}
-fn sombra_x(x: f32, y: f32, sigma: f32, k: f32, meia: vec2<f32>) -> f32 {
-    let delta = min(meia.y - k - abs(y), 0.0);
-    let curva = meia.x - k + sqrt(max(0.0, k * k - delta * delta));
-    let i = 0.5 + 0.5 * erf2((x + vec2<f32>(-curva, curva)) * (sqrt(0.5) / sigma));
-    return i.y - i.x;
-}
-fn sombra(r: vec4<f32>, k: f32, c: vec2<f32>, sigma: f32) -> f32 {
+// A sombra do Iced (quad/solid.wgsl): some do meio (0,5 na borda) até `b` além dela.
+fn sombra(r: vec4<f32>, k: f32, c: vec2<f32>, b: f32) -> f32 {
     let meia = r.zw * 0.5;
-    let p = c - (r.xy + meia);
-    let ini = clamp(-3.0 * sigma, p.y - meia.y, p.y + meia.y);
-    let fim = clamp(3.0 * sigma, p.y - meia.y, p.y + meia.y);
-    let passo = (fim - ini) / 4.0;
-    var y = ini + passo * 0.5;
-    var v = 0.0;
-    for (var i = 0; i < 4; i++) {
-        v += sombra_x(p.x, p.y - y, sigma, k, meia) * exp(-(y * y) / (2.0 * sigma * sigma)) / (2.5066283 * sigma) * passo;
-        y += passo;
-    }
-    return v;
+    let p = abs(c - (r.xy + meia)) - meia + vec2<f32>(k);
+    let d = max(length(max(p, vec2<f32>(0.0))) - k, 0.0);
+    return 1.0 - smoothstep(-b, b, d);
 }
 
 struct QuadIn {
@@ -670,7 +719,7 @@ struct QuadIn {
     @location(5) c3: vec4<f32>,
     @location(6) paradas: vec4<f32>,
     @location(7) borda: vec4<f32>,
-    // largura da borda, tipo (0 cor, 1 degradê, 2 sombra), paradas, sigma
+    // largura da borda, tipo (0 cor, 1 degradê, 2 sombra), paradas, desfoque da sombra
     @location(8) params: vec4<f32>,
     // degradê: início e direção/comprimento; sombra: a caixa que ela não cobre
     @location(9) extra: vec4<f32>,
@@ -697,7 +746,7 @@ struct QuadOut {
 
 @vertex fn vs_quad(@builtin(vertex_index) i: u32, q: QuadIn) -> QuadOut {
     var o: QuadOut;
-    let m = select(1.0, 3.0 * q.params.w + 1.0, q.params.y == 2.0);
+    let m = select(1.0, q.params.w + 1.0, q.params.y == 2.0);
     o.pos = ndc(vertice(i, q.rect, m, q.ret));
     o.rect = q.rect; o.raios = q.raios; o.c0 = q.c0; o.c1 = q.c1; o.c2 = q.c2; o.c3 = q.c3;
     o.paradas = q.paradas; o.borda = q.borda; o.params = q.params; o.extra = q.extra;
@@ -725,15 +774,15 @@ fn degrade(c0: vec4<f32>, c1: vec4<f32>, c2: vec4<f32>, c3: vec4<f32>, paradas: 
     if corte == 0.0 { discard; }
     var saida: vec4<f32>;
     if q.params.y == 2.0 {
-        let sigma = q.params.w;
+        let blur = q.params.w;
         var a: f32;
-        if sigma < 0.5 {
+        if blur < 0.5 {
             a = cobertura(q.rect, q.raios, c);
         } else {
             let meio = q.rect.xy + q.rect.zw * 0.5;
             var k = select(q.raios.x, q.raios.y, c.x > meio.x);
             if c.y > meio.y { k = select(q.raios.w, q.raios.z, c.x > meio.x); }
-            a = sombra(q.rect, min(k, min(q.rect.z, q.rect.w) / 2.0), c, sigma);
+            a = sombra(q.rect, min(k, min(q.rect.z, q.rect.w) / 2.0), c, blur);
         }
         saida = pre(q.c0) * a * (1.0 - cobertura(q.extra, q.raios, c));
     } else {
@@ -795,12 +844,12 @@ struct GlifoOut {
     if q.params.x == 2.0 {
         // Imagem: suavizada (bilinear, como o `escalar` da CPU) e com os cantos.
         let t = textureSampleLevel(tex, amostra, (c - q.dst.xy) / q.dst.zw, 0.0);
-        saida = t * q.cor.a * cobertura(q.dst, q.raios, c);
+        saida = linear_pre(t) * q.cor.a * cobertura(q.dst, q.raios, c);
     } else {
         // Glifo: pixel a pixel do atlas.
         let t = textureLoad(tex, vec2<i32>(q.uv.xy + floor(c - q.dst.xy)), 0);
         if q.params.x == 1.0 {
-            saida = t * q.cor.a;
+            saida = linear_pre(t) * q.cor.a;
         } else {
             saida = vec4<f32>(q.cor.rgb, 1.0) * t.a * q.cor.a;
         }

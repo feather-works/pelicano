@@ -648,7 +648,10 @@ impl<A: App> Runtime<A> {
             };
             let tela = match &self.gpu {
                 Some(g) => g.tela(w.clone(), s.transparent).map(Saida::Gpu),
-                None if self.sem_gpu => Saida::cpu(&w),
+                None if self.sem_gpu => {
+                    self.renderer.gpu.max_textura = gpu::SEM_LIMITE_TEXTURA;
+                    Saida::cpu(&w)
+                }
                 None => match Gpu::new(w.clone(), s.transparent, s.gpu) {
                     Ok((g, t)) => {
                         self.renderer.gpu.max_textura = g.device.limits().max_texture_dimension_2d;
@@ -660,6 +663,7 @@ impl<A: App> Runtime<A> {
                     Err(e) => {
                         eprintln!("[pelicano] sem aparelho gráfico ({e}): mostrando a janela pela CPU");
                         self.sem_gpu = true;
+                        self.renderer.gpu.max_textura = gpu::SEM_LIMITE_TEXTURA;
                         Saida::cpu(&w)
                     }
                 },
@@ -883,7 +887,22 @@ impl<A: App> Runtime<A> {
         if !nada {
             j.na_gpu = na_gpu;
         }
-        let parcial = na_gpu || regioes.as_ref().is_some_and(|rs| rs.iter().all(|r| self.renderer.begin_parcial(size, escala, fundo, *r) && {
+        // Na CPU, mas a lista da GPU representa o quadro: ela é pintada em faixas, uma thread
+        // cada, em vez do tiny-skia numa thread só.
+        let mut em_faixas = false;
+        if !na_gpu && !nada && self.renderer.falta_gpu.is_none() {
+            self.renderer.begin_gpu(size, escala, fundo);
+            pintar(&mut self.renderer);
+            self.renderer.end();
+            if self.renderer.falta_gpu.is_none() {
+                self.renderer.pintar_lista_cpu(regioes.as_deref());
+                em_faixas = true;
+            }
+        }
+        // shortcut: o tiny-skia (quadro com camada/vidro, regiões parciais, `capture`) mistura em sRGB,
+        // não em linear: bordas suavizadas e translúcidos saem um pouco mais escuros que na GPU e nas
+        // faixas. Pintar em linear também ali (pixmap de 16 bits) se o salto incomodar.
+        let parcial = na_gpu || em_faixas || regioes.as_ref().is_some_and(|rs| rs.iter().all(|r| self.renderer.begin_parcial(size, escala, fundo, *r) && {
             pintar(&mut self.renderer);
             self.renderer.end();
             true
@@ -924,7 +943,7 @@ impl<A: App> Runtime<A> {
         }
         // Os tempos acumulados de cada etapa do quadro (para achar o gargalo).
         if let Some(tipo) = tipo {
-            let onde = if na_gpu { " gpu" } else { "" };
+            let onde = if na_gpu { " gpu" } else if em_faixas { " faixas" } else { "" };
             eprintln!("[quadro] {size:?} view {t1:.1?} layout {t2:.1?} gravar {t3:.1?} pintar {t4:.1?} tela {:.1?} {tipo}{onde}", t0.elapsed());
         }
         if std::env::var_os("PELICANO_MEMORIA").is_some() {
@@ -1365,8 +1384,12 @@ impl Gpu {
         let limites = limites.filter(|_| pintar).unwrap_or_else(|| wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()));
         let (device, queue) = futures::executor::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: limites }, None)).map_err(|e| e.to_string())?;
         let caps = surface.get_capabilities(&adapter);
-        // O quadro já vem em sRGB: um formato "Srgb" converteria de novo.
-        let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).or(caps.formats.first().copied()).ok_or("superfície sem formato")?;
+        // A GPU mistura em espaço linear (como o Iced) e precisa de um formato "Srgb" que codifique
+        // na escrita; sem ele, pinta a CPU. O quadro da CPU já vem em sRGB e passa por uma textura
+        // "Srgb" também (decodifica na leitura, codifica na escrita: sai igual).
+        let srgb = caps.formats.iter().copied().find(|f| f.is_srgb());
+        let pintar = pintar && srgb.is_some();
+        let format = srgb.filter(|_| pintar).or_else(|| caps.formats.iter().copied().find(|f| !f.is_srgb())).or(caps.formats.first().copied()).ok_or("superfície sem formato")?;
         let modulo = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
@@ -1473,7 +1496,7 @@ impl Tela {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format: if g.format.is_srgb() { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm },
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });

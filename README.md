@@ -40,6 +40,22 @@ cargo run --example xadrez                       # xadrez com temas (Clássico, 
 
 ![xadrez](docs/xadrez-vidro.png)
 
+### Pack de jogos offline
+
+Paciência, buraco, pôquer, damas e xadrez em pixel art, todos contra bots, num menu só
+(fontes Press Start 2P e Pixelify Sans, OFL, em `examples/assets`):
+
+```sh
+cargo run --release --example jogos              # o menu com os cinco
+cargo run --release --example paciencia          # ou cada um sozinho: buraco, poker, damas, xadrez_pixel
+```
+
+![jogos](docs/jogos.png)
+
+![paciência](docs/paciencia.png)
+
+![buraco](docs/buraco.png)
+
 ## Como funciona
 
 winit abre a janela; o quadro é desenhado na CPU com tiny-skia (texto com

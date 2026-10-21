@@ -467,7 +467,14 @@ pub fn capture<M>(el: &Element<'_, M>, size: Size, scale: f32, theme: &Theme, re
     let states = States::default();
     renderer.begin(size, scale, theme.background);
     let n = layout(el, size, renderer, &states, theme);
-    draw(el, &n, renderer, &states, theme, inspect_at, inspect_at.is_some());
+    // Como a janela sem GPU: a lista em faixas (mistura linear); o tiny-skia se ela não der conta.
+    let desenhar = |r: &mut Renderer| {
+        draw(el, &n, r, &states, theme, inspect_at, inspect_at.is_some());
+    };
+    if renderer.capture_bands(size, scale, theme.background, &desenhar).is_err() {
+        renderer.begin(size, scale, theme.background);
+        desenhar(renderer);
+    }
     renderer.pixmap.encode_png().expect("pixmap em memória sempre codifica")
 }
 
@@ -544,11 +551,12 @@ pub struct Text<'a> {
     height: Length,
     align_x: Align,
     wrap: bool,
+    ellipsis: bool,
     line_height: f32,
 }
 
 pub fn text<'a>(s: impl Into<Cow<'a, str>>) -> Text<'a> {
-    Text { content: s.into(), size: 14.0, font: Font::DEFAULT, color: None, width: Length::Shrink, height: Length::Shrink, align_x: Align::Start, wrap: true, line_height: 1.3 }
+    Text { content: s.into(), size: 14.0, font: Font::DEFAULT, color: None, width: Length::Shrink, height: Length::Shrink, align_x: Align::Start, wrap: true, ellipsis: false, line_height: 1.3 }
 }
 
 impl Text<'_> {
@@ -581,10 +589,30 @@ impl Text<'_> {
         self.wrap = false;
         self
     }
+    /// Uma linha só que, sem espaço, termina em "…" ("Verificar" vira "Verif…").
+    pub fn ellipsis(mut self) -> Self {
+        self.wrap = false;
+        self.ellipsis = true;
+        self
+    }
     /// Altura da linha em múltiplos do tamanho (o `line-height` do CSS); o padrão é 1.3.
     pub fn line_height(mut self, f: f32) -> Self {
         self.line_height = f;
         self
+    }
+    /// O maior começo do texto que, com "…", cabe em `largura`.
+    fn cortado(&self, r: &mut Renderer, largura: f32) -> Cow<'_, str> {
+        let medir = |r: &mut Renderer, t: &str| r.measure_lh(t, self.size, self.font, None, self.line_height).width;
+        if medir(r, &self.content) <= largura + 0.5 {
+            return Cow::Borrowed(&self.content);
+        }
+        let fins: Vec<usize> = self.content.char_indices().map(|(i, _)| i).collect();
+        let (mut cabe, mut nao) = (0, fins.len());
+        while nao - cabe > 1 {
+            let meio = (cabe + nao) / 2;
+            if medir(r, &format!("{}…", &self.content[..fins[meio]])) <= largura { cabe = meio } else { nao = meio }
+        }
+        format!("{}…", &self.content[..fins.get(cabe).copied().unwrap_or(0)]).into()
     }
     fn max_width(&self, w: f32) -> Option<f32> {
         (self.wrap && w.is_finite()).then_some(w)
@@ -618,15 +646,23 @@ impl<M> Widget<M> for Text<'_> {
             Length::Fixed(v) => v.min(l.max.width),
             _ => l.max.width,
         };
-        let m = cx.renderer.measure_lh(&self.content, self.size, self.font, self.max_width(largura), self.line_height);
-        Node::leaf(cx.key(), Size::new(Limits::resolve(self.width, l.max.width, m.width), Limits::resolve(self.height, l.max.height, m.height)))
+        let mut m = cx.renderer.measure_lh(&self.content, self.size, self.font, self.max_width(largura), self.line_height);
+        // Texto que encolhe nunca fica mais estreito que a maior palavra (o `min-width: auto` do CSS):
+        // o que não cabe passa da caixa em vez de virar coluna de letras. Com "…" ele encolhe.
+        let natural = self.width == Length::Shrink && !self.ellipsis;
+        if natural && m.width > largura {
+            m = cx.renderer.measure_lh(&self.content, self.size, self.font, self.max_width(m.width), self.line_height);
+        }
+        let w = if natural { m.width } else { Limits::resolve(self.width, l.max.width, m.width) };
+        Node::leaf(cx.key(), Size::new(w, Limits::resolve(self.height, l.max.height, m.height)))
     }
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
         let r = n.rect;
         let mw = self.max_width(r.width);
-        let w = if self.align_x == Align::Start { 0.0 } else { cx.renderer.measure_lh(&self.content, self.size, self.font, mw, self.line_height).width };
+        let conteudo = if self.ellipsis { self.cortado(cx.renderer, r.width) } else { Cow::Borrowed(&*self.content) };
+        let w = if self.align_x == Align::Start { 0.0 } else { cx.renderer.measure_lh(&conteudo, self.size, self.font, mw, self.line_height).width };
         let at = Point::new(r.x + self.align_x.offset(r.width, w), r.y);
-        cx.renderer.draw_text_lh(&self.content, self.size, self.font, self.color.unwrap_or(cx.text_color), at, mw, self.line_height);
+        cx.renderer.draw_text_lh(&conteudo, self.size, self.font, self.color.unwrap_or(cx.text_color), at, mw, self.line_height);
         cx.access_text(n.key, r, &self.content);
     }
 }
@@ -671,6 +707,7 @@ pub struct Container<'a, M> {
     width: Length,
     height: Length,
     max_width: f32,
+    max_height: f32,
     align_x: Align,
     align_y: Align,
     clip: bool,
@@ -678,7 +715,7 @@ pub struct Container<'a, M> {
 }
 
 pub fn container<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Container<'a, M> {
-    Container { content: content.into(), padding: Padding::ZERO, margin: Padding::ZERO, width: Length::Shrink, height: Length::Shrink, max_width: f32::INFINITY, align_x: Align::Start, align_y: Align::Start, clip: false, style: None }
+    Container { content: content.into(), padding: Padding::ZERO, margin: Padding::ZERO, width: Length::Shrink, height: Length::Shrink, max_width: f32::INFINITY, max_height: f32::INFINITY, align_x: Align::Start, align_y: Align::Start, clip: false, style: None }
 }
 
 impl<'a, M> Container<'a, M> {
@@ -701,6 +738,10 @@ impl<'a, M> Container<'a, M> {
     }
     pub fn max_width(mut self, w: f32) -> Self {
         self.max_width = w;
+        self
+    }
+    pub fn max_height(mut self, h: impl Into<Num>) -> Self {
+        self.max_height = h.into().0;
         self
     }
     pub fn align_x(mut self, a: Align) -> Self {
@@ -735,11 +776,12 @@ impl<M> Widget<M> for Container<'_, M> {
         let ext = Padding { top: p.top + mg.top, right: p.right + mg.right, bottom: p.bottom + mg.bottom, left: p.left + mg.left };
         let lim_w = l.max.width.min(self.max_width + mg.horizontal());
         let max_w = Limits::resolve(self.width, lim_w, lim_w);
-        let max_h = Limits::resolve(self.height, l.max.height, l.max.height);
+        let lim_h = l.max.height.min(self.max_height + mg.vertical());
+        let max_h = Limits::resolve(self.height, lim_h, lim_h);
         let mut filho = cx.child(0, &self.content, Limits::new(Size::new((max_w - ext.horizontal()).max(0.0), (max_h - ext.vertical()).max(0.0))));
         let c = filho.size();
         let w = Limits::resolve(self.width, lim_w, c.width + ext.horizontal());
-        let h = Limits::resolve(self.height, l.max.height, c.height + ext.vertical());
+        let h = Limits::resolve(self.height, lim_h, c.height + ext.vertical());
         let (iw, ih) = (w - ext.horizontal(), h - ext.vertical());
         filho.place(Point::new(ext.left + self.align_x.offset(iw, c.width), ext.top + self.align_y.offset(ih, c.height)));
         Node { rect: Rect::new(Point::ORIGIN, Size::new(w, h)), key: cx.key(), children: vec![filho], padding: p, margin: mg }
@@ -1158,11 +1200,13 @@ impl<M: Clone> Widget<M> for Button<'_, M> {
     }
     fn layout(&self, cx: &mut LayoutCx, l: Limits) -> Node {
         let p = self.padding;
-        let max_w = Limits::resolve(self.width, l.max.width, l.max.width) - p.horizontal();
+        // Botão que encolhe tem o rótulo numa linha só e a largura dele (o `white-space: nowrap` dos botões).
+        let natural = self.width == Length::Shrink;
+        let max_w = if natural { f32::INFINITY } else { Limits::resolve(self.width, l.max.width, l.max.width) - p.horizontal() };
         let max_h = Limits::resolve(self.height, l.max.height, l.max.height) - p.vertical();
         let mut filho = cx.child(0, &self.content, Limits::new(Size::new(max_w.max(0.0), max_h.max(0.0))));
         let c = filho.size();
-        let w = Limits::resolve(self.width, l.max.width, c.width + p.horizontal());
+        let w = if natural { c.width + p.horizontal() } else { Limits::resolve(self.width, l.max.width, c.width + p.horizontal()) };
         let h = Limits::resolve(self.height, l.max.height, c.height + p.vertical());
         filho.place(Point::new(p.left + Align::Center.offset(w - p.horizontal(), c.width), p.top + Align::Center.offset(h - p.vertical(), c.height)));
         Node { rect: Rect::new(Point::ORIGIN, Size::new(w, h)), key: cx.key(), children: vec![filho], padding: p, ..Default::default() }
@@ -1454,10 +1498,15 @@ pub struct Scrollable<'a, M> {
     direction: Direction,
     id: Option<u64>,
     on_scroll: Option<Box<dyn Fn(Viewport) -> M + 'a>>,
+    max_height: f32,
+    bar_width: f32,
+    bar_spacing: Option<f32>,
+    bar_color: Option<Color>,
+    bar_track: Option<Color>,
 }
 
 pub fn scrollable<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Scrollable<'a, M> {
-    Scrollable { content: content.into(), width: Length::FILL, height: Length::FILL, direction: Direction::Vertical, id: None, on_scroll: None }
+    Scrollable { content: content.into(), width: Length::FILL, height: Length::FILL, direction: Direction::Vertical, id: None, on_scroll: None, max_height: f32::INFINITY, bar_width: 6.0, bar_spacing: None, bar_color: None, bar_track: None }
 }
 
 impl<'a, M> Scrollable<'a, M> {
@@ -1468,6 +1517,36 @@ impl<'a, M> Scrollable<'a, M> {
     pub fn height(mut self, h: impl Into<Length>) -> Self {
         self.height = h.into();
         self
+    }
+    /// Altura máxima (com `height(Shrink)`, cresce com o conteúdo até aqui e então rola).
+    pub fn max_height(mut self, h: impl Into<Num>) -> Self {
+        self.max_height = h.into().0;
+        self
+    }
+    /// Espessura da barra de rolagem (padrão 6).
+    pub fn scrollbar_width(mut self, w: impl Into<Num>) -> Self {
+        self.bar_width = w.into().0;
+        self
+    }
+    /// Põe a barra ao lado do conteúdo, num trilho próprio a `s` dele, em vez de por cima.
+    pub fn scrollbar_spacing(mut self, s: impl Into<Num>) -> Self {
+        self.bar_spacing = Some(s.into().0);
+        self
+    }
+    /// Cor do polegar (padrão: a cor do texto, mais forte no hover).
+    pub fn scrollbar_color(mut self, c: Color) -> Self {
+        self.bar_color = Some(c);
+        self
+    }
+    /// Pinta o trilho atrás do polegar (padrão: sem trilho). Como no Iced, com
+    /// `scrollbar_spacing` ele aparece sempre; por cima do conteúdo, só quando há o que rolar.
+    pub fn scrollbar_track(mut self, c: Color) -> Self {
+        self.bar_track = Some(c);
+        self
+    }
+    /// O trilho que a barra reserva fora do conteúdo (0 quando ela vai por cima).
+    fn trilho(&self) -> f32 {
+        self.bar_spacing.map_or(0.0, |s| s + self.bar_width)
     }
     /// Vertical (padrão), horizontal ou os dois. A roda com Shift rola na horizontal.
     pub fn direction(mut self, d: Direction) -> Self {
@@ -1493,16 +1572,19 @@ impl<'a, M> Scrollable<'a, M> {
         let v = Self::viewport(n);
         let (r, c) = (n.rect, v.content);
         let ambos = self.direction.y() && self.direction.x() && c.height > r.height && c.width > r.width;
-        let canto = if ambos { 8.0 } else { 0.0 };
+        let t = self.bar_width;
+        // Por cima do conteúdo a barra fica a 2 da borda; no trilho próprio, encostada nela.
+        let borda = t + if self.bar_spacing.is_some() { 0.0 } else { 2.0 };
+        let canto = if ambos { borda } else { 0.0 };
         let vertical = (self.direction.y() && c.height > r.height).then(|| {
             let curso = r.height - canto;
             let h = (curso * r.height / c.height).max(24.0);
-            Rect { x: r.x + r.width - 8.0, y: r.y + (curso - h) * v.offset.y / (c.height - r.height), width: 6.0, height: h }
+            Rect { x: r.x + r.width - borda, y: r.y + (curso - h) * v.offset.y / (c.height - r.height), width: t, height: h }
         });
         let horizontal = (self.direction.x() && c.width > r.width).then(|| {
             let curso = r.width - canto;
             let w = (curso * r.width / c.width).max(24.0);
-            Rect { x: r.x + (curso - w) * v.offset.x / (c.width - r.width), y: r.y + r.height - 8.0, width: w, height: 6.0 }
+            Rect { x: r.x + (curso - w) * v.offset.x / (c.width - r.width), y: r.y + r.height - borda, width: w, height: t }
         });
         (vertical, horizontal)
     }
@@ -1517,13 +1599,16 @@ impl<M> Widget<M> for Scrollable<'_, M> {
         if let Some(id) = self.id {
             cx.states.ids.borrow_mut().insert(id, cx.key());
         }
+        let max_h = l.max.height.min(self.max_height);
         let w = Limits::resolve(self.width, l.max.width, l.max.width);
-        let hmax = Limits::resolve(self.height, l.max.height, l.max.height);
-        let livre = Size::new(if self.direction.x() { f32::INFINITY } else { w }, if self.direction.y() { f32::INFINITY } else { hmax });
+        let hmax = Limits::resolve(self.height, max_h, max_h);
+        // O trilho da barra sai do eixo cruzado: rolando na vertical, o conteúdo fica mais estreito.
+        let (tw, th) = (if self.direction.y() { self.trilho() } else { 0.0 }, if self.direction.x() { self.trilho() } else { 0.0 });
+        let livre = Size::new(if self.direction.x() { f32::INFINITY } else { (w - tw).max(0.0) }, if self.direction.y() { f32::INFINITY } else { (hmax - th).max(0.0) });
         let mut filho = cx.child(0, &self.content, Limits::new(livre));
-        let h = Limits::resolve(self.height, l.max.height, filho.rect.height);
-        let w = Limits::resolve(self.width, l.max.width, filho.rect.width);
-        let max = Point::new((filho.rect.width - w).max(0.0), (filho.rect.height - h).max(0.0));
+        let h = Limits::resolve(self.height, max_h, filho.rect.height + th);
+        let w = Limits::resolve(self.width, l.max.width, filho.rect.width + tw);
+        let max = Point::new((filho.rect.width + tw - w).max(0.0), (filho.rect.height + th - h).max(0.0));
         let off = match cx.states.get::<Rolagem>(cx.key()) {
             Some(Rolagem { relativo: Some(r), .. }) => Point::new(r.x.clamp(0.0, 1.0) * max.x, r.y.clamp(0.0, 1.0) * max.y),
             Some(r) => Point::new(r.offset.x.clamp(0.0, max.x), r.offset.y.clamp(0.0, max.y)),
@@ -1543,8 +1628,20 @@ impl<M> Widget<M> for Scrollable<'_, M> {
         cx.cursor = cursor;
         let ativo = cx.hovered(&n.rect) || cx.states.get::<Rolagem>(n.key).is_some_and(|r| r.arrastando.is_some());
         let (v, h) = self.thumbs(n);
+        let cor = self.bar_color.unwrap_or(cx.theme.text.alpha(if ativo { 0.35 } else { 0.18 }));
+        if let Some(trilho) = self.bar_track {
+            let r = n.rect;
+            let fixo = self.bar_spacing.is_some();
+            let borda = self.bar_width + if fixo { 0.0 } else { 2.0 };
+            let canto = if v.is_some() && h.is_some() { borda } else { 0.0 };
+            let vt = (self.direction.y() && (fixo || v.is_some())).then(|| Rect { x: r.x + r.width - borda, y: r.y, width: self.bar_width, height: r.height - canto });
+            let ht = (self.direction.x() && (fixo || h.is_some())).then(|| Rect { x: r.x, y: r.y + r.height - borda, width: r.width - canto, height: self.bar_width });
+            for t in [vt, ht].into_iter().flatten() {
+                cx.renderer.fill_quad(t, Some(&trilho.into()), Border::rounded(2.0), None);
+            }
+        }
         for t in [v, h].into_iter().flatten() {
-            cx.renderer.fill_quad(t, Some(&cx.theme.text.alpha(if ativo { 0.35 } else { 0.18 }).into()), Border::rounded(3.0), None);
+            cx.renderer.fill_quad(t, Some(&cor.into()), Border::rounded(self.bar_width / 2.0), None);
         }
     }
     fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
@@ -1644,7 +1741,21 @@ impl<M> Scrollable<'_, M> {
 // ---------- Campo de texto ----------
 
 #[derive(Default)]
-struct Cursor(usize);
+struct Cursor {
+    pos: usize,
+    /// Onde a seleção começou; igual a `pos` (ou `None`) = nada selecionado.
+    ancora: Option<usize>,
+    arrastando: bool,
+}
+
+/// `i` dentro de `v` e numa fronteira de caractere (o app pode ter trocado o valor).
+fn fronteira(v: &str, i: usize) -> usize {
+    let mut i = i.min(v.len());
+    while !v.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
 
 pub struct TextInput<'a, M> {
     placeholder: Cow<'a, str>,
@@ -1659,6 +1770,8 @@ pub struct TextInput<'a, M> {
     style: Option<StyleFn<'a>>,
     autofocus: Option<u64>,
     id: Option<u64>,
+    placeholder_color: Option<Color>,
+    selection_color: Option<Color>,
 }
 
 /// O último pedido de foco ([`TextInput::autofocus`]) que o widget já atendeu.
@@ -1686,7 +1799,7 @@ pub(crate) fn atender_foco(ev: &Event, states: &mut States, key: u64, pedido: Op
 }
 
 pub fn text_input<'a, M>(placeholder: impl Into<Cow<'a, str>>, value: impl Into<Cow<'a, str>>) -> TextInput<'a, M> {
-    TextInput { placeholder: placeholder.into(), value: value.into(), on_input: None, on_submit: None, size: 14.0, font: Font::DEFAULT, padding: [6u16, 10].into(), width: Length::FILL, secure: false, style: None, autofocus: None, id: None }
+    TextInput { placeholder: placeholder.into(), value: value.into(), on_input: None, on_submit: None, size: 14.0, font: Font::DEFAULT, padding: [6u16, 10].into(), width: Length::FILL, secure: false, style: None, autofocus: None, id: None, placeholder_color: None, selection_color: None }
 }
 
 impl<'a, M> TextInput<'a, M> {
@@ -1733,6 +1846,24 @@ impl<'a, M> TextInput<'a, M> {
     pub fn style(mut self, f: impl Fn(&Theme, Status) -> Style + 'a) -> Self {
         self.style = Some(Box::new(f));
         self
+    }
+    /// Cor do texto de exemplo (padrão: `theme.muted`).
+    pub fn placeholder_color(mut self, c: Color) -> Self {
+        self.placeholder_color = Some(c);
+        self
+    }
+    /// Cor do fundo do trecho selecionado (padrão: `theme.primary` a 30%).
+    pub fn selection_color(mut self, c: Color) -> Self {
+        self.selection_color = Some(c);
+        self
+    }
+    /// Byte do valor sob o `x` relativo ao começo do texto.
+    fn indice_em(&self, r: &mut Renderer, x: f32) -> usize {
+        let shown = self.shown();
+        let carets = r.carets(&shown, self.size, self.font);
+        let i = carets.iter().find(|g| x < (g.1 + g.2) / 2.0).map_or(shown.len(), |g| g.0);
+        // No modo senha cada bolinha é um caractere do valor.
+        if self.secure { self.value.char_indices().nth(i / '•'.len_utf8()).map_or(self.value.len(), |(b, _)| b) } else { i }
     }
     fn shown(&self) -> Cow<'_, str> {
         if self.secure {
@@ -1819,15 +1950,18 @@ impl<M: Clone> Widget<M> for TextInput<'_, M> {
         });
         let dentro = n.rect.shrink(self.padding);
         let cor = st.text_color.unwrap_or(cx.text_color);
-        let mut cursor = cx.states.get::<Cursor>(n.key).map_or(self.value.len(), |c| c.0).min(self.value.len());
-        // O app pode ter trocado o valor: o cursor velho pode cair no meio de um caractere.
-        while !self.value.is_char_boundary(cursor) {
-            cursor -= 1;
-        }
+        let estado = cx.states.get::<Cursor>(n.key);
+        let cursor = fronteira(&self.value, estado.map_or(self.value.len(), |c| c.pos));
+        let ancora = estado.and_then(|c| c.ancora).map(|a| fronteira(&self.value, a));
         let rolar = if focado { self.scroll(cx.renderer, cursor, dentro.width) } else { 0.0 };
         cx.renderer.push_clip(dentro, [0.0; 4]);
+        if let (true, Some(a)) = (focado, ancora.filter(|&a| a != cursor)) {
+            let (x0, x1) = (self.caret_x(cx.renderer, a.min(cursor)), self.caret_x(cx.renderer, a.max(cursor)));
+            let cor_sel = self.selection_color.unwrap_or(cx.theme.primary.alpha(0.3));
+            cx.renderer.fill_quad(Rect { x: dentro.x + x0 - rolar, y: dentro.y, width: x1 - x0, height: dentro.height }, Some(&cor_sel.into()), Border::default(), None);
+        }
         if self.value.is_empty() {
-            cx.renderer.draw_text(&self.placeholder, self.size, self.font, cx.theme.muted, Point::new(dentro.x, dentro.y), None);
+            cx.renderer.draw_text(&self.placeholder, self.size, self.font, self.placeholder_color.unwrap_or(cx.theme.muted), Point::new(dentro.x, dentro.y), None);
         } else {
             cx.renderer.draw_text(&self.shown(), self.size, self.font, cor, Point::new(dentro.x - rolar, dentro.y), None);
         }
@@ -1842,71 +1976,101 @@ impl<M: Clone> Widget<M> for TextInput<'_, M> {
         atender_foco(ev, cx.states, n.key, self.autofocus);
         let v = &self.value;
         let focado = cx.states.focus == Some(n.key);
-        let mut c = cx.states.get::<Cursor>(n.key).map_or(v.len(), |c| c.0).min(v.len());
-        while !v.is_char_boundary(c) {
-            c -= 1;
-        }
+        let estado = cx.states.get::<Cursor>(n.key);
+        let mut c = fronteira(v, estado.map_or(v.len(), |e| e.pos));
+        let mut ancora = estado.and_then(|e| e.ancora).map(|a| fronteira(v, a));
+        let arrastando = estado.is_some_and(|e| e.arrastando);
         let anterior = |c: usize| v[..c].char_indices().next_back().map_or(0, |(i, _)| i);
         let proximo = |c: usize| v[c..].chars().next().map_or(c, |ch| c + ch.len_utf8());
+        let x_em = |cx: &mut EventCx<M>, c: usize| cx.cursor.map_or(0.0, |p| p.x) - n.rect.x - self.padding.left + if focado { self.scroll(cx.renderer, c, n.rect.width - self.padding.horizontal()) } else { 0.0 };
         match ev {
             Event::MousePressed(MouseButton::Left) if cx.cursor.is_some_and(|p| n.rect.contains(p)) => {
-                let x = cx.cursor.map_or(0.0, |p| p.x) - n.rect.x - self.padding.left + if focado { self.scroll(cx.renderer, c, n.rect.width - self.padding.horizontal()) } else { 0.0 };
-                let shown = self.shown();
-                let carets = cx.renderer.carets(&shown, self.size, self.font);
-                let i = carets.iter().find(|g| x < (g.1 + g.2) / 2.0).map_or(shown.len(), |g| g.0);
-                // No modo senha cada bolinha é um caractere do valor.
-                let i = if self.secure { v.char_indices().nth(i / '•'.len_utf8()).map_or(v.len(), |(b, _)| b) } else { i };
+                let x = x_em(cx, c);
+                let i = self.indice_em(cx.renderer, x);
                 cx.states.focus = Some(n.key);
-                cx.states.get_mut::<Cursor>(n.key).0 = i;
+                *cx.states.get_mut::<Cursor>(n.key) = Cursor { pos: i, ancora: Some(i), arrastando: true };
                 cx.redraw = true;
                 Captured::Yes
             }
+            Event::CursorMoved(_) if arrastando => {
+                let x = x_em(cx, c);
+                let i = self.indice_em(cx.renderer, x);
+                cx.states.get_mut::<Cursor>(n.key).pos = i;
+                cx.redraw = true;
+                Captured::Yes
+            }
+            Event::MouseReleased(MouseButton::Left) if arrastando => {
+                cx.states.get_mut::<Cursor>(n.key).arrastando = false;
+                Captured::No
+            }
             Event::Key { key, text, modifiers, pressed: true } if focado => {
+                let sel = ancora.filter(|&a| a != c).map(|a| (a.min(c), a.max(c)));
+                let (ini, fim) = sel.unwrap_or((c, c));
+                let shift = modifiers.shift_key();
+                // Shift estende a seleção a partir de onde o cursor estava; sem Shift, ela some.
+                let mover = |novo: usize, ancora: &mut Option<usize>| {
+                    *ancora = if shift { Some(ancora.unwrap_or(c)) } else { None };
+                    novo
+                };
                 let mut novo: Option<String> = None;
                 match key {
+                    Key::Named(NamedKey::Backspace | NamedKey::Delete) if sel.is_some() => {
+                        novo = Some(format!("{}{}", &v[..ini], &v[fim..]));
+                        c = ini;
+                    }
                     Key::Named(NamedKey::Backspace) if c > 0 => {
                         let i = anterior(c);
                         novo = Some(format!("{}{}", &v[..i], &v[c..]));
                         c = i;
                     }
                     Key::Named(NamedKey::Delete) if c < v.len() => novo = Some(format!("{}{}", &v[..c], &v[proximo(c)..])),
-                    Key::Named(NamedKey::ArrowLeft) => c = anterior(c),
-                    Key::Named(NamedKey::ArrowRight) => c = proximo(c),
-                    Key::Named(NamedKey::Home) => c = 0,
-                    Key::Named(NamedKey::End) => c = v.len(),
+                    Key::Named(NamedKey::ArrowLeft) => c = mover(if sel.is_some() && !shift { ini } else { anterior(c) }, &mut ancora),
+                    Key::Named(NamedKey::ArrowRight) => c = mover(if sel.is_some() && !shift { fim } else { proximo(c) }, &mut ancora),
+                    Key::Named(NamedKey::Home) => c = mover(0, &mut ancora),
+                    Key::Named(NamedKey::End) => c = mover(v.len(), &mut ancora),
                     Key::Named(NamedKey::Enter) => {
                         if let Some(m) = &self.on_submit {
                             cx.publish(m.clone());
                         }
                     }
                     Key::Named(NamedKey::Escape) => cx.states.focus = None,
-                    // shortcut: sem seleção ainda, copiar e recortar pegam o campo inteiro; com Shift+setas e arrastar, só o trecho.
+                    Key::Character(k) if modifiers.control_key() && k.eq_ignore_ascii_case("a") => {
+                        ancora = Some(0);
+                        c = v.len();
+                    }
                     Key::Character(k) if modifiers.control_key() && k.eq_ignore_ascii_case("v") => {
                         // Uma linha só: quebras de linha coladas viram espaço.
                         let t: String = cx.clipboard.read().unwrap_or_default().chars().map(|ch| if ch == '\n' || ch == '\r' || ch == '\t' { ' ' } else { ch }).filter(|ch| !ch.is_control()).collect();
-                        if !t.is_empty() {
-                            novo = Some(format!("{}{}{}", &v[..c], t, &v[c..]));
-                            c += t.len();
+                        if !t.is_empty() || sel.is_some() {
+                            novo = Some(format!("{}{}{}", &v[..ini], t, &v[fim..]));
+                            c = ini + t.len();
                         }
                     }
+                    // Sem seleção, copiar e recortar pegam o campo inteiro.
                     Key::Character(k) if modifiers.control_key() && !self.secure && (k.eq_ignore_ascii_case("c") || k.eq_ignore_ascii_case("x")) => {
-                        if !v.is_empty() {
-                            cx.clipboard.write(v.to_string());
+                        let (ini, fim) = sel.unwrap_or((0, v.len()));
+                        if ini < fim {
+                            cx.clipboard.write(v[ini..fim].to_string());
                             if k.eq_ignore_ascii_case("x") {
-                                novo = Some(String::new());
-                                c = 0;
+                                novo = Some(format!("{}{}", &v[..ini], &v[fim..]));
+                                c = ini;
                             }
                         }
                     }
                     _ => match text.as_deref().filter(|t| !modifiers.control_key() && t.chars().all(|ch| !ch.is_control())) {
                         Some(t) if !t.is_empty() => {
-                            novo = Some(format!("{}{}{}", &v[..c], t, &v[c..]));
-                            c += t.len();
+                            novo = Some(format!("{}{}{}", &v[..ini], t, &v[fim..]));
+                            c = ini + t.len();
                         }
                         _ => return Captured::No,
                     },
                 }
-                cx.states.get_mut::<Cursor>(n.key).0 = c;
+                if novo.is_some() {
+                    ancora = None;
+                }
+                let e = cx.states.get_mut::<Cursor>(n.key);
+                e.pos = c;
+                e.ancora = ancora;
                 if let Some(s) = novo {
                     cx.publish(on_input(s));
                 }

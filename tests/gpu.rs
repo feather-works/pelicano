@@ -3,20 +3,28 @@ use pelicano::*;
 
 const FUNDO: Color = Color { r: 0.1, g: 0.11, b: 0.13, a: 1.0 };
 
-/// A cena pelos dois caminhos; falha se mais que `fracao` dos pixels difere mais que `tol` num canal.
+/// A cena pela lista pintada em faixas na CPU e pela GPU; falha se mais que `fracao` dos pixels
+/// difere mais que `tol` num canal. As duas misturam em espaço linear; o tiny-skia mistura em
+/// sRGB (bordas suavizadas e translúcidos mudam), então contra ele só se confere a geometria.
 fn comparar(nome: &str, tam: Size, escala: f32, tol: u8, fracao: f64, cena: impl Fn(&mut Renderer)) {
-    let Some(mut g) = GpuOffscreen::new() else {
-        eprintln!("{nome}: sem adaptador gráfico, pulando");
-        return;
-    };
     let mut r = Renderer::new();
     r.begin(tam, escala, FUNDO);
     cena(&mut r);
     let cpu = r.pixmap.data().to_vec();
+    let faixas = r.capture_bands(tam, escala, FUNDO, &cena).unwrap_or_else(|m| panic!("{nome}: a lista não representa a cena ({m})"));
+    diferenca(&format!("{nome}: tiny-skia × faixas"), &cpu, &faixas, 128, 0.01);
+    let Some(mut g) = GpuOffscreen::new() else {
+        eprintln!("{nome}: sem adaptador gráfico, pulando a GPU");
+        return;
+    };
     let gpu = g.capture(&mut r, tam, escala, FUNDO, &cena).unwrap_or_else(|m| panic!("{nome}: caiu na CPU ({m})"));
-    assert_eq!(cpu.len(), gpu.len());
+    diferenca(nome, &faixas, &gpu, tol, fracao);
+}
+
+fn diferenca(nome: &str, cpu: &[u8], outro: &[u8], tol: u8, fracao: f64) {
+    assert_eq!(cpu.len(), outro.len());
     let (mut ruins, mut pior) = (0usize, 0u8);
-    for (a, b) in cpu.chunks(4).zip(gpu.chunks(4)) {
+    for (a, b) in cpu.chunks(4).zip(outro.chunks(4)) {
         let d = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0);
         pior = pior.max(d);
         ruins += (d > tol) as usize;
@@ -75,6 +83,44 @@ fn linha_grossa() {
     });
 }
 
+#[test]
+fn caminhos_com_curva() {
+    comparar("caminhos", Size::new(240.0, 180.0), 1.5, 8, 0.01, |r| {
+        let estrela = Path::new(|b| {
+            b.move_to(Point::new(60.0, 10.0)).quadratic_to(Point::new(110.0, 40.0), Point::new(100.0, 90.0));
+            b.bezier_to(Point::new(80.0, 120.0), Point::new(30.0, 110.0), Point::new(20.0, 60.0)).close();
+            b.circle(Point::new(60.0, 60.0), 18.0);
+        })
+        .unwrap();
+        r.fill_path(&estrela, Color::rgb8(0x3b, 0x82, 0xf6), FillRule::EvenOdd);
+        r.push_transform(Transform::rotate_around(30.0, Point::new(170.0, 60.0)));
+        let g = Background::Linear { angle: 0.0, stops: vec![(0.0, Color::rgb8(0x8b, 0x5c, 0xf6)), (1.0, Color::rgb8(0xec, 0x48, 0x99))] };
+        r.fill_path(&Path::rect(Rect { x: 130.0, y: 30.0, width: 80.0, height: 60.0 }).unwrap(), g, FillRule::NonZero);
+        r.pop_transform();
+        r.push_opacity(0.6);
+        let onda = Path::new(|b| {
+            b.move_to(Point::new(10.0, 150.0));
+            for i in 0..8 {
+                let x = 10.0 + i as f32 * 28.0;
+                b.quadratic_to(Point::new(x + 7.0, 130.0), Point::new(x + 14.0, 150.0)).quadratic_to(Point::new(x + 21.0, 170.0), Point::new(x + 28.0, 150.0));
+            }
+        })
+        .unwrap();
+        r.stroke_path(&onda, &Stroke::new(3.0).dash(vec![9.0, 4.0]), Color::rgb8(0xef, 0x44, 0x44));
+        r.pop_opacity();
+    });
+}
+
+/// Com zoom, o contorno do slide passa da janela (e do maior lado de textura): só a parte
+/// visível vai à GPU, em vez de o quadro inteiro cair na CPU.
+#[test]
+fn contorno_maior_que_a_janela() {
+    comparar("contorno grande", Size::new(200.0, 120.0), 1.0, 8, 0.01, |r| {
+        let slide = Path::rect(Rect { x: -2100.0, y: -1500.0, width: 2250.0, height: 1600.0 }).unwrap();
+        r.stroke_path(&slide, &Stroke::new(1.0), Color::rgb8(0xd0, 0xd4, 0xdc));
+    });
+}
+
 /// Quadro cheio de uma tabela (como o exemplo csv): `cargo test --release --test gpu -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -94,12 +140,15 @@ fn bench_tabela_cheia() {
         let mut r = Renderer::new();
         let el = tabela();
         let n = widget::layout(&el, tam, &mut r, &st, &tema);
-        let (mut cpu, mut gpu) = (Vec::new(), Vec::new());
+        let (mut cpu, mut gpu, mut faixas) = (Vec::new(), Vec::new(), Vec::new());
         for _ in 0..30 {
             let t = std::time::Instant::now();
             r.begin(tam, escala, tema.background);
             widget::draw(&el, &n, &mut r, &st, &tema, None, false);
             cpu.push(t.elapsed().as_secs_f64() * 1000.0);
+            let t = std::time::Instant::now();
+            r.capture_bands(tam, escala, tema.background, |r| { widget::draw(&el, &n, r, &st, &tema, None, false); }).expect("tabela inteira na lista");
+            faixas.push(t.elapsed().as_secs_f64() * 1000.0);
             let t = std::time::Instant::now();
             g.capture(&mut r, tam, escala, tema.background, |r| {
                 widget::draw(&el, &n, r, &st, &tema, None, false);
@@ -108,7 +157,7 @@ fn bench_tabela_cheia() {
             gpu.push(t.elapsed().as_secs_f64() * 1000.0);
         }
         let med = |v: &mut Vec<f64>| { v.sort_by(f64::total_cmp); v[v.len() / 2] };
-        eprintln!("escala {escala}: CPU {:.2} ms · GPU (com leitura de volta) {:.2} ms", med(&mut cpu), med(&mut gpu));
+        eprintln!("escala {escala}: CPU {:.2} ms · CPU em faixas {:.2} ms · GPU (com leitura de volta) {:.2} ms", med(&mut cpu), med(&mut faixas), med(&mut gpu));
     }
 }
 

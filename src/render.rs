@@ -1,10 +1,12 @@
 //! Desenho do quadro na CPU. Tudo entra em pixels lógicos e sai multiplicado pela escala.
 use crate::{Background, Border, Color, Point, Rect, Shadow, Size};
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
+use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight, Wrap};
 use std::collections::HashMap;
 use std::sync::Arc;
 pub(crate) mod vetor;
 pub(crate) mod gpu;
+#[cfg(test)]
+mod rastros;
 use tiny_skia::{FillRule, FilterQuality, GradientStop, LinearGradient, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, SpreadMode, Transform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -100,8 +102,29 @@ impl Image {
 pub struct Svg(Arc<resvg::usvg::Tree>, u64);
 
 impl Svg {
+    /// O mesmo conteúdo dá o mesmo `Svg`: ícones refeitos a cada `view` não são lidos de novo,
+    /// e a chave do desenho não muda (senão todo quadro redesenhava a janela inteira).
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok().map(|t| Svg(Arc::new(t), novo_id()))
+        use std::hash::{Hash, Hasher};
+        thread_local! {
+            static LIDOS: std::cell::RefCell<HashMap<u64, Arc<resvg::usvg::Tree>>> = Default::default();
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        let id = h.finish();
+        if let Some(t) = LIDOS.with(|l| l.borrow().get(&id).cloned()) {
+            return Some(Svg(t, id));
+        }
+        let t = Arc::new(resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok()?);
+        LIDOS.with(|l| {
+            let mut l = l.borrow_mut();
+            // shortcut: esvazia tudo ao passar de 2048 (SVGs gerados que mudam sempre); LRU se fizer falta.
+            if l.len() >= 2048 {
+                l.clear();
+            }
+            l.insert(id, t.clone());
+        });
+        Some(Svg(t, id))
     }
     pub fn size(&self) -> Size {
         let s = self.0.size();
@@ -152,6 +175,10 @@ struct Clip {
     mask: Option<Mask>,
     /// O mesmo recorte para a GPU (veja [`gpu::SEM_RECORTE`]).
     gpu: [f32; 12],
+    /// O `rect` em coordenadas da janela e em pixels inteiros do pixmap (x0, y0, x1, y1): arredondado
+    /// na janela, cai no mesmo pixel no quadro cheio e no parcial.
+    tela: Rect,
+    px: [i32; 4],
 }
 
 /// O quadrado de um canto arredondado e o centro do arco dele (lógicos).
@@ -164,6 +191,12 @@ struct Canto {
 
 /// A máscara do recorte atual, só se o desenho em `area` (pixels físicos) puder sair dele.
 /// `None` em `area` = sempre (texto, que não sabe o tamanho antes).
+/// Os pixels do recorte, dentro do pixmap `w` × `h`.
+fn limites(c: &Clip, w: u32, h: u32) -> [usize; 4] {
+    let [x0, y0, x1, y1] = c.px;
+    [x0.clamp(0, w as i32) as usize, y0.clamp(0, h as i32) as usize, x1.clamp(0, w as i32) as usize, y1.clamp(0, h as i32) as usize]
+}
+
 fn clip_mask(clips: &mut [Clip], w: u32, h: u32, s: f32, area: Option<tiny_skia::Rect>) -> Option<&Mask> {
     let (r, rounded) = clips.last().map(|c| (c.rect, c.rounded))?;
     let dentro = area.is_some_and(|a| a.left() >= r.x * s && a.top() >= r.y * s && a.right() <= (r.x + r.width) * s && a.bottom() <= (r.y + r.height) * s);
@@ -176,8 +209,7 @@ fn clip_mask(clips: &mut [Clip], w: u32, h: u32, s: f32, area: Option<tiny_skia:
         if !rounded {
             // Só retângulos: a máscara é o cruzamento deles (`r`), preenchido direto. Rasterizar
             // cada recorte na máscara inteira custava várias passadas na tela toda por quadro.
-            let (x0, y0) = (((r.x * s).round().max(0.0) as usize).min(w as usize), ((r.y * s).round().max(0.0) as usize).min(h as usize));
-            let (x1, y1) = ((((r.x + r.width) * s).round().max(0.0) as usize).min(w as usize), (((r.y + r.height) * s).round().max(0.0) as usize).min(h as usize));
+            let [x0, y0, x1, y1] = limites(&clips[n - 1], w, h);
             let dados = m.data_mut();
             for y in y0..y1.max(y0) {
                 dados[y * w as usize + x0..y * w as usize + x1.max(x0)].fill(255);
@@ -187,8 +219,7 @@ fn clip_mask(clips: &mut [Clip], w: u32, h: u32, s: f32, area: Option<tiny_skia:
         }
         // O retângulo cheio e, nos quadrados dos cantos, a cobertura do arco calculada pixel a
         // pixel: rasterizar cada contorno na máscara inteira custava a tela toda por recorte.
-        let (x0, y0) = (((r.x * s).round().max(0.0) as usize).min(w as usize), ((r.y * s).round().max(0.0) as usize).min(h as usize));
-        let (x1, y1) = ((((r.x + r.width) * s).round().max(0.0) as usize).min(w as usize), (((r.y + r.height) * s).round().max(0.0) as usize).min(h as usize));
+        let [x0, y0, x1, y1] = limites(&clips[n - 1], w, h);
         let largura = w as usize;
         let dados = m.data_mut();
         for y in y0..y1.max(y0) {
@@ -226,6 +257,18 @@ pub struct Renderer {
     /// [`crate::Settings::text_cache`]: os textos ficam de um quadro para o outro.
     pub(crate) cache_textos: bool,
     svgs: Cache<SvgKey, Arc<Pixmap>>,
+    /// Caminhos rasterizados para a GPU (a forma já deslocada para o canto da caixa dela).
+    caminhos: Cache<u64, Arc<Pixmap>>,
+    /// Culling (o dos jogos): cada desenho gravado (chave, área visível, parte opaca). No fim da
+    /// gravação viram as chaves que a pintura pula: as todas cobertas por algo opaco desenhado
+    /// depois, ou fora do recorte. Pular é antes de qualquer trabalho (texto, caminho, textura).
+    cobertura: Vec<(u64, Rect, Option<Rect>)>,
+    ocultos: std::collections::HashSet<u64>,
+    /// Só entre o `changes` e o fim do quadro da janela: pintar sem gravar não pula nada.
+    ocultos_validos: bool,
+    /// A parte opaca do próximo desenho, posta por quem desenha logo antes do `gravou`.
+    opaco: Option<Rect>,
+    imagens_opacas: HashMap<u64, bool>,
     shadows: Cache<ShadowKey, Pixmap>,
     imagens: Cache<(u64, u32, u32), Pixmap>,
     clips: Vec<Clip>,
@@ -331,6 +374,12 @@ impl Renderer {
             fontes_carregadas: 0,
             cache_textos: false,
             svgs: Cache::default(),
+            caminhos: Cache::default(),
+            cobertura: Vec::new(),
+            ocultos: Default::default(),
+            ocultos_validos: false,
+            opaco: None,
+            imagens_opacas: HashMap::new(),
             shadows: Cache::default(),
             imagens: Cache::default(),
             clips: Vec::new(),
@@ -356,6 +405,7 @@ impl Renderer {
     /// Troca o quadro guardado pelo que está aqui (veja [`Quadro`]).
     pub(crate) fn trocar(&mut self, q: &mut Quadro) {
         self.end();
+        self.ocultos_validos = false;
         // Antes do layout: medir já com a fonte nova.
         self.carregar_fontes();
         // A janela troca no começo e no fim de cada quadro: cada quadro é uma geração, cheio ou
@@ -367,6 +417,7 @@ impl Renderer {
         self.texts.geracao += 1;
         self.proprios.geracao += 1;
         self.svgs.geracao += 1;
+        self.caminhos.geracao += 1;
         self.shadows.geracao += 1;
         self.imagens.geracao += 1;
         std::mem::swap(&mut self.pixmap, &mut q.pixmap);
@@ -405,16 +456,18 @@ impl Renderer {
             self.texts.clear();
             self.proprios.clear();
             self.svgs.clear();
+            self.caminhos.clear();
         }
         // Um quadro cheio desenha tudo o que está à mostra: o que nem ele nem o layout usaram
         // (outro tamanho de janela no meio de um resize, um menu que fechou) sai do cache.
-        let antes = self.svgs.bytes() + self.shadows.bytes() + self.imagens.bytes();
+        let antes = self.svgs.bytes() + self.caminhos.bytes() + self.shadows.bytes() + self.imagens.bytes();
         self.texts.virar();
         self.proprios.virar();
         self.svgs.virar();
+        self.caminhos.virar();
         self.shadows.virar();
         self.imagens.virar();
-        if antes - (self.svgs.bytes() + self.shadows.bytes() + self.imagens.bytes()) > 4 << 20 {
+        if antes - (self.svgs.bytes() + self.caminhos.bytes() + self.shadows.bytes() + self.imagens.bytes()) > 4 << 20 {
             devolver_memoria();
         }
         self.scale = scale;
@@ -519,6 +572,9 @@ impl Renderer {
         self.gravando = true;
         self.mudou = Some((u32::MAX, 0));
         self.lista.clear();
+        self.cobertura.clear();
+        self.ocultos_validos = false;
+        self.opaco = None;
         self.vidros.clear();
         self.clips.clear();
         self.falta_gpu = None;
@@ -633,6 +689,18 @@ impl Renderer {
         self.gravando = false;
         self.clips.clear();
         self.camadas.clear();
+        // De trás para a frente: um desenho só some se toda vez que aparece (mesma chave) está
+        // coberto por um opaco que vem depois dele, ou fora do recorte.
+        let mut todos: HashMap<u64, bool> = HashMap::new();
+        let mut opacos: Vec<Rect> = Vec::new();
+        for (h, area, opaco) in self.cobertura.iter().rev() {
+            let coberto = area.width <= 0.0 || area.height <= 0.0 || opacos.iter().any(|o| contem(o, area));
+            *todos.entry(*h).or_insert(true) &= coberto;
+            opacos.extend(opaco);
+        }
+        self.ocultos.clear();
+        self.ocultos.extend(todos.into_iter().filter(|e| e.1).map(|e| e.0));
+        self.ocultos_validos = true;
         let novo = std::mem::take(&mut self.lista);
         let c = comparar(&self.anterior, &novo, &self.vidros);
         self.lista = std::mem::replace(&mut self.anterior, novo);
@@ -641,30 +709,65 @@ impl Renderer {
 
     /// Gravando, anota o desenho (área lógica, já cortada pelo recorte, e a chave) e diz
     /// para não pintar.
-    fn gravou(&mut self, area: Rect, mut k: Chave) -> bool {
+    /// Pintando, diz se este desenho foi todo coberto na gravação (culling).
+    fn gravou(&mut self, area: Rect, k: Chave) -> bool {
+        let opaco = self.opaco.take();
         if !self.gravando {
-            return false;
+            return self.oculto(k);
         }
-        let mut area = crescer(area, 2.0);
+        // Dentro de uma camada o desenho aparece transformado: vale a área dela toda.
+        let (mut area, mut visivel) = match self.camadas.first() {
+            Some(c) => (c.caixa, c.caixa),
+            None => (crescer(area, 2.0), area),
+        };
+        let mut opaco = opaco.filter(|_| self.camadas.is_empty() && self.opacidade >= 1.0);
+        if let Some(c) = self.clips.last() {
+            area = area.intersect(&c.rect);
+            visivel = visivel.intersect(&c.rect);
+            opaco = if c.rounded { None } else { opaco.map(|o| o.intersect(&c.rect)) };
+        }
+        let h = self.chave_final(k);
+        let tem = |r: &Rect| r.width > 0.0 && r.height > 0.0;
+        if tem(&area) {
+            self.lista.push((area, h));
+        }
+        self.cobertura.push((h, if tem(&visivel) { visivel } else { Rect::default() }, opaco.filter(tem)));
+        true
+    }
+
+    /// A chave com o que muda o resultado sem estar no desenho: opacidade, fontes, camadas, recortes.
+    fn chave_final(&self, mut k: Chave) -> u64 {
         // Fonte nova muda as letras de todas as janelas, sem mudar o que elas desenham.
         k.f(self.opacidade).h(self.fontes_carregadas);
-        // Dentro de uma camada o desenho aparece transformado: vale a área dela toda.
-        if let Some(c) = self.camadas.first() {
-            area = c.caixa;
-        }
         for c in &self.camadas {
             k.h(c.chave);
         }
         for c in &self.clips {
             k.r(c.own).h(c.radius.map(f32::to_bits));
         }
-        if let Some(c) = self.clips.last() {
-            area = area.intersect(&c.rect);
+        k.0.finish()
+    }
+
+    /// Pintando: o desenho com esta chave ficou todo coberto (ou fora) na gravação.
+    fn oculto(&self, k: Chave) -> bool {
+        self.ocultos_validos && !self.ocultos.is_empty() && self.ocultos.contains(&self.chave_final(k))
+    }
+
+    /// Onde o texto começa no pixmap. Na CPU as letras caem no pixel inteiro: arredondar a posição
+    /// da janela e só então tirar o deslocamento da região faz o quadro parcial pôr cada letra no
+    /// mesmo pixel do cheio (`(x - origem) * escala` às vezes desempata o `.5` para o outro lado).
+    fn texto_local(&self, at: Point) -> Point {
+        if self.pintando_gpu {
+            return Point::new(at.x - self.origem.x, at.y - self.origem.y);
         }
-        if area.width > 0.0 && area.height > 0.0 {
-            self.lista.push((area, k.0.finish()));
-        }
-        true
+        let (s, (dx, dy)) = (self.scale, self.desloc);
+        Point::new(((at.x * s).round() - dx as f32) / s, ((at.y * s).round() - dy as f32) / s)
+    }
+
+    /// O pixel inteiro onde cai a coordenada lógica `v` da janela (`y`: eixo vertical), no pixmap
+    /// atual. Arredonda na janela e só então desconta a região, como o [`texto_local`](Self::texto_local).
+    fn px(&self, v: f32, y: bool) -> i32 {
+        (v * self.scale).round() as i32 - if y { self.desloc.1 } else { self.desloc.0 }
     }
 
     fn local(&self, r: Rect) -> Rect {
@@ -683,6 +786,8 @@ impl Renderer {
         self.texts.pegar(key, || {
             let mut b = Buffer::new(fonts, Metrics::new(size * s, (size * lh * s).ceil()));
             b.set_size(fonts, max_width.map(|w| w * s), None);
+            // Quebra só entre palavras: a que não cabe sozinha passa da largura, nunca vira coluna de letras.
+            b.set_wrap(fonts, Wrap::Word);
             let attrs = attrs(font);
             b.set_text(fonts, text, attrs, Shaping::Advanced);
             b
@@ -720,17 +825,20 @@ impl Renderer {
     /// [`draw_text`](Self::draw_text) com a altura da linha em múltiplos do tamanho.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_text_lh(&mut self, text: &str, size: f32, font: Font, color: Color, at: Point, max_width: Option<f32>, lh: f32) {
+        let mut k = Chave::new(1);
+        k.h(text).f(size).h(font).c(color).f(at.x).f(at.y).h(max_width.map(f32::to_bits)).f(lh);
         if self.gravando {
             let m = self.measure_lh(text, size, font, max_width, lh);
-            let mut k = Chave::new(1);
-            k.h(text).f(size).h(font).c(color).f(at.x).f(at.y).h(max_width.map(f32::to_bits)).f(lh);
             self.gravou(crescer(Rect::new(at, m), sobra_glifos(size, lh)), k);
+            return;
+        }
+        if self.oculto(k) {
             return;
         }
         self.buffer(text, size, font, max_width, lh);
         let key = TextKey { text: text.to_owned(), size: (size * self.scale * 64.0) as u32, font, width: max_width.map(|w| (w * self.scale) as u32), line_height: lh.to_bits() };
         let b = self.texts.get(&key).expect("criado pelo buffer");
-        let at = Point::new(at.x - self.origem.x, at.y - self.origem.y);
+        let at = self.texto_local(at);
         let color = color.alpha(color.a * self.opacidade);
         if self.pintando_gpu {
             let rec = self.clips.last().map_or(gpu::SEM_RECORTE, |c| c.gpu);
@@ -757,7 +865,7 @@ impl Renderer {
         if self.gravou(area, k) {
             return;
         }
-        let at = Point::new(at.x - self.origem.x, at.y - self.origem.y);
+        let at = self.texto_local(at);
         let color = self.esmaecer(color);
         let Some(b) = self.proprios.get(&(chave ^ self.scale.to_bits() as u64)) else { return };
         if self.pintando_gpu {
@@ -865,7 +973,7 @@ impl Renderer {
         if matches!(bg, Some(Background::Linear { stops, .. }) if stops.len() > 4) {
             self.falta("degradê com mais de 4 paradas");
         }
-        if self.gravando {
+        {
             let mut k = Chave::new(2);
             k.r(r).borda(border);
             match bg {
@@ -884,12 +992,25 @@ impl Renderer {
                 k.c(sh.color).f(sh.offset.x).f(sh.offset.y).f(sh.blur);
                 area = uniao(area, crescer(Rect { x: r.x + sh.offset.x, y: r.y + sh.offset.y, ..r }, sh.blur));
             }
-            self.gravou(area, k);
-            return;
+            let cheio = match bg {
+                Some(Background::Color(c)) => c.a >= 1.0,
+                Some(Background::Linear { stops, .. }) => stops.iter().all(|(_, c)| c.a >= 1.0),
+                None => false,
+            };
+            if cheio {
+                // Com cantos redondos, a faixa do meio (a maior das duas) ainda é toda opaca.
+                let m = border.radius.iter().fold(0.0f32, |a, b| a.max(*b));
+                let (lx, ly) = (Rect { x: r.x + m, width: r.width - 2.0 * m, ..r }, Rect { y: r.y + m, height: r.height - 2.0 * m, ..r });
+                self.opaco = Some(if lx.width * lx.height >= ly.width * ly.height { lx } else { ly });
+            }
+            if self.gravou(area, k) {
+                return;
+            }
         }
         if self.pintando_gpu {
             return self.quad_gpu(r, bg, border, shadow);
         }
+        let tela = r;
         let r = self.local(r);
         let s = self.scale;
         let esmaecido;
@@ -900,7 +1021,7 @@ impl Renderer {
             (bg, border)
         };
         if let Some(sh) = shadow.filter(|sh| sh.color.a > 0.0) {
-            self.shadow(r, border.radius, sh);
+            self.shadow(tela, border.radius, sh);
         }
         let Some(path) = rounded_path(r, border.radius, s) else { return };
         if let Some(bg) = bg.filter(|_| self.preencher(r, bg, border.radius)) {
@@ -917,16 +1038,25 @@ impl Renderer {
                     }
                 }
             };
-            self.preencher_caminho(&path, &p);
+            match rounded_path(tela, border.radius, s).filter(|_| self.parcial.is_some() && self.camadas.is_empty()) {
+                Some(janela) => self.preencher_parcial(&janela, &p, FillRule::Winding),
+                None => self.preencher_caminho(&path, &p),
+            }
         }
         if border.width > 0.0 && border.color.a > 0.0 {
             // A borda fica do lado de dentro: o anel entre o contorno e o contorno encolhido.
             let w = border.width;
+            // Num quadro parcial, o anel na janela (como o do quadro cheio): ver `preencher_parcial`.
+            let parcial = self.parcial.is_some() && self.camadas.is_empty();
+            let r = if parcial { tela } else { r };
             let dentro = Rect { x: r.x + w, y: r.y + w, width: r.width - 2.0 * w, height: r.height - 2.0 * w };
             let mut pb = PathBuilder::new();
             push_rounded_path(&mut pb, r, border.radius, s);
             push_rounded_path(&mut pb, dentro, border.radius.map(|v| (v - w).max(0.0)), s);
             if let Some(anel) = pb.finish() {
+                if parcial {
+                    return self.preencher_parcial(&anel, &paint(border.color), FillRule::EvenOdd);
+                }
                 let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
                 let mask = clip_mask(&mut self.clips, pw, ph, s, Some(anel.bounds()));
                 self.pixmap.fill_path(&anel, &paint(border.color), FillRule::EvenOdd, Transform::identity(), mask);
@@ -987,9 +1117,11 @@ impl Renderer {
     }
 
     /// Sombra desfocada de verdade, guardada em cache pelo tamanho, raio, desfoque e cor.
-    fn shadow(&mut self, r: Rect, radius: [f32; 4], sh: Shadow) {
+    fn shadow(&mut self, tela: Rect, radius: [f32; 4], sh: Shadow) {
+        let r = self.local(tela);
         let s = self.scale;
         let m = (sh.blur * s).ceil();
+        let (x, y) = (self.px(tela.x + sh.offset.x, false) - m as i32, self.px(tela.y + sh.offset.y, true) - m as i32);
         let (bw, bh) = ((r.width * s).ceil(), (r.height * s).ceil());
         if bw < 1.0 || bh < 1.0 {
             return;
@@ -1007,17 +1139,33 @@ impl Renderer {
         let pm = self.shadows.pegar(key, || {
             let mut pm = Pixmap::new(w as u32, h as u32).expect("w, h >= 1");
             let caixa = Rect { x: m / s, y: m / s, width: bw / s, height: bh / s };
-            if let Some(p) = rounded_path(caixa, radius, s) {
-                pm.fill_path(&p, &paint(sh.color), FillRule::Winding, Transform::identity(), None);
-            }
-            if m < 1.0 {
+            let b = sh.blur * s;
+            if b < 0.5 {
+                if let Some(p) = rounded_path(caixa, radius, s) {
+                    pm.fill_path(&p, &paint(sh.color), FillRule::Winding, Transform::identity(), None);
+                }
                 return pm;
             }
-            let px: Vec<[u32; 4]> = pm.pixels().iter().map(|p| [p.red() as u32, p.green() as u32, p.blue() as u32, p.alpha() as u32]).collect();
-            let (pq, d) = desfocar(px, w as usize, h as usize, (m / 3.0).round().max(1.0) as usize);
-            if d > 1.0 { escalar(&pq, w as u32, h as u32, None) } else { pq }
+            // A sombra do Iced (o mesmo `sombra` da GPU): 0,5 na borda, some a `b` dela.
+            let (meia, k) = ([bw / 2.0, bh / 2.0], radius.map(|v| (v * s).min(bw.min(bh) / 2.0)));
+            let c = sh.color;
+            for (i, px) in pm.pixels_mut().iter_mut().enumerate() {
+                let (x, y) = ((i % w as usize) as f32 + 0.5 - m - meia[0], (i / w as usize) as f32 + 0.5 - m - meia[1]);
+                let r = match (x > 0.0, y > 0.0) {
+                    (false, false) => k[0],
+                    (true, false) => k[1],
+                    (true, true) => k[2],
+                    (false, true) => k[3],
+                };
+                let (px_, py) = ((x.abs() - meia[0] + r).max(0.0), (y.abs() - meia[1] + r).max(0.0));
+                let d = (px_.hypot(py) - r).max(0.0);
+                let t = ((d + b) / (2.0 * b)).clamp(0.0, 1.0);
+                let a = (1.0 - t * t * (3.0 - 2.0 * t)) * c.a;
+                let q = |v: f32| (v * a * 255.0).round() as u8;
+                *px = tiny_skia::PremultipliedColorU8::from_rgba(q(c.r), q(c.g), q(c.b), q(1.0)).expect("pré-multiplicada");
+            }
+            pm
         });
-        let (x, y) = (((r.x + sh.offset.x) * s - m).round() as i32, ((r.y + sh.offset.y) * s - m).round() as i32);
         let caixa = tiny_skia::Rect::from_xywh(r.x * s, r.y * s, r.width * s, r.height * s).map(|f| (f, radius.map(|v| v * s)));
         let fatia = |alvo: usize, n: usize| -> Vec<usize> {
             let c = n / 2;
@@ -1048,6 +1196,9 @@ impl Renderer {
         }
         let mut k = Chave::new(3);
         k.h(img.1).r(r).h(radius.map(f32::to_bits));
+        if radius.iter().all(|v| *v == 0.0) && *self.imagens_opacas.entry(img.1).or_insert_with(|| img.0.pixels().iter().all(|p| p.alpha() == 255)) {
+            self.opaco = Some(r);
+        }
         if self.gravou(r, k) {
             return;
         }
@@ -1059,7 +1210,7 @@ impl Renderer {
         let tela = r;
         let r = self.local(r);
         let s = self.scale;
-        let (x, y, w, h) = ((r.x * s).round() as i32, (r.y * s).round() as i32, (r.width * s).round() as u32, (r.height * s).round() as u32);
+        let (x, y, w, h) = (self.px(tela.x, false), self.px(tela.y, true), (r.width * s).round() as u32, (r.height * s).round() as u32);
         if w == 0 || h == 0 {
             return;
         }
@@ -1091,14 +1242,17 @@ impl Renderer {
     /// A imagem esticada em `r` pela transformação inteira (a do usuário, a escala, a camada).
     fn imagem_transformada(&mut self, img: &Image, r: Rect, filtro: FilterQuality) {
         self.falta("imagem transformada ou sem suavizar");
+        let mut k = Chave::new(12);
+        k.h(img.1).r(r).h(matches!(filtro, FilterQuality::Nearest));
+        let t = self.transformacoes.last().copied().unwrap_or_default();
+        let tt = t.0;
+        k.f(tt.sx).f(tt.ky).f(tt.kx).f(tt.sy).f(tt.tx).f(tt.ty);
         if self.gravando {
-            let mut k = Chave::new(12);
-            k.h(img.1).r(r).h(matches!(filtro, FilterQuality::Nearest));
-            let t = self.transformacoes.last().copied().unwrap_or_default();
-            let tt = t.0;
-            k.f(tt.sx).f(tt.ky).f(tt.kx).f(tt.sy).f(tt.tx).f(tt.ty);
             let area = vetor::Path::rect(r).and_then(|p| p.transform(t)).map_or(r, |p| p.bounds());
             self.gravou(area, k);
+            return;
+        }
+        if self.oculto(k) {
             return;
         }
         let (iw, ih) = (img.0.width() as f32, img.0.height() as f32);
@@ -1123,6 +1277,7 @@ impl Renderer {
         if self.gravou(r, k) {
             return;
         }
+        let tela = r;
         let r = self.local(r);
         let (w, h) = ((r.width * s).round() as u32, (r.height * s).round() as u32);
         if w == 0 || h == 0 {
@@ -1143,7 +1298,7 @@ impl Renderer {
             }
             Some(pm)
         };
-        let (x, y) = ((r.x * s).round() as i32, (r.y * s).round() as i32);
+        let (x, y) = (self.px(tela.x, false), self.px(tela.y, true));
         let parte;
         let (pm, x, y) = if w as u64 * h as u64 <= 1 << 22 {
             let key = SvgKey { tree: svg.1, w, h, color: cor };
@@ -1168,6 +1323,17 @@ impl Renderer {
             parte = p;
             (&parte, x0, y0)
         };
+        // Com deslocamento negativo (o ícone começa antes da região parcial) o `draw_pixmap` do
+        // tiny-skia pinta uma linha/coluna a mais: corta a parte de fora antes.
+        let cortada;
+        let (pm, x, y) = if x < 0 || y < 0 {
+            let (cx, cy) = ((-x).max(0), (-y).max(0));
+            let Some(p) = tiny_skia::IntRect::from_xywh(cx, cy, pm.width().saturating_sub(cx as u32), pm.height().saturating_sub(cy as u32)).and_then(|r| pm.clone_rect(r)) else { return };
+            cortada = p;
+            (&cortada, x.max(0), y.max(0))
+        } else {
+            (pm, x, y)
+        };
         let (w, h) = (pm.width(), pm.height());
         let area = tiny_skia::Rect::from_xywh(x as f32, y as f32, w as f32, h as f32);
         let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
@@ -1181,7 +1347,7 @@ impl Renderer {
         if cor.a * self.opacidade < 1.0 && pontos.len() > 2 {
             self.falta("traço translúcido");
         }
-        if self.gravando {
+        {
             let mut k = Chave::new(5);
             k.f(largura).c(cor);
             let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -1189,10 +1355,9 @@ impl Renderer {
                 k.f(p.x).f(p.y);
                 (x0, y0, x1, y1) = (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y));
             }
-            if !pontos.is_empty() {
-                self.gravou(crescer(Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }, largura / 2.0), k);
+            if pontos.is_empty() || self.gravou(crescer(Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }, largura / 2.0), k) {
+                return;
             }
-            return;
         }
         if self.pintando_gpu {
             let cor = self.esmaecer(cor);
@@ -1231,14 +1396,15 @@ impl Renderer {
         if self.gravou(r, k) {
             return;
         }
+        let tela = r;
         let r = self.local(r);
         let s = self.scale;
         let (pw, ph) = (self.pixmap.width() as i32, self.pixmap.height() as i32);
         // Começa num múltiplo de 12 na janela inteira: o desfoque reduzido cai na mesma grade
         // no quadro cheio e no parcial (`begin_parcial`), e não aparece emenda.
-        let grade = |v: f32, o: i32| (v.floor() as i32 + o).div_euclid(12) * 12 - o;
-        let x0 = grade(r.x * s, self.desloc.0).clamp(0, pw);
-        let y0 = grade(r.y * s, self.desloc.1).clamp(0, ph);
+        let grade = |v: f32, o: i32| ((v * s).floor() as i32).div_euclid(12) * 12 - o;
+        let x0 = grade(tela.x, self.desloc.0).clamp(0, pw);
+        let y0 = grade(tela.y, self.desloc.1).clamp(0, ph);
         let x1 = (((r.x + r.width) * s).ceil() as i32).clamp(0, pw);
         let y1 = (((r.y + r.height) * s).ceil() as i32).clamp(0, ph);
         let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
@@ -1263,6 +1429,8 @@ impl Renderer {
 
     /// Daqui até o `pop_clip`, nada sai de `r` (nem dos cantos arredondados).
     pub fn push_clip(&mut self, r: Rect, radius: [f32; 4]) {
+        let tela = self.clips.last().map_or(r, |c| c.tela.intersect(&r));
+        let px = [self.px(tela.x, false), self.px(tela.y, true), self.px(tela.x + tela.width, false), self.px(tela.y + tela.height, true)];
         let r = self.local(r);
         let rect = self.clips.last().map_or(r, |c| c.rect.intersect(&r));
         let toca = |q: &Rect| q.x < rect.x + rect.width && rect.x < q.x + q.width && q.y < rect.y + rect.height && rect.y < q.y + q.height;
@@ -1277,7 +1445,7 @@ impl Renderer {
             }
         }
         let gpu = gpu::recorte(self.clips.last().map_or(&gpu::SEM_RECORTE, |c| &c.gpu), rect, r, radius, self.scale);
-        self.clips.push(Clip { rect, own: r, radius, rounded: !cantos.is_empty(), cantos, mask: None, gpu });
+        self.clips.push(Clip { rect, own: r, radius, rounded: !cantos.is_empty(), cantos, mask: None, gpu, tela, px });
     }
 
     pub fn pop_clip(&mut self) {
@@ -1733,6 +1901,11 @@ fn comparar(velho: &[(Rect, u64)], novo: &[(Rect, u64)], vidros: &[(Rect, f32)])
     let espalhados: Vec<Rect> = vidros.iter().flat_map(|(v, raio)| sujos.iter().filter(|s| cruza(**s, *v)).map(move |s| crescer(*s, *raio).intersect(v))).collect();
     sujos.extend(espalhados);
     // Junta as que se encostam; muitas pedaços viram uma só.
+    // shortcut: com muitas (selecionar tudo num slide cheio dá milhares) a junção abaixo, que
+    // recomeça a cada par, custava 100 ms; vira a união direto. Agrupar por grade se fizer falta.
+    if sujos.len() > 64 {
+        return Changes::Regions(vec![sujos.iter().copied().reduce(uniao).expect("não vazio")]);
+    }
     let mut juntou = true;
     while juntou {
         juntou = false;
@@ -1760,6 +1933,11 @@ pub(crate) fn sobra_glifos(size: f32, lh: f32) -> f32 {
     size * ((1.4 - lh).max(0.0) / 2.0 + 0.1)
 }
 
+/// `a` cabe inteiro em `o`.
+fn contem(o: &Rect, a: &Rect) -> bool {
+    o.x <= a.x && o.y <= a.y && o.x + o.width >= a.x + a.width && o.y + o.height >= a.y + a.height
+}
+
 pub(crate) fn crescer(r: Rect, m: f32) -> Rect {
     Rect { x: r.x - m, y: r.y - m, width: r.width + 2.0 * m, height: r.height + 2.0 * m }
 }
@@ -1777,6 +1955,50 @@ fn uniao(a: Rect, b: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Milhares de mudanças (selecionar tudo num slide cheio) viram uma região só, sem a junção par a par.
+    #[test]
+    fn muitas_mudancas_viram_uma_regiao() {
+        let velho: Vec<(Rect, u64)> = (0..5000).map(|i| (Rect { x: (i % 100) as f32 * 10.0, y: (i / 100) as f32 * 10.0, width: 5.0, height: 5.0 }, i)).collect();
+        let novo: Vec<(Rect, u64)> = velho.iter().map(|(r, k)| (*r, k + 10_000)).collect();
+        match comparar(&velho, &novo, &[]) {
+            Changes::Regions(r) => assert_eq!(r.len(), 1),
+            _ => panic!("devia ser uma região"),
+        }
+    }
+
+    /// Ícone refeito a cada `view` (mesmos bytes) é o mesmo `Svg`: não muda a chave do desenho.
+    #[test]
+    fn svg_igual_tem_o_mesmo_id() {
+        let b = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M2 2h20v20z"/></svg>"#;
+        let (a, c) = (Svg::from_bytes(b).unwrap(), Svg::from_bytes(b).unwrap());
+        assert_eq!(a.1, c.1);
+        assert!(Arc::ptr_eq(&a.0, &c.0));
+        assert_ne!(a.1, Svg::from_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"/>"#).unwrap().1);
+    }
+
+    /// O culling pula o que um opaco cobre depois, e o quadro sai igual ao sem culling.
+    #[test]
+    fn culling_pula_o_coberto_e_nao_muda_o_quadro() {
+        let tam = Size::new(200.0, 120.0);
+        let azul = Background::Color(Color::rgb8(0x3b, 0x82, 0xf6));
+        let cena = |r: &mut Renderer| {
+            r.draw_text("escondido atrás", 14.0, crate::Font::DEFAULT, Color::BLACK, Point::new(20.0, 20.0), None);
+            r.fill_quad(Rect { x: 30.0, y: 70.0, width: 40.0, height: 20.0 }, Some(&Background::Color(Color::rgb8(200, 0, 0))), Border::default(), None);
+            r.fill_quad(Rect { x: 10.0, y: 10.0, width: 150.0, height: 50.0 }, Some(&azul), Border::rounded(6.0), None);
+        };
+        let mut sem = Renderer::new();
+        sem.begin(tam, 1.0, Color::WHITE);
+        cena(&mut sem);
+        let mut com = Renderer::new();
+        com.record();
+        cena(&mut com);
+        com.changes();
+        assert_eq!(com.ocultos.len(), 1, "só o texto, todo atrás da caixa azul");
+        com.begin(tam, 1.0, Color::WHITE);
+        cena(&mut com);
+        assert_eq!(sem.pixmap.data(), com.pixmap.data());
+    }
 
     #[test]
     fn corte_so_fora_do_recorte_e_sem_transformacao() {

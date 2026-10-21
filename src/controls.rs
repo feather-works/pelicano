@@ -2,7 +2,7 @@
 use crate::access::accesskit::{Action, Role};
 use crate::anim::{Lerp, Transition};
 use crate::widget::{no, surgir, text_input, TextInput, ABRIR, CursorIcon, DrawCx, Element, EventCx, LayoutCx, Limits, Node, Num, Widget};
-use crate::{Background, Border, Captured, Color, Event, Font, Key, Length, MouseButton, NamedKey, Padding, Point, Rect, Renderer, Shadow, Size, Status, Theme};
+use crate::{Background, Border, Captured, Color, Event, Font, Key, Length, MouseButton, NamedKey, Padding, Point, Rect, Renderer, Shadow, Size, Status, Style, Theme};
 use std::borrow::Cow;
 
 fn status(desabilitado: bool, hover: bool) -> Status {
@@ -161,10 +161,14 @@ pub struct PickList<'a, T, M> {
     width: Length,
     size: f32,
     menu_height: f32,
+    padding: Padding,
+    style: Option<Box<dyn Fn(&Theme, Status) -> Style + 'a>>,
+    handle_color: Option<Color>,
 }
 
 pub fn pick_list<'a, T: Clone + PartialEq + ToString, M>(options: &'a [T], selected: Option<T>, on_select: impl Fn(T) -> M + 'a) -> PickList<'a, T, M> {
-    PickList { options, selected, on_select: Box::new(on_select), placeholder: "".into(), width: Length::Shrink, size: 14.0, menu_height: f32::INFINITY }
+    let padding = Padding { top: 7.0, right: 10.0, bottom: 7.0, left: 10.0 };
+    PickList { options, selected, on_select: Box::new(on_select), placeholder: "".into(), width: Length::Shrink, size: 14.0, menu_height: f32::INFINITY, padding, style: None, handle_color: None }
 }
 
 const ITEM: f32 = 30.0;
@@ -228,6 +232,22 @@ impl<'a, T: Clone + PartialEq + ToString, M> PickList<'a, T, M> {
         self.size = s.into().0;
         self
     }
+    /// Espaço em volta do texto do campo (a seta fica dentro do lado direito). Padrão 7 × 10.
+    pub fn padding(mut self, p: impl Into<Padding>) -> Self {
+        self.padding = p.into();
+        self
+    }
+    /// O campo fechado: `Idle`, `Hovered` ou `Pressed` (aberto). `text_color` vale também
+    /// para o texto de exemplo.
+    pub fn style(mut self, f: impl Fn(&Theme, Status) -> Style + 'a) -> Self {
+        self.style = Some(Box::new(f));
+        self
+    }
+    /// A cor da seta (padrão: a do texto).
+    pub fn handle_color(mut self, c: Color) -> Self {
+        self.handle_color = Some(c);
+        self
+    }
     /// A altura máxima do menu aberto; passando dela, ele rola.
     pub fn menu_height(mut self, h: impl Into<Num>) -> Self {
         self.menu_height = h.into().0;
@@ -248,8 +268,9 @@ impl<'a, T: Clone + PartialEq + ToString + 'a, M> Widget<M> for PickList<'a, T, 
         for o in self.options.iter() {
             w = w.max(cx.renderer.measure(&o.to_string(), self.size, Font::DEFAULT, None).width);
         }
-        let h = cx.renderer.measure("Ag", self.size, Font::DEFAULT, None).height + 14.0;
-        Node::leaf(cx.key(), Size::new(Limits::resolve(self.width, l.max.width, w + 20.0 + 24.0), h))
+        let pd = self.padding;
+        let h = cx.renderer.measure("Ag", self.size, Font::DEFAULT, None).height + pd.vertical();
+        Node::leaf(cx.key(), Size::new(Limits::resolve(self.width, l.max.width, w + pd.horizontal() + 24.0), h))
     }
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
         let t = *cx.theme;
@@ -258,11 +279,15 @@ impl<'a, T: Clone + PartialEq + ToString + 'a, M> Widget<M> for PickList<'a, T, 
         if hover {
             cx.cursor_icon = CursorIcon::Pointer;
         }
-        let borda = if aberto { t.primary } else if hover { t.muted } else { t.border };
-        cx.renderer.fill_quad(n.rect, Some(&t.surface.into()), Border::rounded(6.0).color(borda, 1.0), None);
+        let estilo = self.style.as_ref().map(|f| f(&t, if aberto { Status::Pressed } else if hover { Status::Hovered } else { Status::Idle }));
+        let (fundo, borda, texto) = match &estilo {
+            Some(e) => (e.background.clone(), e.border, e.text_color),
+            None => (Some(t.surface.into()), Border::rounded(6.0).color(if aberto { t.primary } else if hover { t.muted } else { t.border }, 1.0), None),
+        };
+        cx.renderer.fill_quad(n.rect, fundo.as_ref(), borda, None);
         let (rotulo, cor) = match &self.selected {
-            Some(s) => (s.to_string(), cx.text_color),
-            None => (self.placeholder.to_string(), t.muted),
+            Some(s) => (s.to_string(), texto.unwrap_or(cx.text_color)),
+            None => (self.placeholder.to_string(), texto.unwrap_or(t.muted)),
         };
         cx.access(n.key, n.rect, || {
             let mut a = no(Role::ComboBox, &[Action::Click]);
@@ -272,12 +297,17 @@ impl<'a, T: Clone + PartialEq + ToString + 'a, M> Widget<M> for PickList<'a, T, 
         });
         let th = cx.renderer.measure(&rotulo, self.size, Font::DEFAULT, None).height;
         let y = n.rect.y + (n.rect.height - th) / 2.0;
-        cx.renderer.push_clip(Rect { width: n.rect.width - 28.0, ..n.rect }, [0.0; 4]);
-        cx.renderer.draw_text(&rotulo, self.size, Font::DEFAULT, cor, Point::new(n.rect.x + 10.0, y), None);
+        let pd = self.padding;
+        // Recorta logo antes da seta (que vai de -12 a -4 do lado direito, menos o padding).
+        cx.renderer.push_clip(Rect { width: n.rect.width - pd.right - 13.0, ..n.rect }, [0.0; 4]);
+        cx.renderer.draw_text(&rotulo, self.size, Font::DEFAULT, cor, Point::new(n.rect.x + pd.left, y), None);
         cx.renderer.pop_clip();
-        let (ax, ay) = (n.rect.x + n.rect.width - 18.0, n.rect.y + n.rect.height / 2.0);
-        let seta = if aberto { [Point::new(ax - 4.0, ay + 2.0), Point::new(ax, ay - 2.0), Point::new(ax + 4.0, ay + 2.0)] } else { [Point::new(ax - 4.0, ay - 2.0), Point::new(ax, ay + 2.0), Point::new(ax + 4.0, ay - 2.0)] };
-        cx.renderer.stroke(&seta, 1.5, t.muted);
+        let (ax, ay) = (n.rect.x + n.rect.width - pd.right - 8.0, n.rect.y + n.rect.height / 2.0);
+        // Triângulo cheio, como o do Iced; de ponta para cima com o menu aberto.
+        let (y0, y1) = if aberto { (ay + 2.0, ay - 2.5) } else { (ay - 2.0, ay + 2.5) };
+        if let Some(p) = crate::Path::polyline(&[Point::new(ax - 4.0, y0), Point::new(ax + 4.0, y0), Point::new(ax, y1)], true) {
+            cx.renderer.fill_path(&p, self.handle_color.unwrap_or(cx.text_color), crate::FillRule::NonZero);
+        }
         // O menu surge ao abrir e se apaga ao fechar.
         let p = cx.transition(n.key, if aberto { 1.0f32 } else { 0.0 }, ABRIR);
         if p <= 0.0 {

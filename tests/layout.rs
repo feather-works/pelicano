@@ -70,3 +70,47 @@ fn captura_gera_png() {
     assert_eq!(&png[1..4], b"PNG");
     assert_eq!(Color::hex("#ff000080"), Some(Color::rgb(1.0, 0.0, 0.0).alpha(128.0 / 255.0)));
 }
+
+#[test]
+fn palavra_que_nao_cabe_nao_vira_coluna_de_letras() {
+    let mut r = Renderer::new();
+    r.begin(Size::new(500.0, 500.0), 1.0, Color::TRANSPARENT);
+    let palavra = r.measure("Substituir", 11.0, Font::DEFAULT, None);
+    // Numa caixa de 20, a palavra fica inteira numa linha e com a largura dela.
+    let el: Element<()> = container(text("Substituir").size(11)).width(20.0).into();
+    let n = montar(&el, Size::new(500.0, 500.0), &mut r, &States::default());
+    assert_eq!(n.children[0].rect.size(), palavra);
+    // Rótulo de botão não quebra nem entre palavras.
+    let el: Element<()> = container(button(text("Selecionar tudo").size(11)).padding(0.0)).width(40.0).into();
+    let n = montar(&el, Size::new(500.0, 500.0), &mut r, &States::default());
+    assert_eq!(n.children[0].rect.height, palavra.height);
+}
+
+#[test]
+fn reticencias_cortam_o_que_nao_cabe() {
+    let el: Element<()> = container(text("Verificar ortografia").ellipsis()).width(40.0).into();
+    let mut r = Renderer::new();
+    let n = montar(&el, Size::new(500.0, 500.0), &mut r, &States::default());
+    assert_eq!(n.children[0].rect.width, 40.0);
+    draw(&el, &n, &mut r, &States::default(), &Theme::dark(), None, false);
+}
+
+#[test]
+fn max_height_limita_contener_e_rolagem() {
+    let alto = || Space::new(50.0, 900.0);
+    let el: Element<()> = container(scrollable(alto()).height(Length::Shrink)).max_height(300.0).into();
+    let n = montar(&el, Size::new(500.0, 800.0), &mut Renderer::new(), &States::default());
+    assert_eq!(n.rect.height, 300.0);
+    let el: Element<()> = scrollable(alto()).height(Length::Shrink).max_height(200.0).into();
+    assert_eq!(montar(&el, Size::new(500.0, 800.0), &mut Renderer::new(), &States::default()).rect.height, 200.0);
+    // Baixo, cresce com o conteúdo.
+    let el: Element<()> = scrollable(Space::new(50.0, 80.0)).height(Length::Shrink).max_height(200.0).into();
+    assert_eq!(montar(&el, Size::new(500.0, 800.0), &mut Renderer::new(), &States::default()).rect.height, 80.0);
+}
+
+#[test]
+fn barra_com_espaco_fica_ao_lado_do_conteudo() {
+    let el: Element<()> = scrollable(Space::new(Length::FILL, 900.0)).width(182.0).height(300.0).scrollbar_width(6.0).scrollbar_spacing(4.0).into();
+    let n = montar(&el, Size::new(500.0, 800.0), &mut Renderer::new(), &States::default());
+    assert_eq!(n.children[0].rect.width, 182.0 - 10.0);
+}

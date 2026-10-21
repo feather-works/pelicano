@@ -1,6 +1,9 @@
 //! Desenho vetorial no [`Renderer`]: caminhos com curvas, preenchidos (cor ou degradê) ou
 //! contornados, debaixo de uma transformação (mover, girar, escalar) — o `Frame` do canvas.
 use super::{clip_mask, paint, skia_color, Chave, Renderer};
+use std::hash::Hasher;
+use std::sync::Arc;
+use tiny_skia::Pixmap;
 use crate::{Background, Color, Font, Point, Rect};
 use cosmic_text::Command;
 use tiny_skia::{GradientStop, LinearGradient, Paint, SpreadMode};
@@ -260,6 +263,136 @@ impl Renderer {
     fn transformacao(&self) -> Transform {
         self.transformacoes.last().copied().unwrap_or_default()
     }
+    /// O deslocamento da transformação atual, se ela só desloca. Aí dá para usar
+    /// `fill_quad`/`draw_text` (que vão à GPU e usam o cache de glifos) somando esse ponto.
+    pub fn translation(&self) -> Option<Point> {
+        let t = self.transformacao().0;
+        (t.sx == 1.0 && t.sy == 1.0 && t.kx == 0.0 && t.ky == 0.0).then(|| Point::new(t.tx, t.ty))
+    }
+
+    /// A caixa do caminho (com `margem` lógica) passa do que uma textura em cache aguenta.
+    fn grande_para_gpu(&self, p: &Path, margem: f32) -> bool {
+        let b = p.transform(self.transformacao()).map_or(Rect::default(), |p| p.bounds());
+        let s = self.scale;
+        // Só a parte na janela vai à textura (`caminho_gpu`): com zoom, o contorno do slide passa dela.
+        let j = self.window_size();
+        let (x0, y0) = ((b.x - margem).max(-1.0), (b.y - margem).max(-1.0));
+        let (x1, y1) = ((b.x + b.width + margem).min(j.width + 1.0), (b.y + b.height + margem).min(j.height + 1.0));
+        let (w, h) = ((x1 - x0).max(0.0) * s + 2.0, (y1 - y0).max(0.0) * s + 2.0);
+        let max = if self.gpu.max_textura > 0 { self.gpu.max_textura as f32 } else { 2048.0 };
+        w * h > (1u64 << 22) as f32 || w > max || h > max
+    }
+
+    /// Na GPU: `dev` (em pixels) é rasterizado pela CPU só na caixa dele e vai como textura em
+    /// cache. A chave é a forma relativa ao canto da caixa: mover por pixels inteiros reaproveita.
+    fn caminho_gpu(&mut self, dev: &tiny_skia::Path, fundo: &Background, logico: Rect, regra: tiny_skia::FillRule) {
+        // A posição vai para o quarto de pixel mais perto: arrastando (com zoom, quase sempre em
+        // fração de pixel) cada forma reaproveita uma de 16 rasterizações em vez de refazer.
+        let b = dev.bounds();
+        let quarto = |v: f32| (v * 4.0).round() / 4.0 - v;
+        let (ax, ay) = (quarto(b.left() - b.left().floor()), quarto(b.top() - b.top().floor()));
+        let Some(dev) = dev.clone().transform(tiny_skia::Transform::from_translate(ax, ay)) else { return };
+        let dev = &dev;
+        let b = dev.bounds();
+        // Rasteriza só o que cai na janela (os pontos entram na chave relativos a este canto).
+        let (jw, jh) = (self.tela.0 as f32 + 2.0, self.tela.1 as f32 + 2.0);
+        let (x0, y0) = (b.left().floor().max(-2.0), b.top().floor().max(-2.0));
+        let (x1, y1) = (b.right().ceil().min(jw), b.bottom().ceil().min(jh));
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let (w, h) = ((x1 - x0) as u32 + 1, (y1 - y0) as u32 + 1);
+        if w as u64 * h as u64 > 1 << 22 {
+            return;
+        }
+        let mut k = Chave::new(11);
+        k.h(regra == tiny_skia::FillRule::EvenOdd).h(w).h(h);
+        match fundo {
+            Background::Color(c) => k.c(*c),
+            // O degradê vem da caixa lógica e da transformação: só reaproveita parado.
+            Background::Linear { angle, stops } => {
+                k.f(*angle).r(logico).f(x0).f(y0);
+                let t = self.para_pixels();
+                k.f(t.sx).f(t.ky).f(t.kx).f(t.sy).f(t.tx).f(t.ty);
+                for (t, c) in stops {
+                    k.f(*t).c(*c);
+                }
+                &mut k
+            }
+        };
+        for q in dev.points() {
+            k.f(((q.x - x0) * 16.0).round()).f(((q.y - y0) * 16.0).round());
+        }
+        let chave = k.0.finish();
+        // Bits de cima 01: não colide com as imagens nem com os SVGs (bit 63).
+        let id = chave >> 2 | 1 << 62;
+        // A opacidade vai na instância (`imagem_gpu`), não nos pixels. O deslocamento do
+        // `fill_path` abaixo também move o degradê.
+        let opacidade = std::mem::replace(&mut self.opacidade, 1.0);
+        let pincel = self.pincel(fundo, logico);
+        self.opacidade = opacidade;
+        self.caminhos.aparar(self.caminhos.len() > 1024 || self.caminhos.bytes() > 64 << 20);
+        let pm = self
+            .caminhos
+            .pegar(chave, || {
+                let mut pm = Pixmap::new(w, h).expect("tamanho > 0");
+                pm.fill_path(dev, &pincel, regra, tiny_skia::Transform::from_translate(-x0, -y0), None);
+                Arc::new(pm)
+            })
+            .clone();
+        self.imagem_gpu(id, &pm, [x0, y0, w as f32, h as f32], [0.0; 4]);
+    }
+    /// Do lógico para os pixels da janela inteira (o `para_pixels` de um quadro cheio).
+    fn para_janela(&self) -> tiny_skia::Transform {
+        self.transformacao().0.post_scale(self.scale, self.scale)
+    }
+
+    /// Preenche `janela` (em pixels da janela) num quadro parcial. Direto no pixmap da região,
+    /// o tiny-skia corta as arestas na borda dela e refaz as inclinações: a borda da forma sai
+    /// diferente da do quadro cheio (rastro). A cobertura vai numa máscara da caixa da forma na
+    /// janela, cortada só onde o quadro cheio corta, e se pinta a parte que cai na região.
+    pub(super) fn preencher_parcial(&mut self, janela: &tiny_skia::Path, pincel: &Paint, regra: tiny_skia::FillRule) {
+        let Some(par) = &self.parcial else { return };
+        let (jw, jh) = (par.cheio.width() as i32, par.cheio.height() as i32);
+        let (ex, ey) = self.desloc;
+        let (pw, ph) = (self.pixmap.width() as i32, self.pixmap.height() as i32);
+        let b = janela.bounds();
+        let (bx0, by0) = ((b.left().floor() as i32).max(0), (b.top().floor() as i32).max(0));
+        let (bx1, by1) = ((b.right().ceil() as i32).min(jw), (b.bottom().ceil() as i32).min(jh));
+        // A parte da forma dentro da região, em pixels da janela.
+        let (x0, y0, x1, y1) = (bx0.max(ex), by0.max(ey), bx1.min(ex + pw), by1.min(ey + ph));
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let exata = tiny_skia::Rect::from_ltrb(b.left() - ex as f32, b.top() - ey as f32, b.right() - ex as f32, b.bottom() - ey as f32);
+        if (x0, y0, x1, y1) == (bx0, by0, bx1, by1) {
+            // Inteira na região: nada a cortar, direto (deslocar por pixels inteiros é exato).
+            let Some(dev) = janela.clone().transform(tiny_skia::Transform::from_translate(-ex as f32, -ey as f32)) else { return };
+            let mask = clip_mask(&mut self.clips, pw as u32, ph as u32, self.scale, exata);
+            return self.pixmap.fill_path(&dev, pincel, regra, tiny_skia::Transform::identity(), mask);
+        }
+        let Some(mut cob) = tiny_skia::Mask::new((bx1 - bx0) as u32, (by1 - by0) as u32) else { return };
+        // Deslocar por pixels inteiros não muda a cobertura (o tiny-skia rasteriza em ponto fixo).
+        cob.fill_path(janela, regra, true, tiny_skia::Transform::from_translate(-bx0 as f32, -by0 as f32));
+        let Some(mut m) = tiny_skia::Mask::new(pw as u32, ph as u32) else { return };
+        let (cw, n) = ((bx1 - bx0) as usize, (x1 - x0) as usize);
+        for y in y0..y1 {
+            let o = (y - by0) as usize * cw + (x0 - bx0) as usize;
+            let d = (y - ey) as usize * pw as usize + (x0 - ex) as usize;
+            m.data_mut()[d..d + n].copy_from_slice(&cob.data()[o..o + n]);
+        }
+        // O recorte decide pela caixa exata da forma, como no quadro cheio (a arredondada para
+        // pixels passaria da borda de um recorte fracionário e cortaria a coluna do antisserrilhado).
+        if let Some(c) = clip_mask(&mut self.clips, pw as u32, ph as u32, self.scale, exata) {
+            for (a, c) in m.data_mut().iter_mut().zip(c.data()) {
+                *a = ((*a as u32 * *c as u32 + 127) / 255) as u8;
+            }
+        }
+        if let Some(r) = tiny_skia::Rect::from_ltrb((x0 - ex) as f32, (y0 - ey) as f32, (x1 - ex) as f32, (y1 - ey) as f32) {
+            self.pixmap.fill_rect(r, pincel, tiny_skia::Transform::identity(), Some(&m));
+        }
+    }
+
     /// Do lógico (com a transformação do usuário) para os pixels do pixmap atual.
     fn para_pixels(&self) -> tiny_skia::Transform {
         let s = self.scale;
@@ -268,9 +401,6 @@ impl Renderer {
 
     /// A área (lógica, na tela) que o caminho cobre, e a impressão digital dele.
     fn anotar(&mut self, p: &Path, margem: f32, k: &mut Chave) -> bool {
-        if !self.gravando {
-            return false;
-        }
         let t = self.transformacao();
         k.h(p.0.points().len());
         for q in p.0.points() {
@@ -278,9 +408,12 @@ impl Renderer {
         }
         let tt = t.0;
         k.f(tt.sx).f(tt.ky).f(tt.kx).f(tt.sy).f(tt.tx).f(tt.ty);
+        let k = std::mem::replace(k, Chave::new(0));
+        if !self.gravando {
+            return self.gravou(Rect::default(), k);
+        }
         let area = p.transform(t).map_or(Rect::default(), |p| p.bounds());
-        self.gravou(super::crescer(area, margem + 1.0), std::mem::replace(k, Chave::new(0)));
-        true
+        self.gravou(super::crescer(area, margem + 1.0), k)
     }
 
     fn pincel(&self, fundo: &Background, caixa: Rect) -> Paint<'static> {
@@ -313,15 +446,27 @@ impl Renderer {
                 &mut k
             }
         };
-        self.falta("caminho preenchido");
+        if self.gravando && self.grande_para_gpu(p, 0.0) {
+            self.falta("caminho grande demais");
+        }
         if self.anotar(p, 0.0, &mut k) {
             return;
         }
         let Some(dev) = p.0.clone().transform(self.para_pixels()) else { return };
+        if self.pintando_gpu {
+            let regra = if regra == FillRule::EvenOdd { tiny_skia::FillRule::EvenOdd } else { tiny_skia::FillRule::Winding };
+            return self.caminho_gpu(&dev, &fundo, p.bounds(), regra);
+        }
         let pincel = self.pincel(&fundo, p.bounds());
+        let regra = if regra == FillRule::EvenOdd { tiny_skia::FillRule::EvenOdd } else { tiny_skia::FillRule::Winding };
+        if self.parcial.is_some() && self.camadas.is_empty() {
+            if let Some(janela) = p.0.clone().transform(self.para_janela()) {
+                self.preencher_parcial(&janela, &pincel, regra);
+            }
+            return;
+        }
         let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
         let mask = clip_mask(&mut self.clips, pw, ph, self.scale, Some(dev.bounds()));
-        let regra = if regra == FillRule::EvenOdd { tiny_skia::FillRule::EvenOdd } else { tiny_skia::FillRule::Winding };
         self.pixmap.fill_path(&dev, &pincel, regra, tiny_skia::Transform::identity(), mask);
     }
 
@@ -348,10 +493,38 @@ impl Renderer {
             Background::Linear { .. } => None,
         };
         let opaca = cor_lisa.is_some_and(|c| c.a >= 1.0) || p.0.len() <= 2;
-        if !(retas && opaca && traco.cap == LineCap::Round && traco.join == LineJoin::Round && traco.dash.is_empty() && cor_lisa.is_some()) {
-            self.falta("contorno com curva, ponta reta, tracejado ou translúcido");
+        // O resto vai à GPU como o caminho preenchido: o contorno rasterizado numa textura.
+        let capsulas = retas && opaca && traco.cap == LineCap::Round && traco.join == LineJoin::Round && traco.dash.is_empty() && cor_lisa.is_some();
+        if self.gravando && !capsulas && self.grande_para_gpu(p, sobra) {
+            self.falta("contorno grande demais");
         }
         if self.anotar(p, sobra, &mut k) {
+            return;
+        }
+        let ts = tiny_skia::Stroke {
+            width: traco.width,
+            line_cap: match traco.cap {
+                LineCap::Butt => tiny_skia::LineCap::Butt,
+                LineCap::Round => tiny_skia::LineCap::Round,
+                LineCap::Square => tiny_skia::LineCap::Square,
+            },
+            line_join: match traco.join {
+                LineJoin::Miter => tiny_skia::LineJoin::Miter,
+                LineJoin::Round => tiny_skia::LineJoin::Round,
+                LineJoin::Bevel => tiny_skia::LineJoin::Bevel,
+            },
+            dash: (traco.dash.len() >= 2).then(|| tiny_skia::StrokeDash::new(traco.dash.clone(), 0.0)).flatten(),
+            ..Default::default()
+        };
+        if self.pintando_gpu && !capsulas {
+            let t = self.para_pixels();
+            let res = tiny_skia::PathStroker::compute_resolution_scale(&t);
+            // `Path::stroke` não traceja: o `stroke_path` da CPU traceja antes, igual aqui.
+            let tracejado = ts.dash.as_ref().and_then(|d| p.0.dash(d, res));
+            let contorno = tracejado.as_ref().unwrap_or(&p.0).stroke(&ts, res);
+            if let Some(dev) = contorno.and_then(|c| c.transform(t)) {
+                self.caminho_gpu(&dev, &cor, p.bounds(), tiny_skia::FillRule::Winding);
+            }
             return;
         }
         if self.pintando_gpu {
@@ -377,22 +550,21 @@ impl Renderer {
             }
             return;
         }
-        let ts = tiny_skia::Stroke {
-            width: traco.width,
-            line_cap: match traco.cap {
-                LineCap::Butt => tiny_skia::LineCap::Butt,
-                LineCap::Round => tiny_skia::LineCap::Round,
-                LineCap::Square => tiny_skia::LineCap::Square,
-            },
-            line_join: match traco.join {
-                LineJoin::Miter => tiny_skia::LineJoin::Miter,
-                LineJoin::Round => tiny_skia::LineJoin::Round,
-                LineJoin::Bevel => tiny_skia::LineJoin::Bevel,
-            },
-            dash: (traco.dash.len() >= 2).then(|| tiny_skia::StrokeDash::new(traco.dash.clone(), 0.0)).flatten(),
-            ..Default::default()
-        };
         let pincel = self.pincel(&cor, p.bounds());
+        // Num quadro parcial, o contorno vira caminho como o `stroke_path` do tiny-skia faz (com a
+        // transformação da janela) e é preenchido como o cheio; o traço fino (até 1 pixel, que o
+        // tiny-skia faz como linha fina, com a mesma conta do `treat_as_hairline` dele) não.
+        let t = self.para_janela();
+        let curto = |x: f32, y: f32| x.abs().max(y.abs()) + x.abs().min(y.abs()) / 2.0;
+        let fino = traco.width == 0.0 || (curto(t.sx * traco.width, t.ky * traco.width) <= 1.0 && curto(t.kx * traco.width, t.sy * traco.width) <= 1.0);
+        if self.parcial.is_some() && self.camadas.is_empty() && !fino {
+            let res = tiny_skia::PathStroker::compute_resolution_scale(&t);
+            let tracejado = ts.dash.as_ref().and_then(|d| p.0.dash(d, res));
+            if let Some(janela) = tracejado.as_ref().unwrap_or(&p.0).stroke(&ts, res).and_then(|c| c.transform(t)) {
+                self.preencher_parcial(&janela, &pincel, tiny_skia::FillRule::Winding);
+            }
+            return;
+        }
         let t = self.para_pixels();
         let Some(dev) = p.0.clone().transform(t) else { return };
         let meia = sobra * self.scale;
