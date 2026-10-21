@@ -471,6 +471,27 @@ fn caixa_da_linha(texto: &str) -> Option<(usize, bool)> {
 struct Tons {
     sinal: cosmic_text::Color,
     link: cosmic_text::Color,
+    /// Os trechos com aviso nesta linha: link que toca um deles fica como texto, com o endereço à vista.
+    avisos: Vec<std::ops::Range<usize>>,
+}
+
+/// O endereço do `[texto](endereço)` que tem o byte `i`, lido como o desenho lê: o link que toca
+/// um aviso não conta (fica como texto).
+fn link_em(texto: &str, i: usize, avisos: &[std::ops::Range<usize>]) -> Option<String> {
+    let mut desde = 0;
+    while let Some(a) = texto[desde..].find('[').map(|a| desde + a) {
+        let f = texto[a..].find("](").map(|f| a + f)?;
+        let z = texto[f..].find(')').map(|z| f + z)?;
+        if avisos.iter().any(|r| r.start <= z && a < r.end) {
+            desde = a + 1;
+            continue;
+        }
+        if (a..=z).contains(&i) {
+            return Some(texto[f + 2..z].to_owned());
+        }
+        desde = z + 1;
+    }
+    None
 }
 
 fn cor_ct(c: Color) -> cosmic_text::Color {
@@ -604,7 +625,7 @@ fn inline(texto: &str, desde: usize, l: &mut AttrsList, base: Attrs<'static>, t:
         // [texto](endereço)
         if b[i] == b'[' {
             if let Some(f) = texto[i..].find("](").map(|f| i + f) {
-                if let Some(z) = texto[f..].find(')').map(|z| f + z) {
+                if let Some(z) = texto[f..].find(')').map(|z| f + z).filter(|&z| !t.avisos.iter().any(|a| a.start <= z && i < a.end)) {
                     l.add_span(i + 1..f, base.color(t.link).metadata(LINK));
                     l.add_span(i..i + 1, sinal);
                     l.add_span(f..z + 1, sinal);
@@ -668,14 +689,25 @@ pub struct TextEditor<'a, M> {
     placeholder: &'a str,
     id: Option<u64>,
     on_key: Option<Box<dyn Fn(&Key, crate::Modifiers) -> Option<M> + 'a>>,
+    warnings: Vec<Warning>,
+    on_link: Option<Box<dyn Fn(String) -> M + 'a>>,
     #[cfg(feature = "highlighter")]
     highlight: Option<(&'a str, crate::Highlight)>,
+}
+
+/// Um trecho sublinhado em onda laranja ([`TextEditor::warnings`]): a linha (contando de 0), os
+/// bytes dentro dela e a dica que aparece com o mouse em cima.
+#[derive(Clone, Debug, PartialEq, Hash)]
+pub struct Warning {
+    pub line: usize,
+    pub range: std::ops::Range<usize>,
+    pub tip: String,
 }
 
 /// Editor de várias linhas sobre um [`Content`]. Edita o conteúdo direto e avisa com
 /// `on_change` (para o app marcar "não salvo").
 pub fn text_editor<'a, M>(content: &'a Content) -> TextEditor<'a, M> {
-    TextEditor { content, size: 15.0, font: Font::DEFAULT, wrap: true, line_numbers: false, padding: Padding::from(12.0), on_change: None, style: None, autofocus: None, invisibles: false, markdown: false, line_height: None, placeholder: "", id: None, on_key: None, #[cfg(feature = "highlighter")] highlight: None }
+    TextEditor { content, size: 15.0, font: Font::DEFAULT, wrap: true, line_numbers: false, padding: Padding::from(12.0), on_change: None, style: None, autofocus: None, invisibles: false, markdown: false, line_height: None, placeholder: "", id: None, on_key: None, warnings: Vec::new(), on_link: None, #[cfg(feature = "highlighter")] highlight: None }
 }
 
 impl<'a, M> TextEditor<'a, M> {
@@ -733,6 +765,18 @@ impl<'a, M> TextEditor<'a, M> {
     fn altura(&self) -> f32 {
         self.line_height.unwrap_or(self.size * 1.45)
     }
+    /// Sublinha estes trechos em onda (aviso, erro de ortografia); a dica de cada um aparece com o
+    /// mouse em cima. Trecho fora do texto é ignorado.
+    pub fn warnings(mut self, w: Vec<Warning>) -> Self {
+        self.warnings = w;
+        self
+    }
+    /// Com [`markdown`](Self::markdown): Ctrl+clique num `[texto](endereço)` manda o endereço (o
+    /// clique simples só põe o cursor). Com o mouse em cima, a dica mostra o endereço.
+    pub fn on_link(mut self, f: impl Fn(String) -> M + 'a) -> Self {
+        self.on_link = Some(Box::new(f));
+        self
+    }
     pub fn line_numbers(mut self, n: bool) -> Self {
         self.line_numbers = n;
         self
@@ -774,6 +818,8 @@ struct Mouse {
     arrastando: bool,
     /// O último clique marcou uma caixinha: o próximo não vira clique duplo.
     caixa: bool,
+    /// Ctrl apertado: o link sob o mouse vira mãozinha e abre no clique.
+    ctrl: bool,
     ultimo: Option<(std::time::Instant, u8)>,
 }
 
@@ -823,7 +869,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             let base = crate::render::attrs(self.font);
             let primeira = b.scroll().line;
             let ultima = (primeira + (area.height / self.altura()) as usize + 2).min(b.lines.len());
-            let tons = Tons { sinal: cor_ct(cx.theme.muted), link: cor_ct(cx.theme.primary) };
+            let mut tons = Tons { sinal: cor_ct(cx.theme.muted), link: cor_ct(cx.theme.primary), avisos: Vec::new() };
             // Dentro de um bloco ``` ou não: conta as cercas desde o começo (só comparação de prefixo).
             let mut em_codigo = self.markdown
                 && match cercas {
@@ -842,7 +888,8 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                 }
                 return;
             }
-            for linha in &mut b.lines[primeira..ultima] {
+            for (k, linha) in b.lines[primeira..ultima].iter_mut().enumerate() {
+                tons.avisos = self.warnings.iter().filter(|w| w.line == primeira + k).map(|w| w.range.clone()).collect();
                 // Os sinais ficam escondidos sempre (como no Bloco de Notas do Windows): formatar é pelos atalhos.
                 let estilos = if self.markdown { markdown(linha.text(), base, metricas, &tons, &mut em_codigo, true) } else { AttrsList::new(base) };
                 linha.set_attrs_list(estilos);
@@ -859,6 +906,8 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         let mut tracos: Vec<(Rect, usize)> = Vec::new();
         let mut tarefas: Vec<(Rect, bool, usize)> = Vec::new();
         let mut enfeites: Vec<(Rect, usize)> = Vec::new();
+        let mut ondas: Vec<(Rect, usize)> = Vec::new();
+        let (mouse, mut link_sob_mouse) = (cx.cursor, None::<(Rect, String)>);
         let (rolagem, altura_linha) = ed.with_buffer(|b| {
             let h = b.scroll().horizontal;
             let mut anterior = usize::MAX;
@@ -893,6 +942,11 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                         let base = area.y + run.line_y / s;
                         let y = if g.metadata == TACHADO { base - g.font_size / s * 0.3 } else { base + 2.0 };
                         tracos.push((Rect { x: gx, y, width: gw, height: 1.0 }, g.metadata));
+                        let caixa = Rect { x: gx, y: area.y + run.line_top / s, width: gw, height: run.line_height / s };
+                        if g.metadata == LINK && link_sob_mouse.is_none() && mouse.is_some_and(|p| caixa.contains(p)) {
+                            let avisos: Vec<_> = self.warnings.iter().filter(|w| w.line == run.line_i).map(|w| w.range.clone()).collect();
+                            link_sob_mouse = link_em(run.text, g.start, &avisos).map(|u| (caixa, u));
+                        }
                     }
                 }
                 if self.invisibles {
@@ -910,6 +964,11 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                             _ if trecho.chars().any(is_invisible) => caixas.push(if gw < 1.0 { Rect { x: gx - 1.5, y: y + 2.0, width: 3.0, height: run.line_height / s - 4.0 } } else { Rect { x: gx, y: y + 2.0, width: gw, height: run.line_height / s - 4.0 } }),
                             _ => {}
                         }
+                    }
+                }
+                for (k, aviso) in self.warnings.iter().enumerate().filter(|(_, a)| a.line == run.line_i) {
+                    if let Some((x, w)) = run.highlight(Cursor::new(aviso.line, aviso.range.start), Cursor::new(aviso.line, aviso.range.end)).filter(|&(_, w)| w > 0.0) {
+                        ondas.push((Rect { x: area.x + (x - h) / s, y, width: w / s, height: run.line_height / s }, k));
                     }
                 }
                 if let Some((a, z)) = selecao {
@@ -930,6 +989,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         let caret = focado.then(|| ed.cursor_position()).flatten().map(|(x, y)| Point::new(area.x + (x as f32 - rolagem.horizontal) / s, area.y + y as f32 / s));
         let mut chave = std::collections::hash_map::DefaultHasher::new();
         (versao, rolagem.line, rolagem.vertical.to_bits(), rolagem.horizontal.to_bits(), (area.width * s) as u32, (self.size * s * 64.0) as u32, self.wrap, self.invisibles, self.markdown).hash(&mut chave);
+        self.warnings.hash(&mut chave);
         #[cfg(feature = "highlighter")]
         self.highlight.hash(&mut chave);
 
@@ -972,6 +1032,27 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         for r in &caixas {
             cx.renderer.fill_quad(*r, Some(&laranja.alpha(0.25).into()), Border::rounded(2.0).color(laranja, 1.0), None);
         }
+        // A onda: degraus de 2 px que sobem e descem logo abaixo das letras.
+        let mut dica = None;
+        for &(r, k) in &ondas {
+            let base = r.y + r.height - 3.5;
+            let mut x = r.x;
+            let mut sobe = false;
+            while x < r.x + r.width {
+                let w = (r.x + r.width - x).min(2.0);
+                cx.renderer.fill_quad(Rect { x, y: if sobe { base - 1.0 } else { base }, width: w, height: 1.2 }, Some(&laranja.into()), Border::default(), None);
+                x += 2.0;
+                sobe = !sobe;
+            }
+            if cx.hovered(&r) {
+                dica = Some((r, self.warnings[k].tip.clone()));
+            }
+        }
+        if link_sob_mouse.is_some() && cx.states.get::<Mouse>(n.key).is_some_and(|m| m.ctrl) && self.on_link.is_some() {
+            cx.cursor_icon = CursorIcon::Pointer;
+        }
+        // Link escondido pelo markdown: a dica mostra para onde ele leva de verdade.
+        let dica = dica.or_else(|| link_sob_mouse.map(|(r, u)| (r, if self.on_link.is_some() { format!("{u}\nCtrl+clique para abrir") } else { u })));
         let desce = (altura_linha - cx.renderer.measure("·", self.size, self.font, None).height) / 2.0;
         for &(x, y, m, centrada) in &marcas {
             let w = if centrada { cx.renderer.measure(m, self.size, self.font, None).width } else { 0.0 };
@@ -981,6 +1062,23 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             cx.renderer.fill_quad(Rect { x: p.x, y: p.y, width: 1.5, height: altura_linha }, Some(&cor.into()), Border::default(), None);
         }
         cx.renderer.pop_clip();
+        // A dica do trecho sob o mouse, por cima de tudo (como a do `tooltip`).
+        let p = cx.transition(n.key, if dica.is_some() { 1.0f32 } else { 0.0 }, if dica.is_some() { crate::Transition::new(120).delay(250) } else { crate::Transition::new(90) });
+        if let Some((r, tip)) = dica.filter(|_| p > 0.0) {
+            let (theme, janela) = (*cx.theme, cx.renderer.window_size());
+            cx.overlay(move |rd| {
+                rd.push_opacity(p);
+                let t = rd.measure(&tip, 12.0, Font::DEFAULT, Some(420.0));
+                let (w, h) = (t.width + 20.0, t.height + 12.0);
+                let x = r.x.clamp(4.0, (janela.width - w - 4.0).max(4.0));
+                // Embaixo da palavra; sem espaço, em cima.
+                let y = if r.y + r.height + 4.0 + h > janela.height { r.y - h - 4.0 } else { r.y + r.height + 4.0 };
+                let sombra = crate::Shadow { color: Color::BLACK.alpha(0.3), offset: Point::new(0.0, 2.0), blur: 6.0 };
+                rd.fill_quad(Rect { x, y, width: w, height: h }, Some(&theme.surface.into()), Border::rounded(6.0).color(theme.border, 1.0), Some(sombra));
+                rd.draw_text(&tip, 12.0, Font::DEFAULT, theme.text, Point::new(x + 10.0, y + 6.0), Some(420.0));
+                rd.pop_opacity();
+            });
+        }
         i.cercas = cercas;
         #[cfg(feature = "highlighter")]
         {
@@ -1017,7 +1115,27 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         // O primeiro evento pode vir antes do primeiro desenho (testes): monta já.
         i.editor(cx.renderer.fonts(), self.size, self.altura(), s, self.font, self.wrap);
         let antes = i.versao;
+        // Ctrl+clique num link: o endereço vai para o app e o cursor fica onde estava.
+        let ctrl = cx.states.get::<Mouse>(n.key).is_some_and(|m| m.ctrl);
+        let mut link = None;
+        if self.markdown && ctrl && self.on_link.is_some() && dentro && matches!(ev, Event::MousePressed(MouseButton::Left)) {
+            let (x, y) = ponto(cx.cursor.unwrap_or(Point::ORIGIN));
+            link = i.ed.as_ref().expect("montado acima").with_buffer(|b| {
+                let c = b.hit(x as f32, y as f32)?;
+                let avisos: Vec<_> = self.warnings.iter().filter(|w| w.line == c.line).map(|w| w.range.clone()).collect();
+                link_em(b.lines[c.line].text(), c.index, &avisos)
+            });
+        }
         let resultado = match ev {
+            Event::ModifiersChanged(m) => {
+                cx.states.get_mut::<Mouse>(n.key).ctrl = m.control_key();
+                cx.redraw = true;
+                Captured::No
+            }
+            Event::MousePressed(MouseButton::Left) if link.is_some() => {
+                cx.publish((self.on_link.as_ref().expect("conferido"))(link.clone().expect("conferido")));
+                Captured::Yes
+            }
             Event::MousePressed(MouseButton::Left) if dentro => {
                 cx.states.focus = Some(n.key);
                 let (x, y) = ponto(cx.cursor.unwrap_or(Point::ORIGIN));
@@ -1191,7 +1309,7 @@ mod testes {
     #[test]
     fn markdown_marca_cada_trecho() {
         let base = Attrs::new();
-        let t = Tons { sinal: cosmic_text::Color::rgb(1, 1, 1), link: cosmic_text::Color::rgb(2, 2, 2) };
+        let t = Tons { sinal: cosmic_text::Color::rgb(1, 1, 1), link: cosmic_text::Color::rgb(2, 2, 2), avisos: Vec::new() };
         let m = Metrics::new(15.0, 22.0);
         // (peso, tem tamanho próprio, cor, marca, estilo) do byte `i`.
         let estilo = |texto: &str, i: usize| {
@@ -1211,6 +1329,10 @@ mod testes {
         assert_eq!(estilo("- [x] feito", 7).metadata, TACHADO);
         assert_eq!(estilo("- [ ] falta", 7).metadata, 0);
         assert_eq!(estilo("[a](b)", 1).metadata, LINK);
+        // Com aviso no endereço, o link fica como texto: nada escondido.
+        let t2 = Tons { sinal: t.sinal, link: t.link, avisos: vec![4..5] };
+        let l = markdown("[a](b)", base, m, &t2, &mut false, true);
+        assert!((0..6).all(|i| l.get_span(i).metadata != LINK && l.get_span(i).color_opt.is_none_or(|c| c.a() > 0)));
         assert_eq!(estilo("snake_case_nome", 6).style, Estilo::Normal);
         assert_eq!(estilo("um *dois* tres", 5).style, Estilo::Italic);
         // Fora da linha do cursor os sinais somem (transparentes); o texto fica.

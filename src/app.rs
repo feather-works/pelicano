@@ -1327,16 +1327,30 @@ const SHADER: &str = r#"
 impl Gpu {
     /// O aparelho, escolhido para a primeira janela, e a tela dela.
     fn new(w: Arc<Window>, transparente: bool, pintar: bool) -> Result<(Self, Tela), String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
-        let surface = instance.create_surface(w.clone()).map_err(|e| e.to_string())?;
-        // A placa dedicada, se houver; o rasterizador em software (llvmpipe) só se não tiver outra.
-        let pedido = wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: Some(&surface), force_fallback_adapter: false };
-        let mut adapter = futures::executor::block_on(instance.request_adapter(&pedido)).ok_or("nenhum adaptador gráfico")?;
-        if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
-            if let Some(a) = instance.enumerate_adapters(wgpu::Backends::all()).into_iter().find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu && a.is_surface_supported(&surface)) {
-                adapter = a;
+        // Vulkan/DX12/Metal primeiro: só sondar o OpenGL já carrega o driver dele (no Mesa, ~15 MB a
+        // mais) sem nunca usá-lo. O OpenGL fica para a placa que não tem os outros.
+        let mut achado = None;
+        for backends in [wgpu::Backends::PRIMARY, wgpu::Backends::GL] {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..Default::default() });
+            let Ok(surface) = instance.create_surface(w.clone()) else { continue };
+            // A placa dedicada, se houver; o rasterizador em software (llvmpipe) só se não tiver outra.
+            let pedido = wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: Some(&surface), force_fallback_adapter: false };
+            let Some(mut adapter) = futures::executor::block_on(instance.request_adapter(&pedido)) else { continue };
+            if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+                if let Some(a) = instance.enumerate_adapters(backends).into_iter().find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu && a.is_surface_supported(&surface)) {
+                    adapter = a;
+                }
+            }
+            // Só o Vulkan em software (lavapipe): fica de reserva, o OpenGL ainda pode ter a placa.
+            let cpu = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
+            if achado.is_none() || !cpu {
+                achado = Some((instance, surface, adapter));
+            }
+            if !cpu {
+                break;
             }
         }
+        let (instance, surface, adapter) = achado.ok_or("nenhum adaptador gráfico")?;
         let info = adapter.get_info();
         let limites = gpu::limites(&adapter);
         let env = std::env::var("PELICANO_GPU").ok();

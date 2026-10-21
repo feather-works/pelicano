@@ -39,7 +39,7 @@ pub use render::{load_font, Changes, Font, Image, Renderer, Svg};
 #[doc(hidden)]
 pub use render::gpu::GpuOffscreen;
 pub use controls::*;
-pub use editor::{is_invisible, text_editor, Content, TextEditor};
+pub use editor::{is_invisible, text_editor, Content, TextEditor, Warning};
 pub use pickers::*;
 pub use markdown::markdown;
 #[cfg(feature = "terminal")]
