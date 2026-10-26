@@ -90,7 +90,23 @@ fn main() -> Result<(), pelicano::Error> {
 | `start_hidden` | `bool` | `false` | A principal não abre sozinha; só com `Task::open_window(WindowId::MAIN, …)`. |
 | `debug` | `bool` | `false` | Libera o inspetor de layout no F12. `PELICANO_DEBUG=1` também libera, já ligado. |
 
-Variáveis de ambiente: `PELICANO_DEBUG=1` (inspetor ligado) e `PELICANO_DANO=1` (imprime as regiões redesenhadas).
+Variáveis de ambiente: `PELICANO_DEBUG=1` (inspetor ligado), `PELICANO_DANO=1` (imprime as regiões redesenhadas),
+`PELICANO_ROTEIRO=arquivo` (a janela principal segue o roteiro, com o cursor do Claude desenhado e o mouse de verdade
+ignorado) e `PELICANO_GRAVAR=video.mp4` (os quadros da principal vão ao `ffmpeg`, pela CPU; o vídeo fecha no fim do
+roteiro ou ao sair).
+
+Roteiro, um passo por linha (`#` comenta):
+
+```text
+esperar 600
+mover "Controles" 900   # até o widget com esse texto (o da acessibilidade), em 900 ms
+mover 320 180           # ou até x y lógicos (700 ms)
+clicar
+digitar Olá
+tecla Ctrl+Shift+Z      # Enter, Tab, Escape, Backspace, Delete, Space, setas, Home, End, PageUp, PageDown, F11
+rolar -300
+sair                    # fecha como o X da janela
+```
 
 ### `Task<M>`
 

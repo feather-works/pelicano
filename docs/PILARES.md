@@ -43,6 +43,7 @@ Checklist dos seis pilares de um motor de interface, com o estado do pelicano ve
 | Grid | ❌ | — | Trilhas, áreas e spans |
 | Tamanho e alinhamento | ✅ `Length::{Fixed, Fill, Shrink}`, `Align` | `src/lib.rs` (`Length`, `Align`) | — |
 | Inspetor de layout | ✅ mostra margin, padding e conteúdo; F12 ou `PELICANO_DEBUG=1` | `src/widget.rs` (`inspect`); `src/app.rs` (F12, `PELICANO_DEBUG`) | Só liga com `Settings { debug: true }` |
+| Demonstração gravada | ✅ roteiro com cursor desenhado (`PELICANO_ROTEIRO`) e vídeo pelo ffmpeg (`PELICANO_GRAVAR`) | `src/roteiro.rs`; `src/app.rs` (`seguir_roteiro`, gravador no `redraw`) | Só a janela principal; resize no meio pula quadros |
 
 ## 4. Renderização
 
