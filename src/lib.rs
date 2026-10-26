@@ -30,7 +30,7 @@ pub use access::{accesskit, Access};
 #[cfg(feature = "highlighter")]
 pub use highlight::Highlight;
 pub use anim::{animate, Animate, Easing, Keyframe, Lerp, Repeat, Transition};
-pub use app::{run, App, Error, Handle, Settings, Subscription, Task, WindowCmd, WindowId};
+pub use app::{run, validar_roteiro, App, Error, Handle, Settings, Subscription, Task, WindowCmd, WindowId};
 /// Canais e fluxos para as tarefas ([`Task::run`]).
 pub use futures;
 /// A alça crua da janela ([`Task::window_handle`]).

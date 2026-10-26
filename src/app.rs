@@ -143,6 +143,15 @@ pub enum WindowCmd {
     /// Põe o canto da janela em `p` (lógico, na área de trabalho).
     /// shortcut: o Wayland ignora, como em `Settings::position`.
     Move(Point),
+    /// Segue um roteiro nesta janela, com o cursor desenhado (mesma língua do
+    /// `PELICANO_ROTEIRO`, ver [`validar_roteiro`]). Com um roteiro já andando na mesma
+    /// janela, os passos entram no fim; o cursor continua de onde o último parou.
+    Roteiro(String),
+}
+
+/// Confere um roteiro (o texto de [`WindowCmd::Roteiro`]) sem rodar: o erro diz a linha.
+pub fn validar_roteiro(texto: &str) -> Result<(), String> {
+    crate::roteiro::ler(texto).map(|_| ())
 }
 
 /// Ordens para um widget, pelo `id` dele.
@@ -400,7 +409,7 @@ pub fn run<A: App>(settings: Settings, init: impl FnOnce() -> (A, Task<A::Msg>))
     let (app, task) = init();
     let mut renderer = Renderer::new();
     renderer.cache_textos = settings.text_cache;
-    let mut rt = Runtime { app, settings, proxy: event_loop.create_proxy(), tokio: tokio.handle().clone(), assinaturas: HashMap::new(), clipboard: Box::new(widget::MemoryClipboard::default()), janelas: Vec::new(), gpu: None, sem_gpu: std::env::var("PELICANO_GPU").is_ok_and(|v| v == "nenhuma"), renderer, modifiers: Modifiers::empty(), abrir: Vec::new(), pendentes: Vec::new(), alcas: Vec::new(), erro: None, sair: false, iniciou: false, inspecionar: false, intervalo: None, avisados: Default::default(), roteiro: None, gravar: std::env::var("PELICANO_GRAVAR").ok(), gravador: None, trabalhos: 0, saindo: None };
+    let mut rt = Runtime { app, settings, proxy: event_loop.create_proxy(), tokio: tokio.handle().clone(), assinaturas: HashMap::new(), clipboard: Box::new(widget::MemoryClipboard::default()), janelas: Vec::new(), gpu: None, sem_gpu: std::env::var("PELICANO_GPU").is_ok_and(|v| v == "nenhuma"), renderer, modifiers: Modifiers::empty(), abrir: Vec::new(), pendentes: Vec::new(), alcas: Vec::new(), erro: None, sair: false, iniciou: false, inspecionar: false, intervalo: None, avisados: Default::default(), roteiro: None, roteiro_janela: WindowId::MAIN, roteiro_cursor: Point::new(40.0, 40.0), gravar: std::env::var("PELICANO_GRAVAR").ok(), gravador: None, trabalhos: 0, saindo: None };
     if let Some(arq) = std::env::var_os("PELICANO_ROTEIRO") {
         let texto = std::fs::read_to_string(&arq).map_err(|e| Error::Window(format!("{}: {e}", arq.to_string_lossy())))?;
         rt.roteiro = Some(crate::roteiro::Roteiro::new(crate::roteiro::ler(&texto).map_err(Error::Window)?));
@@ -454,6 +463,10 @@ struct Runtime<A: App> {
     avisados: std::collections::HashSet<&'static str>,
     /// `PELICANO_ROTEIRO`: a demonstração que a janela principal segue ([`crate::roteiro`]).
     roteiro: Option<crate::roteiro::Roteiro>,
+    /// Em que janela o roteiro anda (o `PELICANO_ROTEIRO` é sempre a principal).
+    roteiro_janela: WindowId,
+    /// Onde o cursor desenhado parou, para o roteiro seguinte sair dali.
+    roteiro_cursor: Point,
     /// `PELICANO_GRAVAR`: para onde vai o vídeo; o gravador abre no primeiro quadro (com o tamanho).
     gravar: Option<String>,
     gravador: Option<crate::roteiro::Gravador>,
@@ -566,8 +579,25 @@ impl<A: App> Runtime<A> {
             }
             return;
         };
+        if let WindowCmd::Roteiro(texto) = c {
+            match crate::roteiro::ler(&texto) {
+                Ok(passos) => match self.roteiro.as_mut().filter(|_| self.roteiro_janela == id) {
+                    Some(rt) => rt.acrescentar(passos),
+                    None => {
+                        let mut rt = crate::roteiro::Roteiro::new(passos);
+                        rt.cursor = self.roteiro_cursor;
+                        self.roteiro = Some(rt);
+                        self.roteiro_janela = id;
+                    }
+                },
+                Err(e) => eprintln!("[roteiro] {e}"),
+            }
+            self.janelas[i].w.request_redraw();
+            return;
+        }
         let w = &self.janelas[i].w;
         match c {
+            WindowCmd::Roteiro(_) => unreachable!("tratado acima"),
             WindowCmd::Drag => drop(w.drag_window()),
             WindowCmd::DragResize(d) => drop(w.drag_resize_window(d)),
             WindowCmd::Minimize => w.set_minimized(true),
@@ -865,7 +895,8 @@ impl<A: App> Runtime<A> {
 
     /// Um passo do roteiro na janela principal; pede o próximo quadro enquanto ele não acaba.
     fn seguir_roteiro(&mut self, agora: std::time::Instant, prox: &mut Option<std::time::Instant>) {
-        let (Some(rt), Some(j)) = (self.roteiro.as_mut(), self.janelas.iter().find(|j| j.id == WindowId::MAIN)) else { return };
+        let alvo = self.roteiro_janela;
+        let (Some(rt), Some(j)) = (self.roteiro.as_mut(), self.janelas.iter().find(|j| j.id == alvo)) else { return };
         // Os rótulos vêm da árvore de acessibilidade do último quadro (áreas lógicas).
         // Só o que está à vista: a árvore também tem o que a rolagem deixou fora da janela.
         let tela = Self::logical_size(&j.w);
@@ -888,7 +919,9 @@ impl<A: App> Runtime<A> {
         }
         w.request_redraw();
         if s.acabou || s.sair {
-            self.roteiro = None;
+            if let Some(rt) = self.roteiro.take() {
+                self.roteiro_cursor = rt.cursor;
+            }
             // Sem o roteiro o quadro volta a comparar: o seguinte precisa ser inteiro para apagar a seta.
             if let Some(i) = self.indice(id) {
                 self.janelas[i].tudo = true;
@@ -948,7 +981,7 @@ impl<A: App> Runtime<A> {
         let fundo = if j.transparente { Color::TRANSPARENT } else { theme.background };
         let escala = w.scale_factor() as f32;
         // A principal no roteiro: o cursor desenhado não entra na comparação, então o quadro é sempre inteiro.
-        let principal = j.id == WindowId::MAIN;
+        let principal = j.id == self.roteiro_janela;
         let roteiro = self.roteiro.as_ref().filter(|_| principal);
         let tudo = std::mem::replace(&mut j.tudo, false) || roteiro.is_some();
         self.renderer.trocar(&mut j.quadro);
@@ -1211,7 +1244,7 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
     fn window_event(&mut self, el: &ActiveEventLoop, wid: winit::window::WindowId, we: WindowEvent) {
         let Some(i) = self.janelas.iter().position(|j| j.w.id() == wid) else { return };
         // No roteiro, o mouse de verdade não briga com o desenhado.
-        if self.roteiro.is_some() && self.janelas[i].id == WindowId::MAIN && matches!(we, WindowEvent::CursorMoved { .. } | WindowEvent::CursorLeft { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } | WindowEvent::Touch(_)) {
+        if self.roteiro.is_some() && self.janelas[i].id == self.roteiro_janela && matches!(we, WindowEvent::CursorMoved { .. } | WindowEvent::CursorLeft { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } | WindowEvent::Touch(_)) {
             return;
         }
         let j = &mut self.janelas[i];

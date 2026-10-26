@@ -18,7 +18,7 @@ personalizar — a ideia é chegar perto do que HTML + CSS permitem.
 - Hover que respeita camadas (o botão debaixo de um menu aberto não acende) e cursor do mouse que muda sozinho.
 - **Inspetor de layout** como o do navegador — desligado por padrão: `Settings { debug: true }` libera o F12 (ou `PELICANO_DEBUG=1`). Margem em laranja, padding em verde, conteúdo em azul, com o tamanho.
 - **Captura sem janela**: `capture(&app.view(), tamanho, escala, &tema, &mut Renderer::new(), None)` devolve o PNG — para testes e miniaturas.
-- **Demonstração gravada**: `PELICANO_ROTEIRO=demo.txt` faz o app seguir um roteiro com um cursor desenhado ("Claude", laranja): vai até o widget pelo texto dele, clica, digita, aperta teclas e rola; `PELICANO_GRAVAR=demo.mp4` grava a janela pelo `ffmpeg` (sozinho, grava você usando). Formato do roteiro em `src/roteiro.rs`.
+- **Demonstração gravada**: `PELICANO_ROTEIRO=demo.txt` faz o app seguir um roteiro com um cursor desenhado ("Claude", laranja): vai até o widget pelo texto dele, clica, digita, aperta teclas e rola; `PELICANO_GRAVAR=demo.mp4` grava a janela pelo `ffmpeg` (sozinho, grava você usando). Formato do roteiro em `src/roteiro.rs`. Com o app rodando, `Task::window_of(id, WindowCmd::Roteiro(texto))` faz o mesmo em qualquer janela (é por onde uma IA controla o app pelo MCP); `validar_roteiro` confere o texto antes.
 - `Widget` é um trait pequeno e público, e todo estilo é uma closure `Fn(&Theme, Status) -> Style`; `canvas` para desenho livre.
 
 ![inspetor](docs/inspetor.png)

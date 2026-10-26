@@ -7,6 +7,9 @@
 //! mover "Salvar" 800      # até o widget com esse rótulo (leitor de tela), em 800 ms
 //! mover 320 180           # ou até x y lógicos (700 ms)
 //! clicar
+//! duplo                   # duplo clique
+//! apertar                 # aperta o botão (arrastar: apertar, mover, soltar)
+//! soltar
 //! digitar Olá mundo
 //! tecla Ctrl+D            # Enter, Tab, Escape, Backspace, Delete, setas, Home, End, PageUp…
 //! rolar -120
@@ -71,6 +74,12 @@ pub(crate) fn ler(texto: &str) -> Result<Vec<Passo>, String> {
                 passos.push(Passo::Mover(alvo, tempo));
             }
             "clicar" => passos.extend([Passo::Apertar, Passo::Esperar(Duration::from_millis(90)), Passo::Soltar, Passo::Esperar(Duration::from_millis(150))]),
+            "duplo" => passos.extend([
+                Passo::Apertar, Passo::Esperar(Duration::from_millis(40)), Passo::Soltar, Passo::Esperar(Duration::from_millis(60)),
+                Passo::Apertar, Passo::Esperar(Duration::from_millis(40)), Passo::Soltar, Passo::Esperar(Duration::from_millis(150)),
+            ]),
+            "apertar" => passos.extend([Passo::Apertar, Passo::Esperar(Duration::from_millis(90))]),
+            "soltar" => passos.extend([Passo::Soltar, Passo::Esperar(Duration::from_millis(150))]),
             "digitar" => {
                 for c in resto.chars() {
                     let s = c.to_string();
@@ -152,6 +161,11 @@ pub(crate) struct Saida {
 impl Roteiro {
     pub(crate) fn new(passos: Vec<Passo>) -> Self {
         Roteiro { passos: passos.into(), atual: None, cursor: Point::new(40.0, 40.0), apertado: false, clique: None }
+    }
+
+    /// Passos novos no fim (outro pedido chegou com este ainda andando).
+    pub(crate) fn acrescentar(&mut self, passos: Vec<Passo>) {
+        self.passos.extend(passos);
     }
 
     /// Avança até `agora`. `achar` dá o meio do widget com o rótulo (lógico), se ele está na tela.
@@ -301,6 +315,20 @@ mod testes {
         assert!(ler("voar 1").is_err());
         assert!(ler("tecla Ctrl+Shift+z").unwrap().contains(&Passo::Tecla(Key::Character("Z".into()), None, Modifiers::CONTROL | Modifiers::SHIFT)));
         assert_eq!(ler("digitar #1").unwrap().len(), 4);
+        let arrastar = ler("apertar\nmover 5 5\nsoltar").unwrap();
+        assert_eq!((arrastar[0].clone(), arrastar.iter().filter(|p| **p == Passo::Soltar).count()), (Passo::Apertar, 1));
+        assert_eq!(ler("duplo").unwrap().iter().filter(|p| **p == Passo::Apertar).count(), 2);
+        assert!(crate::validar_roteiro("clicar\nvoar").unwrap_err().contains("linha 2"));
+    }
+
+    #[test]
+    fn acrescentar_continua_do_mesmo_cursor() {
+        let mut r = Roteiro::new(ler("mover 30 0 0").unwrap());
+        let t0 = Instant::now();
+        r.tick(t0, |_| None);
+        r.acrescentar(ler("clicar").unwrap());
+        let s = r.tick(t0 + Duration::from_millis(1), |_| None);
+        assert_eq!((r.cursor.x, s.eventos.last()), (30.0, Some(&Event::MousePressed(MouseButton::Left))));
     }
 
     #[test]
