@@ -445,7 +445,8 @@ pub fn access_tree<M>(el: &Element<'_, M>, node: &Node, renderer: &mut Renderer,
 
 /// Passa um evento pela árvore; o clique fora de um campo tira o foco dele.
 pub fn dispatch<M>(el: &Element<'_, M>, node: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
-    if matches!(ev, Event::MousePressed(_)) && cx.states.focus.take().is_some() {
+    // Só o botão esquerdo: o direito num campo abre menu sem tirar o foco dele.
+    if matches!(ev, Event::MousePressed(crate::MouseButton::Left)) && cx.states.focus.take().is_some() {
         cx.redraw = true;
     }
     let mouse = matches!(ev, Event::MousePressed(_) | Event::MouseReleased(_) | Event::Wheel { .. } | Event::CursorMoved(_));

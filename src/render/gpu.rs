@@ -168,6 +168,10 @@ impl Atlas {
             return Ok(None);
         };
         let (w, h) = (img.placement.width, img.placement.height);
+        // Maior que o atlas inteiro: nunca cabe, e esvaziar o atlas por ele só faria tudo de novo a cada quadro.
+        if w >= ATLAS || h >= ATLAS {
+            return Err(());
+        }
         let cor = matches!(img.content, SwashContent::Color);
         let Some((x, y)) = self.lugar(w, h) else {
             self.mapa.clear();
@@ -393,6 +397,9 @@ impl Renderer {
 /// segura imagens e caminhos enormes são os limites de área de cada desenho.
 pub(crate) const SEM_LIMITE_TEXTURA: u32 = 16384;
 
+/// Quanto as texturas das imagens podem ocupar na GPU antes de soltar as que não estão na tela.
+const TEXTURAS_MAX: usize = 256 << 20;
+
 /// Os pipelines e o que fica na GPU de um quadro para o outro (atlas, texturas das imagens).
 /// Um só para todas as janelas, como o `Renderer`.
 pub(crate) struct Pintor {
@@ -406,8 +413,9 @@ pub(crate) struct Pintor {
     atlas: wgpu::Texture,
     grupo_atlas: wgpu::BindGroup,
     buffers: [Option<wgpu::Buffer>; 3],
-    /// Pelo número da imagem (ou da rasterização do SVG): a textura e o último quadro em que apareceu.
-    texturas: HashMap<u64, (wgpu::BindGroup, u64)>,
+    /// Pelo número da imagem (ou da rasterização do SVG): a textura, o último quadro em que apareceu
+    /// e os bytes dela.
+    texturas: HashMap<u64, (wgpu::BindGroup, u64, usize)>,
     quadro: u64,
 }
 
@@ -482,13 +490,15 @@ impl Pintor {
                     wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4 * pm.width()), rows_per_image: Some(pm.height()) },
                     wgpu::Extent3d { width: pm.width(), height: pm.height(), depth_or_array_layers: 1 },
                 );
-                (grupo_textura(device, &self.camada_textura, &t, &self.amostrador), quadro)
+                (grupo_textura(device, &self.camada_textura, &t, &self.amostrador), quadro, pm.data().len())
             });
             e.1 = quadro;
         }
         // Imagem que sumiu da tela por um segundo (ou foi liberada) solta a textura.
+        // Passando de TEXTURAS_MAX (uma imagem nova por quadro: zoom de PDF, resize), só as deste quadro.
         let q = self.quadro;
-        self.texturas.retain(|_, e| e.1 + 60 >= q);
+        let manter = if self.texturas.values().map(|e| e.2).sum::<usize>() > TEXTURAS_MAX { 0 } else { 60 };
+        self.texturas.retain(|_, e| e.1 + manter >= q);
         let (w, h) = l.tamanho;
         queue.write_buffer(&self.globais, 0, bytes(&[w as f32, h as f32, 0.0, 0.0]));
         for (i, v) in [&l.quads, &l.glifos, &l.tracos].into_iter().enumerate() {

@@ -134,6 +134,10 @@ impl Svg {
 
 /// Altura da linha padrão do texto, em múltiplos do tamanho.
 const ALTURA_LINHA: f32 = 1.3;
+/// Quantos opacos de cima o `changes` usa para esconder os de baixo (mais seria n² numa grade).
+const OPACOS_MAX: usize = 256;
+/// As letras rasterizadas que o swash guarda: cada tamanho de fonte (zoom contínuo) é outra leva.
+const GLIFOS_MAX: usize = 20_000;
 
 #[derive(PartialEq, Eq, Hash)]
 struct TextKey {
@@ -452,6 +456,10 @@ impl Renderer {
         self.carregar_fontes();
         let (w, h) = (((size.width * scale).round() as u32).max(1), ((size.height * scale).round() as u32).max(1));
         self.tela = (w, h);
+        if self.swash.image_cache.len() > GLIFOS_MAX || self.swash.outline_command_cache.len() > GLIFOS_MAX {
+            self.swash.image_cache.clear();
+            self.swash.outline_command_cache.clear();
+        }
         if self.scale != scale {
             self.texts.clear();
             self.proprios.clear();
@@ -696,7 +704,10 @@ impl Renderer {
         for (h, area, opaco) in self.cobertura.iter().rev() {
             let coberto = area.width <= 0.0 || area.height <= 0.0 || opacos.iter().any(|o| contem(o, area));
             *todos.entry(*h).or_insert(true) &= coberto;
-            opacos.extend(opaco);
+            // Só os de cima: numa grade com milhares de células opacas, comparar com todos era n².
+            if opacos.len() < OPACOS_MAX {
+                opacos.extend(opaco);
+            }
         }
         self.ocultos.clear();
         self.ocultos.extend(todos.into_iter().filter(|e| e.1).map(|e| e.0));
@@ -1196,6 +1207,10 @@ impl Renderer {
         }
         let mut k = Chave::new(3);
         k.h(img.1).r(r).h(radius.map(f32::to_bits));
+        // Imagem nova a cada quadro (vídeo, página refeita no zoom) não acumula.
+        if self.imagens_opacas.len() > 4096 {
+            self.imagens_opacas.clear();
+        }
         if radius.iter().all(|v| *v == 0.0) && *self.imagens_opacas.entry(img.1).or_insert_with(|| img.0.pixels().iter().all(|p| p.alpha() == 255)) {
             self.opaco = Some(r);
         }
@@ -1269,7 +1284,8 @@ impl Renderer {
     /// SVG em `r`; com `color`, troca a cor de tudo mantendo o alfa (ícones de um traço só).
     pub fn draw_svg(&mut self, svg: &Svg, r: Rect, color: Option<Color>) {
         let s = self.scale;
-        if (r.width * s).round() as u64 * (r.height * s).round() as u64 > 1 << 22 {
+        let (pw, ph) = ((r.width * s).round() as u64, (r.height * s).round() as u64);
+        if pw * ph > 1 << 22 || pw.max(ph) > self.gpu.max_textura as u64 {
             self.falta("svg maior que 2048²");
         }
         let mut k = Chave::new(4);
@@ -1479,11 +1495,13 @@ struct Cache<K, V> {
     geracao: u64,
     /// Quantos sobraram na última virada.
     vivos: usize,
+    /// A geração logo depois da última virada: fica o que foi usado desde ela.
+    virada: u64,
 }
 
 impl<K, V> Default for Cache<K, V> {
     fn default() -> Self {
-        Cache { mapa: HashMap::new(), geracao: 0, vivos: 0 }
+        Cache { mapa: HashMap::new(), geracao: 0, vivos: 0, virada: 0 }
     }
 }
 
@@ -1509,10 +1527,13 @@ impl<K: Hash + Eq, V> Cache<K, V> {
         let g = self.geracao;
         self.mapa.retain(|_, e| e.1 + manter >= g);
     }
+    /// Fica o que foi usado desde a última virada (o quadro cheio anterior), não só nesta geração:
+    /// a janela troca de geração duas vezes por quadro, e só a geração atual esvaziava o cache todo.
     fn virar(&mut self) {
-        let g = self.geracao;
-        self.mapa.retain(|_, e| e.1 == g);
+        let desde = self.virada;
+        self.mapa.retain(|_, e| e.1 >= desde);
         self.geracao += 1;
+        self.virada = self.geracao;
         self.vivos = self.mapa.len();
     }
     /// `cheio`: vira no meio do quadro (os quadros parciais não viram no `begin`). Só de novo
@@ -2032,6 +2053,24 @@ mod tests {
         assert!(r.imagens.len() <= 2, "{} imagens", r.imagens.len());
         assert!(r.texts.len() <= 2, "{} textos", r.texts.len());
         assert!(r.shadows.len() <= 2, "{} sombras", r.shadows.len());
+    }
+
+    #[test]
+    fn quadro_da_janela_reaproveita_sombra_e_svg_do_anterior() {
+        // Como a janela: troca, quadro cheio, troca. A sombra e o svg do quadro anterior ficam.
+        let svg = Svg::from_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>"#).expect("svg");
+        let mut r = Renderer::new();
+        let mut q = Quadro::default();
+        for _ in 0..3 {
+            r.trocar(&mut q);
+            r.begin(Size::new(200.0, 200.0), 1.0, Color::BLACK);
+            r.fill_quad(Rect { x: 20.0, y: 20.0, width: 100.0, height: 60.0 }, None, Border::default(), Some(Shadow { color: Color::BLACK, offset: Point::new(0.0, 4.0), blur: 12.0 }));
+            r.draw_svg(&svg, Rect { x: 0.0, y: 0.0, width: 16.0, height: 16.0 }, None);
+            r.trocar(&mut q);
+        }
+        r.trocar(&mut q);
+        r.begin(Size::new(200.0, 200.0), 1.0, Color::BLACK);
+        assert_eq!((r.shadows.len(), r.svgs.len()), (1, 1));
     }
 
     #[test]

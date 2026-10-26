@@ -620,6 +620,7 @@ impl<M> Slider<'_, M> {
     }
     fn valor_em(&self, n: &Node, x: f32) -> f32 {
         let (a, b) = (*self.range.start(), *self.range.end());
+        let (a, b) = (a.min(b), a.max(b));
         let t = ((x - n.rect.x - 8.0) / (n.rect.width - 16.0).max(1.0)).clamp(0.0, 1.0);
         let v = a + (b - a) * t;
         if self.step > 0.0 {

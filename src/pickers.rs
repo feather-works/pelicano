@@ -397,10 +397,16 @@ fn geo_cor(campo: Rect, janela: f32) -> GeoCor {
     GeoCor { painel, quadro, matiz, prontas, hex }
 }
 
+/// A matiz guardada só vale onde a cor não tem uma (cinza, preto); senão a cor manda (o app
+/// pode ter trocado o valor por fora).
+fn matiz(guardada: Option<f32>, h: f32, s: f32, v: f32) -> f32 {
+    guardada.filter(|_| s < 0.005 || v < 0.005).unwrap_or(h)
+}
+
 impl<M> ColorPicker<'_, M> {
     fn hsv(&self, st: Option<&Paleta>) -> (f32, f32, f32) {
         let (h, s, v) = to_hsv(self.value);
-        (st.and_then(|p| p.matiz).unwrap_or(h), s, v)
+        (matiz(st.and_then(|p| p.matiz), h, s, v), s, v)
     }
     /// A cor no ponto `p`, conforme o que está sendo arrastado.
     fn cor_em(&self, n: &Node, p: Point, cx: &mut EventCx<M>) {
@@ -408,10 +414,12 @@ impl<M> ColorPicker<'_, M> {
         let st = cx.states.get_mut::<Paleta>(n.key);
         let (h, s, v) = {
             let (h0, s0, v0) = to_hsv(self.value);
-            (st.matiz.unwrap_or(h0), s0, v0)
+            (matiz(st.matiz, h0, s0, v0), s0, v0)
         };
         let nova = match st.arraste {
             Arraste::Quadro => {
+                // No cinza (saturação 0) a cor perde o matiz: guarda o de antes.
+                st.matiz = Some(h);
                 let s = ((p.x - g.quadro.x) / g.quadro.width).clamp(0.0, 1.0);
                 let v = 1.0 - ((p.y - g.quadro.y) / g.quadro.height).clamp(0.0, 1.0);
                 from_hsv(h, s, v)
@@ -519,7 +527,7 @@ impl<M> Widget<M> for ColorPicker<'_, M> {
                     let i = ((p.x - g.prontas.x) / 27.5) as usize;
                     if let Some(c) = PRONTAS.get(i).and_then(|c| Color::hex(c)) {
                         cx.states.get_mut::<Paleta>(n.key).matiz = None;
-                        cx.publish((self.on_change)(c));
+                        cx.publish((self.on_change)(c.alpha(self.value.a)));
                     }
                 }
                 Captured::Yes

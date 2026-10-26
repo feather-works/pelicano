@@ -225,19 +225,20 @@ impl Content {
         let (a, z) = ed.selection_bounds().unwrap_or((ed.cursor(), ed.cursor()));
         let cursor = ed.cursor();
         i.editar(false, |ed| {
-            let mut desloca = 0isize;
+            let mut coluna = cursor.index;
             for linha in a.line..=z.line {
                 let texto = ed.with_buffer(|b| b.lines[linha].text().to_owned());
                 let (sai, entra) = f(&texto);
                 let sai = sai.min(texto.len());
                 ed.delete_range(Cursor::new(linha, 0), Cursor::new(linha, sai));
                 ed.insert_at(Cursor::new(linha, 0), &entra, None);
+                // Cursor dentro do prefixo trocado: vai para o fim do novo (senão cairia no meio de um "•").
                 if linha == cursor.line {
-                    desloca = entra.len() as isize - sai as isize;
+                    coluna = if cursor.index < sai { entra.len() } else { cursor.index - sai + entra.len() };
                 }
             }
             ed.set_selection(Selection::None);
-            ed.set_cursor(Cursor::new(cursor.line, (cursor.index as isize + desloca).max(0) as usize));
+            ed.set_cursor(Cursor::new(cursor.line, coluna));
         });
     }
 
@@ -606,7 +607,8 @@ fn inline(texto: &str, desde: usize, l: &mut AttrsList, base: Attrs<'static>, t:
     let sinal = sumir(base);
     let mut i = desde;
     while i < b.len() {
-        let antes_letra = i > 0 && (b[i - 1] as char).is_alphanumeric();
+        // `get`: no meio de uma letra de vários bytes não há marca para olhar.
+        let antes_letra = texto.get(..i).and_then(|t| t.chars().next_back()).is_some_and(char::is_alphanumeric);
         // (abre, fecha, estilo do miolo)
         let par: Option<(&str, Attrs<'static>)> = match b[i] {
             b'`' => Some(("`", base.family(Family::Monospace))),
@@ -921,7 +923,8 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             b.set_size(fonts, Some(area.width * s), Some(area.height * s));
             // Só as linhas à vista (e algumas a mais) ganham estilo; as outras quando aparecerem.
             let base = crate::render::attrs(self.font);
-            let primeira = b.scroll().line;
+            // A rolagem só é corrigida depois: apagar muitas linhas deixa ela além do fim.
+            let primeira = b.scroll().line.min(b.lines.len() - 1);
             let ultima = (primeira + (area.height / self.altura()) as usize + 2).min(b.lines.len());
             let mut tons = Tons { sinal: cor_ct(cx.theme.muted), link: cor_ct(cx.theme.primary), avisos: Vec::new() };
             // Dentro de um bloco ``` ou não: conta as cercas desde o começo (só comparação de prefixo).
@@ -1451,6 +1454,8 @@ mod testes {
         let l = markdown("[a](b)", base, m, &t2, &mut false, true);
         assert!((0..6).all(|i| l.get_span(i).metadata != LINK && l.get_span(i).color_opt.is_none_or(|c| c.a() > 0)));
         assert_eq!(estilo("snake_case_nome", 6).style, Estilo::Normal);
+        // Depois de letra acentuada também: "é" termina num byte que, lido sozinho, seria "©".
+        assert_eq!(estilo("pé_de_moleque", 5).style, Estilo::Normal);
         assert_eq!(estilo("um *dois* tres", 5).style, Estilo::Italic);
         // Fora da linha do cursor os sinais somem (transparentes); o texto fica.
         let longe = markdown("**n**", base, m, &t, &mut false, true);

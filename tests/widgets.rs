@@ -926,3 +926,71 @@ fn trilho_da_rolagem_como_o_do_iced() {
     h.desenhar(&el, None);
     assert_eq!(pixel(&h, 195, 95), [0, 255, 0, 255]);
 }
+
+#[test]
+fn editor_rolado_no_fim_apaga_tudo_sem_cair() {
+    let mut h = H::new();
+    let texto: String = (0..1000).map(|i| format!("linha {i}\n")).collect();
+    let c = Content::with_text(&texto);
+    let el: Element<()> = text_editor(&c).into();
+    h.desenhar(&el, None);
+    let ctrl = |k: Key, t: Option<&str>| Event::Key { key: k, text: t.map(Into::into), modifiers: Modifiers::CONTROL, pressed: true };
+    h.ev(&el, Point::ORIGIN, ctrl(Key::Named(NamedKey::End), None));
+    h.desenhar(&el, None);
+    h.ev(&el, Point::ORIGIN, ctrl(Key::Character("a".into()), Some("a")));
+    h.tecla(&el, Key::Named(NamedKey::Backspace), None);
+    h.desenhar(&el, None);
+    assert!(c.text().trim().is_empty());
+}
+
+#[test]
+fn edit_lines_com_prefixo_nao_ascii_deixa_o_cursor_inteiro() {
+    let mut h = H::new();
+    let c = Content::with_text("1. item");
+    let el: Element<()> = text_editor(&c).into();
+    h.desenhar(&el, None);
+    h.tecla(&el, Key::Named(NamedKey::Home), None);
+    h.tecla(&el, Key::Named(NamedKey::ArrowRight), None);
+    c.edit_lines(|l| if l.starts_with("1. ") { (3, "• ".into()) } else { (0, String::new()) });
+    h.desenhar(&el, None);
+    h.tecla(&el, Key::Character("x".into()), Some("x"));
+    assert_eq!(c.text(), "• xitem");
+}
+
+#[test]
+fn slider_com_faixa_invertida_nao_cai() {
+    let mut h = H::new();
+    let el: Element<f32> = slider(10.0..=0.0, 5.0, |v| v).step(1.0).into();
+    let r = h.node(&el).rect;
+    let (m, _) = h.ev(&el, Point::new(r.x + 50.0, r.y + 10.0), Event::MousePressed(MouseButton::Left));
+    assert!(m.iter().all(|v| (0.0..=10.0).contains(v)));
+}
+
+#[test]
+fn cor_arrastada_pelo_cinza_guarda_o_matiz() {
+    let mut h = H::new();
+    let mut cor = Color::hex("#3b82f6").unwrap();
+    let el = |c: Color| -> Element<Color> { column([color_picker(c, |c| c).into()]).into() };
+    let campo = h.node(&el(cor)).children[0].rect;
+    h.click(&el(cor), Point::new(campo.x + 5.0, campo.y + 5.0));
+    h.desenhar(&el(cor), None);
+    let (qx, qy) = (campo.x + 12.0, campo.y + campo.height + 16.0);
+    for p in [Point::new(qx + 1.0, qy + 20.0), Point::new(qx - 5.0, qy + 20.0), Point::new(qx + 200.0, qy + 20.0)] {
+        let ev = if p.x == qx + 1.0 { Event::MousePressed(MouseButton::Left) } else { Event::CursorMoved(p) };
+        cor = h.ev(&el(cor), p, ev).0.pop().unwrap_or(cor);
+        h.desenhar(&el(cor), None);
+    }
+    assert!(cor.b > cor.r, "virou vermelho: {cor:?}");
+}
+
+#[test]
+fn clique_direito_no_campo_mantem_o_foco() {
+    let mut h = H::new();
+    let el: Element<String> = text_input("", "abc").id("campo").on_input(|s| s).into();
+    let r = h.node(&el).rect;
+    h.click(&el, centro(r));
+    let foco = h.st.focus;
+    assert!(foco.is_some());
+    h.ev(&el, centro(r), Event::MousePressed(MouseButton::Right));
+    assert_eq!(h.st.focus, foco);
+}

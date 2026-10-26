@@ -21,6 +21,7 @@ mod pickers;
 mod render;
 mod markdown;
 mod rich;
+mod roteiro;
 #[cfg(feature = "terminal")]
 mod terminal;
 pub mod widget;
