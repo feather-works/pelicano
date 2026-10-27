@@ -2,7 +2,7 @@
 //! linha, e só as linhas visíveis montadas) com desfazer/refazer, área de transferência,
 //! localizar/substituir e números de linha.
 use crate::widget::{CursorIcon, DrawCx, EventCx, Node, Style, Widget};
-use crate::{Border, Captured, Color, Event, Font, Key, LayoutCx, Length, Limits, MouseButton, NamedKey, Padding, Point, Rect, Size, Status, Theme};
+use crate::{Border, Captured, Color, Event, Font, Key, LayoutCx, Length, Limits, MouseButton, NamedKey, Padding, Point, Rect, Renderer, Size, Status, Theme};
 use cosmic_text::{Action, Attrs, AttrsList, Buffer, Change, Cursor, Edit, Editor, Family, FontSystem, Metrics, Motion, Selection, Shaping, Style as Estilo, Weight, Wrap};
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
@@ -27,6 +27,8 @@ struct Interno {
     config: Option<(u32, u32, Font, bool)>,
     /// (versão, primeira linha à vista) -> se ela começa dentro de um bloco ```.
     cercas: Option<(u64, usize, bool)>,
+    /// As tabelas do último desenho, onde o clique e as setas acham a célula.
+    grade: Vec<Tabela>,
     #[cfg(feature = "highlighter")]
     realce: crate::highlight::Realce,
 }
@@ -45,7 +47,7 @@ impl Content {
     }
 
     pub fn with_text(texto: &str) -> Self {
-        Content(RefCell::new(Interno { ed: None, inicial: texto.to_owned(), linha_inicial: None, versao: 0, desfazer: Vec::new(), refazer: Vec::new(), digitando: None, config: None, cercas: None, #[cfg(feature = "highlighter")] realce: Default::default() }))
+        Content(RefCell::new(Interno { ed: None, inicial: texto.to_owned(), linha_inicial: None, versao: 0, desfazer: Vec::new(), refazer: Vec::new(), digitando: None, config: None, cercas: None, grade: Vec::new(), #[cfg(feature = "highlighter")] realce: Default::default() }))
     }
 
     /// O texto inteiro, com as quebras de linha que o arquivo tinha.
@@ -471,13 +473,27 @@ const CAIXA_MARCADA: usize = 4;
 const MARCADOR: usize = 5;
 const CITACAO: usize = 6;
 
-/// Uma tabela de Markdown desenhada como grade: as linhas do texto, as células e a largura das colunas.
+/// Uma célula da grade: o texto à vista e de que byte da linha do texto vem cada letra dele.
+struct Celula {
+    texto: String,
+    negrito: bool,
+    /// Onde começa o espaço da célula na linha (logo depois da `|`).
+    inicio: usize,
+    /// O byte da linha de cada letra à vista e, no fim, o byte depois da última.
+    mapa: Vec<usize>,
+}
+
+/// Uma tabela de Markdown desenhada como grade, por cima do texto (que fica invisível, com o cursor
+/// andando nele): as linhas do texto, as células e a largura das colunas.
 struct Tabela {
     linhas: std::ops::Range<usize>,
-    /// (texto à vista, negrito) de cada célula, por linha do texto; a do `|---|` fica vazia.
-    celulas: Vec<Vec<(String, bool)>>,
+    /// Por linha do texto; a do `|---|` fica vazia.
+    celulas: Vec<Vec<Celula>>,
     /// Com a folga dos dois lados, em pixels lógicos.
     larguras: Vec<f32>,
+    /// Do último desenho: a borda esquerda (x lógico na janela) e (linha, topo, altura) das linhas à vista.
+    x0: f32,
+    filas: Vec<(usize, f32, f32)>,
 }
 
 /// A folga de cada lado do texto da célula.
@@ -486,8 +502,50 @@ const FOLGA_CELULA: f32 = 8.0;
 impl Tabela {
     fn medir(&mut self, mut largura: impl FnMut(&str, bool) -> f32) {
         let colunas = self.celulas.iter().map(Vec::len).max().unwrap_or(0);
-        self.larguras = (0..colunas).map(|c| self.celulas.iter().filter_map(|l| l.get(c)).map(|(t, b)| largura(t, *b)).fold(0.0, f32::max) + 2.0 * FOLGA_CELULA).collect();
+        self.larguras = (0..colunas).map(|c| self.celulas.iter().filter_map(|l| l.get(c)).map(|k| largura(&k.texto, k.negrito)).fold(0.0, f32::max) + 2.0 * FOLGA_CELULA).collect();
     }
+
+    fn coluna_x(&self, c: usize) -> f32 {
+        self.larguras[..c.min(self.larguras.len())].iter().sum()
+    }
+
+    fn celulas_da(&self, linha: usize) -> &[Celula] {
+        self.celulas.get(linha.wrapping_sub(self.linhas.start)).map_or(&[], Vec::as_slice)
+    }
+
+    /// Onde o byte `b` da linha do texto aparece na grade (x lógico desde a borda esquerda).
+    fn x_do_byte(&self, linha: usize, b: usize, r: &mut Renderer, tamanho: f32, fonte: impl Fn(bool) -> Font) -> f32 {
+        let cels = self.celulas_da(linha);
+        let Some(c) = cels.iter().rposition(|k| k.inicio <= b).or((!cels.is_empty()).then_some(0)) else { return FOLGA_CELULA };
+        let cel = &cels[c];
+        let k = cel.mapa[..cel.mapa.len() - 1].iter().filter(|&&o| o < b).count();
+        let vis = cel.texto.char_indices().nth(k).map_or(cel.texto.len(), |(i, _)| i);
+        let letras = r.carets(&cel.texto, tamanho, fonte(cel.negrito));
+        let dx = letras.iter().find(|g| g.0 >= vis).map_or_else(|| letras.last().map_or(0.0, |g| g.2), |g| g.1);
+        self.coluna_x(c) + FOLGA_CELULA + dx
+    }
+
+    /// O byte da linha do texto mais perto de `x` (lógico desde a borda esquerda); `None` no `|---|`.
+    fn byte_do_x(&self, linha: usize, x: f32, r: &mut Renderer, tamanho: f32, fonte: impl Fn(bool) -> Font) -> Option<usize> {
+        let cels = self.celulas_da(linha);
+        let mut c = 0;
+        while c + 1 < cels.len() && x >= self.coluna_x(c + 1) {
+            c += 1;
+        }
+        let cel = cels.get(c)?;
+        let rel = x - self.coluna_x(c) - FOLGA_CELULA;
+        let vis = r.carets(&cel.texto, tamanho, fonte(cel.negrito)).into_iter().find(|g| rel < (g.1 + g.2) / 2.0).map_or(cel.texto.len(), |g| g.0);
+        Some(cel.mapa[cel.texto[..vis].chars().count()])
+    }
+}
+
+/// O ponto da janela numa linha da grade: (linha, byte do texto, começo e fim da célula).
+fn na_grade(grade: &[Tabela], p: Point, r: &mut Renderer, tamanho: f32, fonte: impl Fn(bool) -> Font + Copy) -> Option<(usize, usize, (usize, usize))> {
+    let t = grade.iter().find(|t| (t.x0..=t.x0 + t.larguras.iter().sum::<f32>()).contains(&p.x) && t.filas.iter().any(|f| (f.1..f.1 + f.2).contains(&p.y)))?;
+    let &(linha, ..) = t.filas.iter().find(|f| (f.1..f.1 + f.2).contains(&p.y))?;
+    let b = t.byte_do_x(linha, p.x - t.x0, r, tamanho, fonte)?;
+    let cel = t.celulas_da(linha).iter().find(|c| c.mapa[0] <= b && b <= c.mapa[c.mapa.len() - 1])?;
+    Some((linha, b, (cel.mapa[0], cel.mapa[cel.mapa.len() - 1])))
 }
 
 /// As tabelas (linhas que começam com `|`, a segunda sendo `|---|`) que encostam em `faixa`, inteiras:
@@ -511,7 +569,7 @@ fn tabelas_em<'a>(linha: impl Fn(usize) -> Option<&'a str>, faixa: std::ops::Ran
         }
         if k - inicio >= 2 && linha(inicio + 1).is_some_and(separador_de_tabela) {
             let celulas = (inicio..k).map(|j| if j == inicio + 1 { Vec::new() } else { celulas(linha(j).unwrap_or_default(), j == inicio) }).collect();
-            achadas.push(Tabela { linhas: inicio..k, celulas, larguras: Vec::new() });
+            achadas.push(Tabela { linhas: inicio..k, celulas, larguras: Vec::new(), x0: 0.0, filas: Vec::new() });
         }
     }
     achadas
@@ -524,29 +582,47 @@ fn separador_de_tabela(t: &str) -> bool {
 
 /// As células de `| a | **b** |`, sem os sinais de negrito e código; `\|` é uma barra dentro da célula.
 // shortcut: link e itálico dentro da célula saem com os sinais; tratar quando aparecerem em tabela.
-fn celulas(t: &str, cabecalho: bool) -> Vec<(String, bool)> {
-    let t = t.trim();
-    let t = t.strip_prefix('|').unwrap_or(t);
-    let t = t.strip_suffix('|').filter(|r| !r.ends_with('\\')).unwrap_or(t);
-    let mut cels = vec![String::new()];
-    let mut barra = false;
-    for c in t.chars() {
-        let atual = cels.last_mut().expect("tem célula");
-        match c {
-            '|' if barra => {
-                atual.pop();
-                atual.push('|');
-            }
-            '|' => cels.push(String::new()),
-            _ => atual.push(c),
+fn celulas(linha: &str, cabecalho: bool) -> Vec<Celula> {
+    let mut barras = Vec::new();
+    let mut escapada = false;
+    for (i, c) in linha.char_indices() {
+        if c == '|' && !escapada {
+            barras.push(i);
         }
-        barra = c == '\\';
+        escapada = c == '\\' && !escapada;
     }
-    cels.into_iter()
-        .map(|c| {
-            let c = c.trim();
-            let negrito = cabecalho || c.len() > 4 && c.starts_with("**") && c.ends_with("**");
-            (c.replace("**", "").replace("__", "").replace("~~", "").replace('`', ""), negrito)
+    let mut espacos: Vec<(usize, usize)> = barras.windows(2).map(|w| (w[0] + 1, w[1])).collect();
+    // Sem a `|` do fim, o resto da linha é a última célula.
+    if let Some(&z) = barras.last() {
+        if !linha[z + 1..].trim().is_empty() {
+            espacos.push((z + 1, linha.len()));
+        }
+    }
+    espacos
+        .into_iter()
+        .map(|(a, z)| {
+            let bruto = &linha[a..z];
+            // Vazia: o cursor fica depois do primeiro espaço.
+            let (ini, fim) = if bruto.trim().is_empty() { ((a + 1).min(z), (a + 1).min(z)) } else { (a + bruto.len() - bruto.trim_start().len(), z - (bruto.len() - bruto.trim_end().len())) };
+            let miolo = &linha[ini..fim];
+            let negrito = cabecalho || miolo.len() > 4 && miolo.starts_with("**") && miolo.ends_with("**");
+            let (mut texto, mut mapa) = (String::new(), Vec::new());
+            let mut i = ini;
+            while i < fim {
+                let resto = &linha[i..fim];
+                if ["**", "__", "~~"].iter().any(|m| resto.starts_with(m)) {
+                    i += 2;
+                } else if resto.starts_with('`') || resto.starts_with("\\|") {
+                    i += 1;
+                } else {
+                    let c = resto.chars().next().expect("não vazio");
+                    mapa.push(i);
+                    texto.push(c);
+                    i += c.len_utf8();
+                }
+            }
+            mapa.push(fim);
+            Celula { texto, negrito, inicio: a, mapa }
         })
         .collect()
 }
@@ -858,6 +934,10 @@ impl<'a, M> TextEditor<'a, M> {
         self.highlight = Some((ext, tema));
         self
     }
+    /// A fonte das células da grade: a do editor, em negrito no cabeçalho e no `**texto**`.
+    fn fonte_celula(&self, negrito: bool) -> Font {
+        Font { weight: if negrito { 700 } else { self.font.weight }, ..self.font }
+    }
     fn altura(&self) -> f32 {
         self.line_height.unwrap_or(self.size * 1.45)
     }
@@ -997,7 +1077,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         #[cfg(feature = "highlighter")]
         let mut realce = std::mem::take(&mut i.realce);
         let ed = i.editor(cx.renderer.fonts(), self.size, self.altura(), s, self.font, self.wrap);
-        // As tabelas à vista viram grade desenhada; a do cursor (com foco) fica crua, para editar.
+        // As tabelas à vista viram grade desenhada; o cursor anda no texto por baixo e aparece na célula.
         let linha_cursor = ed.cursor().line;
         let mut tabelas = if self.markdown {
             ed.with_buffer(|b| {
@@ -1008,8 +1088,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         } else {
             Vec::new()
         };
-        tabelas.retain(|t| !(focado && t.linhas.contains(&linha_cursor)));
-        let fonte_celula = |negrito: bool| Font { weight: if negrito { 700 } else { self.font.weight }, ..self.font };
+        let fonte_celula = |negrito: bool| self.fonte_celula(negrito);
         for t in &mut tabelas {
             t.medir(|texto, negrito| cx.renderer.measure(texto, self.size, fonte_celula(negrito), None).width);
         }
@@ -1147,7 +1226,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                         ondas.push((Rect { x: area.x + (x - h) / s, y, width: w / s, height: run.line_height / s }, k));
                     }
                 }
-                if let Some((a, z)) = selecao {
+                if let Some((a, z)) = selecao.filter(|_| na_grade.is_none()) {
                     if let Some((x, w)) = run.highlight(a, z) {
                         // Linha vazia selecionada: um tanto de largura para aparecer.
                         let w = if w <= 0.0 && a.line <= run.line_i && run.line_i < z.line { self.size * 0.4 * s } else { w };
@@ -1166,7 +1245,32 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             (b.scroll(), b.metrics().line_height / s)
         });
         let (total, topo) = ed.with_buffer(|b| (b.lines.len(), b.scroll().line as f32 + b.scroll().vertical / (self.altura() * s)));
-        let caret = focado.then(|| ed.cursor_position()).flatten().map(|(x, y)| Point::new(area.x + (x as f32 - rolagem.horizontal) / s, area.y + y as f32 / s));
+        for (ti, linha, y, h) in filas {
+            tabelas[ti].filas.push((linha, y, h));
+        }
+        for t in &mut tabelas {
+            t.x0 = area.x - rolagem.horizontal / s;
+        }
+        // Na grade, a seleção e o cursor vão para onde a letra aparece.
+        if let Some((a, z)) = selecao {
+            for t in &tabelas {
+                for &(l, y, h) in t.filas.iter().filter(|f| (a.line..=z.line).contains(&f.0)) {
+                    let (de, ate) = (if l == a.line { a.index } else { 0 }, if l == z.line { z.index } else { usize::MAX });
+                    for cel in t.celulas_da(l) {
+                        let (sa, sz) = (de.max(cel.mapa[0]), ate.min(cel.mapa[cel.mapa.len() - 1]));
+                        if sa < sz {
+                            let (xa, xz) = (t.x_do_byte(l, sa, cx.renderer, self.size, fonte_celula), t.x_do_byte(l, sz, cx.renderer, self.size, fonte_celula));
+                            realces.push(Rect { x: t.x0 + xa, y, width: xz - xa, height: h });
+                        }
+                    }
+                }
+            }
+        }
+        let c = ed.cursor();
+        let caret = focado.then(|| ed.cursor_position()).flatten().map(|(x, y)| match tabelas.iter().find(|t| t.filas.iter().any(|f| f.0 == c.line)) {
+            Some(t) => Point::new(t.x0 + t.x_do_byte(c.line, c.index, cx.renderer, self.size, fonte_celula), area.y + y as f32 / s),
+            None => Point::new(area.x + (x as f32 - rolagem.horizontal) / s, area.y + y as f32 / s),
+        });
         let mut chave = std::collections::hash_map::DefaultHasher::new();
         (versao, rolagem.line, rolagem.vertical.to_bits(), rolagem.horizontal.to_bits(), (area.width * s) as u32, (self.size * s * 64.0) as u32, self.wrap, self.invisibles, self.markdown).hash(&mut chave);
         self.warnings.hash(&mut chave);
@@ -1193,19 +1297,18 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             let desce = (altura_linha - cx.renderer.measure(self.placeholder, self.size, self.font, None).height) / 2.0;
             cx.renderer.draw_text(self.placeholder, self.size, self.font, cx.theme.muted, Point::new(area.x, area.y + desce), Some(area.width));
         }
-        for (ti, t) in tabelas.iter().enumerate() {
-            let filas: Vec<_> = filas.iter().filter(|f| f.0 == ti).collect();
-            let (Some(a), Some(z)) = (filas.first(), filas.last()) else { continue };
-            let x0 = area.x - rolagem.horizontal / s;
+        for t in &tabelas {
+            let (Some(a), Some(z)) = (t.filas.first(), t.filas.last()) else { continue };
+            let x0 = t.x0;
             let largura: f32 = t.larguras.iter().sum();
-            let (topo, fundo) = (a.2, z.2 + z.3);
+            let (topo, fundo) = (a.1, z.1 + z.2);
             let fio = |r: Rect, cx: &mut DrawCx| cx.renderer.fill_quad(r, Some(&cx.theme.border.into()), Border::default(), None);
-            for f in &filas {
-                if f.1 == t.linhas.start {
-                    cx.renderer.fill_quad(Rect { x: x0, y: f.2, width: largura, height: f.3 }, Some(&cx.theme.muted.alpha(0.10).into()), Border::default(), None);
+            for &(l, y, h) in &t.filas {
+                if l == t.linhas.start {
+                    cx.renderer.fill_quad(Rect { x: x0, y, width: largura, height: h }, Some(&cx.theme.muted.alpha(0.10).into()), Border::default(), None);
                 } else {
                     // Embaixo do cabeçalho o fio sai dobrado: o do `|---|` e o da linha seguinte.
-                    fio(Rect { x: x0, y: f.2, width: largura, height: 1.0 }, cx);
+                    fio(Rect { x: x0, y, width: largura, height: 1.0 }, cx);
                 }
             }
             let mut x = x0;
@@ -1214,12 +1317,10 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                 fio(Rect { x, y: topo, width: 1.0, height: fundo - topo }, cx);
             }
             cx.renderer.fill_quad(Rect { x: x0, y: topo, width: largura, height: fundo - topo }, None, Border::rounded(4.0).color(cx.theme.border, 1.0), None);
-            for f in &filas {
-                let mut x = x0;
-                for (c, (texto, negrito)) in t.celulas[f.1 - t.linhas.start].iter().enumerate() {
-                    let h = cx.renderer.measure(texto, self.size, fonte_celula(*negrito), None).height;
-                    cx.renderer.draw_text(texto, self.size, fonte_celula(*negrito), cor, Point::new(x + FOLGA_CELULA, f.2 + (f.3 - h) / 2.0), None);
-                    x += t.larguras.get(c).copied().unwrap_or(0.0);
+            for &(l, y, h) in &t.filas {
+                for (c, cel) in t.celulas_da(l).iter().enumerate() {
+                    let alto = cx.renderer.measure(&cel.texto, self.size, fonte_celula(cel.negrito), None).height;
+                    cx.renderer.draw_text(&cel.texto, self.size, fonte_celula(cel.negrito), cor, Point::new(x0 + t.coluna_x(c) + FOLGA_CELULA, y + (h - alto) / 2.0), None);
                 }
             }
         }
@@ -1299,6 +1400,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             });
         }
         i.cercas = cercas;
+        i.grade = tabelas;
         #[cfg(feature = "highlighter")]
         {
             i.realce = realce;
@@ -1409,10 +1511,23 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                     2 => Action::DoubleClick { x, y },
                     _ => Action::TripleClick { x, y },
                 };
+                // Na grade a letra não está onde o texto por baixo está: o clique acha a célula.
+                let celula = (self.markdown && vezes < 3).then(|| na_grade(&i.grade, cx.cursor.unwrap_or(Point::ORIGIN), cx.renderer, self.size, |b| self.fonte_celula(b))).flatten();
                 let fonts = cx.renderer.fonts();
                 let ed = i.ed.as_mut().expect("montado acima");
                 let antes = ed.cursor();
-                ed.action(fonts, acao);
+                match celula {
+                    // Dois cliques pegam a célula inteira.
+                    Some((linha, _, (a, z))) if vezes == 2 => {
+                        ed.set_selection(Selection::Normal(Cursor::new(linha, a)));
+                        ed.set_cursor(Cursor::new(linha, z));
+                    }
+                    Some((linha, b, _)) => {
+                        ed.set_selection(Selection::None);
+                        ed.set_cursor(Cursor::new(linha, b));
+                    }
+                    None => ed.action(fonts, acao),
+                }
                 let c = ed.cursor();
                 // Clique na caixinha desenhada: marca/desmarca e o cursor fica onde estava.
                 let caixa = (self.markdown && vezes == 1).then(|| ed.with_buffer(|b| caixa_da_linha(b.lines[c.line].text()))).flatten();
@@ -1431,8 +1546,18 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             }
             Event::CursorMoved(p) if cx.states.get::<Mouse>(n.key).is_some_and(|m| m.arrastando) => {
                 let (x, y) = ponto(*p);
+                let celula = self.markdown.then(|| na_grade(&i.grade, *p, cx.renderer, self.size, |b| self.fonte_celula(b))).flatten();
                 let fonts = cx.renderer.fonts();
-                i.ed.as_mut().expect("montado acima").action(fonts, Action::Drag { x, y });
+                let ed = i.ed.as_mut().expect("montado acima");
+                match celula {
+                    Some((linha, b, _)) => {
+                        if ed.selection() == Selection::None {
+                            ed.set_selection(Selection::Normal(ed.cursor()));
+                        }
+                        ed.set_cursor(Cursor::new(linha, b));
+                    }
+                    None => ed.action(fonts, Action::Drag { x, y }),
+                }
                 Captured::Yes
             }
             Event::MouseReleased(MouseButton::Left) if cx.states.get::<Mouse>(n.key).is_some_and(|m| m.arrastando) => {
@@ -1465,8 +1590,37 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
 }
 
 impl<M: Clone> TextEditor<'_, M> {
+    /// Para onde ↑/↓ leva o cursor que está numa tabela da grade; `None` sai da tabela (o normal).
+    fn na_coluna(&self, i: &Interno, desce: bool, r: &mut Renderer) -> Option<Cursor> {
+        let c = i.ed.as_ref()?.cursor();
+        let t = i.grade.iter().find(|t| t.linhas.contains(&c.line))?;
+        let mut alvo = if desce { c.line + 1 } else { c.line.checked_sub(1)? };
+        if alvo == t.linhas.start + 1 {
+            alvo = if desce { alvo + 1 } else { alvo - 1 };
+        }
+        if !t.linhas.contains(&alvo) {
+            return None;
+        }
+        let x = t.x_do_byte(c.line, c.index, r, self.size, |b| self.fonte_celula(b));
+        Some(Cursor::new(alvo, t.byte_do_x(alvo, x, r, self.size, |b| self.fonte_celula(b))?))
+    }
+
     fn tecla(&self, i: &mut Interno, key: &Key, text: Option<&str>, modifiers: crate::Modifiers, cx: &mut EventCx<M>) -> Captured {
         let (ctrl, shift) = (modifiers.control_key() || modifiers.super_key(), modifiers.shift_key());
+        // ↑ e ↓ na grade: a mesma coluna da linha de cima ou de baixo, pulando o `|---|`.
+        if let (true, false, Key::Named(seta @ (NamedKey::ArrowUp | NamedKey::ArrowDown))) = (self.markdown, ctrl, key) {
+            if let Some(alvo) = self.na_coluna(i, *seta == NamedKey::ArrowDown, cx.renderer) {
+                let ed = i.ed.as_mut().expect("montado");
+                match (shift, ed.selection()) {
+                    (true, Selection::None) => ed.set_selection(Selection::Normal(ed.cursor())),
+                    (false, _) => ed.set_selection(Selection::None),
+                    _ => {}
+                }
+                ed.set_cursor(alvo);
+                i.digitando = None;
+                return Captured::Yes;
+            }
+        }
         let fonts = cx.renderer.fonts();
         let movimento = |m: Motion, i: &mut Interno, fonts: &mut FontSystem| {
             let ed = i.ed.as_mut().expect("montado");
@@ -1563,12 +1717,37 @@ mod testes {
         assert_eq!(achadas.len(), 1, "a segunda não tem |---|");
         let t = &achadas[0];
         assert_eq!(t.linhas, 1..5);
-        assert_eq!(t.celulas[0], vec![("Nome".to_string(), true), ("Valor".to_string(), true)]);
+        let ver = |l: &[Celula]| l.iter().map(|c| (c.texto.clone(), c.negrito)).collect::<Vec<_>>();
+        assert_eq!(ver(&t.celulas[0]), [("Nome".to_string(), true), ("Valor".to_string(), true)]);
         assert!(t.celulas[1].is_empty());
-        assert_eq!(t.celulas[2], vec![("a | b".to_string(), false), ("10".to_string(), true)]);
+        assert_eq!(ver(&t.celulas[2]), [("a | b".to_string(), false), ("10".to_string(), true)]);
+        // Cada letra à vista sabe o byte dela na linha: "**10**" começa no 11, o "1" está no 13;
+        // a `\` de "\|" não aparece.
+        assert_eq!(t.celulas[2][1].mapa, [13, 14, 17]);
+        assert_eq!(t.celulas[2][0].mapa, [2, 3, 5, 6, 7, 8]);
         let mut t = achadas.into_iter().next().unwrap();
         t.medir(|texto, _| texto.chars().count() as f32);
         assert_eq!(t.larguras, vec![5.0 + 2.0 * FOLGA_CELULA, 5.0 + 2.0 * FOLGA_CELULA]);
+    }
+
+    /// Ida e volta entre o byte do texto e o x na grade: o clique cai na letra onde o cursor aparece.
+    #[test]
+    fn byte_e_x_da_grade_se_casam() {
+        let linhas = ["| Nome | Valor |", "|---|---|", "| Café | **10** |"];
+        let mut t = tabelas_em(|k| linhas.get(k).copied(), 0..3).remove(0);
+        let mut r = Renderer::new();
+        let fonte = |b: bool| Font { weight: if b { 700 } else { 400 }, ..Font::MONO };
+        t.medir(|texto, b| r.measure(texto, 14.0, fonte(b), None).width);
+        // "| Café | **10** |": o "é" ocupa os bytes 5 e 6; o "1" está no 12.
+        for b in [2, 3, 4, 5, 7, 12, 13, 16] {
+            let x = t.x_do_byte(2, b, &mut r, 14.0, fonte);
+            assert_eq!(t.byte_do_x(2, x + 0.5, &mut r, 14.0, fonte), Some(b), "byte {b} em x {x}");
+        }
+        // O "1" de "**10**" fica na segunda coluna, depois da folga; antes dos ** é o começo da célula.
+        assert_eq!(t.x_do_byte(2, 12, &mut r, 14.0, fonte), t.larguras[0] + FOLGA_CELULA);
+        assert_eq!(t.x_do_byte(2, 10, &mut r, 14.0, fonte), t.larguras[0] + FOLGA_CELULA);
+        // Do cabeçalho, ↓ vai direto para a linha de baixo (o |---| não tem células).
+        assert_eq!(t.byte_do_x(1, 10.0, &mut r, 14.0, fonte), None);
     }
 
     #[test]
