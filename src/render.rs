@@ -934,7 +934,10 @@ impl Renderer {
 #[allow(clippy::too_many_arguments)]
 /// `color` já vem esmaecida; `opac` esmaece os glifos de cor própria (`color_opt`).
 fn pintar_glifos(b: &Buffer, fonts: &mut FontSystem, swash: &mut SwashCache, pixmap: &mut Pixmap, clips: &mut [Clip], s: f32, at: Point, color: Color, opac: f32) {
-    let (ox, oy) = ((at.x * s).round() as i32, (at.y * s).round() as i32);
+    // Só o y é arredondado (a linha de base fica nítida); o x vai com a fração para o cosmic-text
+    // escolher a variação de subpixel do glifo. Arredondar a origem errava até meio pixel em cada
+    // texto, e palavra desenhada em pedaços (a página do FeatherDocs) ganhava espaço no meio.
+    let (fx, oy) = (at.x * s, (at.y * s).round() as i32);
     let clip = clips.last().map(|c| c.rect);
     let cor = cosmic_text::Color::rgba((color.r * 255.0) as u8, (color.g * 255.0) as u8, (color.b * 255.0) as u8, (color.a * 255.0) as u8);
     let (w, h) = (pixmap.width() as i32, pixmap.height() as i32);
@@ -960,10 +963,10 @@ fn pintar_glifos(b: &Buffer, fonts: &mut FontSystem, swash: &mut SwashCache, pix
             if fator == 0 {
                 continue;
             }
-            let fis = g.physical((0., 0.), 1.0);
+            let fis = g.physical((fx, 0.), 1.0);
             swash.with_pixels(fonts, fis.cache_key, cor_g, |x, y, c| {
                 let a = c.a() as u32 * fator / 255;
-                let (xx, yy) = (ox + fis.x + x, oy + run.line_y as i32 + fis.y + y);
+                let (xx, yy) = (fis.x + x, oy + run.line_y as i32 + fis.y + y);
                 if a == 0 || xx < cx0.max(0) || xx >= cx1.min(w) || yy < cy0.max(0) || yy >= cy1.min(h) {
                     return;
                 }

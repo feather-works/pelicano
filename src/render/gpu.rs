@@ -250,7 +250,10 @@ impl Atlas {
 /// `false` se o atlas encheu.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn glifos(l: &mut Lista, b: &Buffer, fonts: &mut FontSystem, swash: &mut SwashCache, rec: &[f32; 12], s: f32, at: Point, color: Color, opac: f32) -> bool {
-    let (ox, oy) = ((at.x * s).round() as i32, (at.y * s).round() as i32);
+    // Só o y é arredondado (a linha de base fica nítida); o x vai com a fração para o cosmic-text
+    // escolher a variação de subpixel do glifo. Arredondar a origem errava até meio pixel em cada
+    // texto, e palavra desenhada em pedaços (a página do FeatherDocs) ganhava espaço no meio.
+    let (fx, oy) = (at.x * s, (at.y * s).round() as i32);
     let cor = cosmic_text::Color::rgba((color.r * 255.0) as u8, (color.g * 255.0) as u8, (color.b * 255.0) as u8, (color.a * 255.0) as u8);
     for run in b.layout_runs() {
         let topo = oy + run.line_top as i32;
@@ -263,13 +266,13 @@ pub(crate) fn glifos(l: &mut Lista, b: &Buffer, fonts: &mut FontSystem, swash: &
             if fator == 0.0 {
                 continue;
             }
-            let fis = g.physical((0., 0.), 1.0);
+            let fis = g.physical((fx, 0.), 1.0);
             let gl = match l.atlas.glifo(fonts, swash, fis.cache_key) {
                 Ok(Some(gl)) => gl,
                 Ok(None) => continue,
                 Err(()) => return false,
             };
-            let (x, y) = (ox + fis.x + gl.left, oy + run.line_y as i32 + fis.y - gl.top);
+            let (x, y) = (fis.x + gl.left, oy + run.line_y as i32 + fis.y - gl.top);
             let c = [linear(cor_g.r() as f32 / 255.0), linear(cor_g.g() as f32 / 255.0), linear(cor_g.b() as f32 / 255.0), fator / 255.0];
             l.textura(DO_ATLAS, [x as f32, y as f32, gl.w as f32, gl.h as f32], [gl.x as f32, gl.y as f32, gl.idx as f32], c, [0.0; 4], if gl.cor { 1.0 } else { 0.0 }, rec);
         }
