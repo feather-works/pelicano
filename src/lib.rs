@@ -418,7 +418,43 @@ pub struct States {
 /// O sistema está no tema escuro? (GNOME/KDE pelo portal, Windows e macOS pelas preferências.)
 /// Sem como saber, `false`.
 pub fn system_dark() -> bool {
+    // No Linux o dark-light 1 erra no Ubuntu: a resposta do portal vem num
+    // variant dentro de outro (ele não lê) e `XDG_CURRENT_DESKTOP=ubuntu:GNOME`
+    // não é reconhecido como GNOME, então caía em claro. O GNOME guarda a
+    // escolha em `color-scheme`; Windows e macOS seguem pelo dark-light.
+    #[cfg(target_os = "linux")]
+    if let Some(escuro) = gnome_escuro() {
+        return escuro;
+    }
     matches!(dark_light::detect(), dark_light::Mode::Dark)
+}
+
+/// `prefer-dark` → escuro; `prefer-light`/`default` → claro; sem GNOME → `None`.
+#[cfg(target_os = "linux")]
+fn gnome_escuro() -> Option<bool> {
+    let saida = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+        .output().ok().filter(|s| s.status.success())?;
+    esquema_escuro(&String::from_utf8_lossy(&saida.stdout))
+}
+
+#[cfg(target_os = "linux")]
+fn esquema_escuro(valor: &str) -> Option<bool> {
+    let v = valor.trim().trim_matches('\'');
+    match v {
+        "prefer-dark" => Some(true),
+        "prefer-light" | "default" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn esquema_do_gnome() {
+    assert_eq!(esquema_escuro("'prefer-dark'\n"), Some(true));
+    assert_eq!(esquema_escuro("'default'"), Some(false));
+    assert_eq!(esquema_escuro("'prefer-light'"), Some(false));
+    assert_eq!(esquema_escuro(""), None);
 }
 
 pub(crate) fn id_hash(id: &impl std::hash::Hash) -> u64 {
