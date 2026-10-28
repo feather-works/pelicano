@@ -1402,7 +1402,7 @@ impl Renderer {
 
     /// Desfoca o que já está desenhado em `r` (vidro), respeitando os cantos.
     pub fn blur(&mut self, r: Rect, raio: f32, cantos: [f32; 4]) {
-        self.falta("vidro");
+        // A GPU desfoca ([`gpu::Vidro`]); as faixas da CPU não, e quem as usa olha `gpu.vidros`.
         // Num quadro parcial os vidros já vêm da gravação (e servem às outras regiões).
         if self.parcial.is_none() {
             self.vidros.push((r, raio));
@@ -1415,6 +1415,20 @@ impl Renderer {
         let tela = r;
         let r = self.local(r);
         let s = self.scale;
+        if self.pintando_gpu {
+            // A mesma grade de 12 da CPU (abaixo): o desfoque começa no mesmo pixel e sai igual.
+            let (pw, ph) = self.gpu.tamanho();
+            let grade = |v: f32| (((v * s).floor() as i32).div_euclid(12) * 12).max(0) as u32;
+            let (x0, y0) = (grade(tela.x).min(pw), grade(tela.y).min(ph));
+            let x1 = (((r.x + r.width) * s).ceil().max(0.0) as u32).min(pw);
+            let y1 = (((r.y + r.height) * s).ceil().max(0.0) as u32).min(ph);
+            if x1 > x0 && y1 > y0 {
+                let rec = self.clips.last().map_or(gpu::SEM_RECORTE, |c| c.gpu);
+                let k = ((raio * s) / 3.0).round().max(1.0) as u32;
+                self.gpu.vidro(gpu::Vidro { area: [x0, y0, x1 - x0, y1 - y0], k, forma: [r.x * s, r.y * s, r.width * s, r.height * s], raios: cantos.map(|v| v * s), rec, alfa: self.opacidade });
+            }
+            return;
+        }
         let (pw, ph) = (self.pixmap.width() as i32, self.pixmap.height() as i32);
         // Começa num múltiplo de 12 na janela inteira: o desfoque reduzido cai na mesma grade
         // no quadro cheio e no parcial (`begin_parcial`), e não aparece emenda.

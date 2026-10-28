@@ -97,6 +97,8 @@ impl Faixa<'_> {
                         self.traco(&l.tracos[t * TRACO..(t + 1) * TRACO]);
                         t += 1;
                     }
+                    // A lista com vidro não vem para as faixas (`App::redraw`, `capture_bands`).
+                    Tipo::Vidro => {}
                 }
             }
         }

@@ -1043,7 +1043,8 @@ impl<A: App> Runtime<A> {
             self.renderer.begin_gpu(size, escala, fundo);
             pintar(&mut self.renderer);
             self.renderer.end();
-            if self.renderer.falta_gpu.is_none() {
+            // As faixas não desfocam: o quadro com vidro sem GPU vai pelo tiny-skia.
+            if self.renderer.falta_gpu.is_none() && self.renderer.gpu.vidros.is_empty() {
                 self.renderer.pintar_lista_cpu(regioes.as_deref());
                 em_faixas = true;
             }
@@ -1617,7 +1618,8 @@ impl Gpu {
         let alpha_mode = if transparente && caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) { wgpu::CompositeAlphaMode::PreMultiplied } else { caps.alpha_modes[0] };
         let tamanho = w.inner_size();
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // COPY_SRC: o vidro copia o que já foi desenhado (sem ela, o vidro sai sem desfoque).
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | (caps.usages & wgpu::TextureUsages::COPY_SRC),
             format: self.format,
             width: tamanho.width.max(1),
             height: tamanho.height.max(1),
@@ -1653,9 +1655,8 @@ impl Tela {
                 return std::mem::replace(&mut self.falhou, true);
             }
         };
-        let view = frame.texture.create_view(&Default::default());
         let Some(p) = g.pintor.as_mut() else { return true };
-        p.desenhar(&g.device, &g.queue, &view, lista);
+        p.desenhar(&g.device, &g.queue, &frame.texture, lista);
         frame.present();
         g.device.poll(wgpu::Maintain::Poll);
         self.falhou = false;

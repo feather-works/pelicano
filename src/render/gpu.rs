@@ -44,6 +44,34 @@ pub(crate) enum Tipo {
     Quad,
     Glifo,
     Traco,
+    /// Desfoca o que já foi desenhado: o lote leva o índice em [`Lista::vidros`].
+    Vidro,
+}
+
+/// Um vidro (`backdrop_blur`), em pixels do quadro: a mesma conta do `Renderer::blur` da CPU.
+pub(crate) struct Vidro {
+    /// A área copiada e desfocada: x, y, largura, altura.
+    pub(crate) area: [u32; 4],
+    /// O raio de cada uma das três caixas, em pixels cheios.
+    pub(crate) k: u32,
+    /// Onde o desfoque volta, com os cantos.
+    pub(crate) forma: [f32; 4],
+    pub(crate) raios: [f32; 4],
+    pub(crate) rec: [f32; 12],
+    pub(crate) alfa: f32,
+}
+
+impl Vidro {
+    /// A redução (como o `desfocar` da CPU) e o raio das caixas na imagem reduzida.
+    fn reducao(&self) -> (u32, u32) {
+        let d = (self.k / 2).clamp(1, 4);
+        (d, (self.k / d).max(1))
+    }
+
+    fn reduzida(&self) -> (u32, u32) {
+        let d = self.reducao().0;
+        (self.area[2].div_ceil(d), self.area[3].div_ceil(d))
+    }
 }
 
 /// O quadro anotado. Fica no [`Renderer`] (as alocações servem ao próximo).
@@ -61,6 +89,7 @@ pub(crate) struct Lista {
     /// As imagens usadas no quadro, uma vez cada, pelo número que o lote leva: o [`Pintor`] sobe
     /// as que ainda não tem.
     pub(crate) usadas: Vec<(u64, Arc<Pixmap>)>,
+    pub(crate) vidros: Vec<Vidro>,
     vistas: HashSet<u64>,
     pub(crate) atlas: Atlas,
     tamanho: (u32, u32),
@@ -76,6 +105,7 @@ impl Lista {
         self.tracos.clear();
         self.lotes.clear();
         self.usadas.clear();
+        self.vidros.clear();
         self.vistas.clear();
         self.tamanho = (w, h);
         self.fundo = fundo;
@@ -83,6 +113,15 @@ impl Lista {
 
     pub(crate) fn tamanho(&self) -> (u32, u32) {
         self.tamanho
+    }
+
+    pub(crate) fn vidro(&mut self, v: Vidro) {
+        if !cruza(v.forma, &v.rec) {
+            return;
+        }
+        // Um lote por vidro: cada um interrompe o passe para ler o que já foi desenhado.
+        self.lotes.push((Tipo::Vidro, self.vidros.len() as u64, 1));
+        self.vidros.push(v);
     }
 
     fn por(&mut self, tipo: Tipo, textura: u64, dados: &[f32]) {
@@ -94,6 +133,7 @@ impl Lista {
             Tipo::Quad => &mut self.quads,
             Tipo::Glifo => &mut self.glifos,
             Tipo::Traco => &mut self.tracos,
+            Tipo::Vidro => unreachable!("o vidro entra por Lista::vidro"),
         }
         .extend_from_slice(dados);
     }
@@ -388,6 +428,9 @@ impl Renderer {
         if let Some(m) = self.falta_gpu {
             return Err(m);
         }
+        if !self.gpu.vidros.is_empty() {
+            return Err("vidro (as faixas não desfocam)");
+        }
         self.pintar_lista_cpu(None);
         Ok(self.pixmap.data().to_vec())
     }
@@ -417,7 +460,18 @@ pub(crate) struct Pintor {
     /// e os bytes dela.
     texturas: HashMap<u64, (wgpu::BindGroup, u64, usize)>,
     quadro: u64,
+    borrar: wgpu::RenderPipeline,
+    formato: wgpu::TextureFormat,
+    /// Instâncias dos passes do vidro: os parâmetros de cada passe e a volta (um glifo do tipo 3).
+    buffers_vidro: [Option<wgpu::Buffer>; 2],
+    /// Cópia da área (tamanho cheio) e as duas reduzidas que os passes alternam, com o tamanho de cada.
+    copias: Option<Copias>,
 }
+
+/// As três texturas do vidro (a cópia cheia e as duas reduzidas) e os tamanhos alocados.
+type Copias = ([(wgpu::Texture, wgpu::BindGroup); 3], (u32, u32), (u32, u32));
+
+const BORRAR: usize = 8;
 
 impl Pintor {
     /// `format`: o do alvo, um "Srgb" (a mistura é em espaço linear).
@@ -440,7 +494,7 @@ impl Pintor {
         let com_textura = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&camada_globais, &camada_textura], push_constant_ranges: &[] });
         // Tudo sai pré-multiplicado, como o pixmap da CPU.
         let mistura = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
-        let pipeline = |layout: &wgpu::PipelineLayout, vs: &str, fs: &str, vec4s: u32| {
+        let pipeline_em = |format: wgpu::TextureFormat, layout: &wgpu::PipelineLayout, vs: &str, fs: &str, vec4s: u32| {
             let attrs: Vec<wgpu::VertexAttribute> = (0..vec4s).map(|i| wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16 * i as u64, shader_location: i }).collect();
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: None,
@@ -453,17 +507,21 @@ impl Pintor {
                 multiview: None,
             })
         };
+        let pipeline = |layout: &wgpu::PipelineLayout, vs: &str, fs: &str, vec4s: u32| pipeline_em(format, layout, vs, fs, vec4s);
         let quad = pipeline(&so_globais, "vs_quad", "fs_quad", (QUAD / 4) as u32);
         let glifo = pipeline(&com_textura, "vs_glifo", "fs_glifo", (GLIFO / 4) as u32);
         let traco = pipeline(&so_globais, "vs_traco", "fs_traco", (TRACO / 4) as u32);
+        let borrar = pipeline_em(format.remove_srgb_suffix(), &com_textura, "vs_borrar", "fs_borrar", (BORRAR / 4) as u32);
         let amostrador = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
         let atlas = textura(device, ATLAS, ATLAS);
         let grupo_atlas = grupo_textura(device, &camada_textura, &atlas, &amostrador);
-        Pintor { quad, glifo, traco, globais, grupo, camada_textura, amostrador, atlas, grupo_atlas, buffers: [None, None, None], texturas: HashMap::new(), quadro: 0 }
+        Pintor { quad, glifo, traco, globais, grupo, camada_textura, amostrador, atlas, grupo_atlas, buffers: [None, None, None], texturas: HashMap::new(), quadro: 0, borrar, formato: format, buffers_vidro: [None, None], copias: None }
     }
 
-    /// Pinta a lista em `alvo` (limpo com o fundo) e envia. `alvo` tem o tamanho da lista.
-    pub(crate) fn desenhar(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, alvo: &wgpu::TextureView, l: &mut Lista) {
+    /// Pinta a lista em `alvo` (limpo com o fundo) e envia. `alvo` tem o tamanho da lista; o vidro
+    /// precisa que ele aceite `COPY_SRC` (sem isso o vidro sai só com a cor, sem desfoque).
+    pub(crate) fn desenhar(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, alvo_tex: &wgpu::Texture, l: &mut Lista) {
+        let alvo = &alvo_tex.create_view(&Default::default());
         self.quadro += 1;
         for g in l.atlas.envios.drain(..) {
             // A cobertura vira branco pré-multiplicado; o emoji, pré-multiplicado.
@@ -515,25 +573,33 @@ impl Pintor {
         // Linear e pré-multiplicado: o alvo "Srgb" codifica na escrita.
         let [r, g, b, a] = rgba(l.fundo).map(|v| v as f64);
         let limpo = wgpu::Color { r: r * a, g: g * a, b: b * a, a };
+        let vidro = !l.vidros.is_empty() && alvo_tex.usage().contains(wgpu::TextureUsages::COPY_SRC);
+        if vidro {
+            self.preparar_vidros(device, queue, l);
+        }
         let mut enc = device.create_command_encoder(&Default::default());
-        {
+        let mut inicio = [0u32; 3];
+        let mut de = 0;
+        loop {
+            let ate = l.lotes[de..].iter().position(|x| x.0 == Tipo::Vidro).map_or(l.lotes.len(), |p| de + p);
+            let load = if de == 0 { wgpu::LoadOp::Clear(limpo) } else { wgpu::LoadOp::Load };
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: alvo, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(limpo), store: wgpu::StoreOp::Store } })],
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: alvo, resolve_target: None, ops: wgpu::Operations { load, store: wgpu::StoreOp::Store } })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
             pass.set_bind_group(0, &self.grupo, &[]);
-            let mut inicio = [0u32; 3];
             let mut atual: Option<(Tipo, u64)> = None;
-            for &(tipo, tex, n) in &l.lotes {
+            for &(tipo, tex, n) in &l.lotes[de..ate] {
                 let i = tipo as usize;
                 if atual.map(|a| a.0) != Some(tipo) {
                     pass.set_pipeline(match tipo {
                         Tipo::Quad => &self.quad,
                         Tipo::Glifo => &self.glifo,
                         Tipo::Traco => &self.traco,
+                        Tipo::Vidro => unreachable!("o vidro separa os passes"),
                     });
                     pass.set_vertex_buffer(0, self.buffers[i].as_ref().expect("tem instâncias").slice(..));
                 }
@@ -545,8 +611,124 @@ impl Pintor {
                 pass.draw(0..4, inicio[i]..inicio[i] + n);
                 inicio[i] += n;
             }
+            drop(pass);
+            if ate == l.lotes.len() {
+                break;
+            }
+            if vidro {
+                self.desfocar(&mut enc, alvo, alvo_tex, l, l.lotes[ate].1 as usize);
+            }
+            de = ate + 1;
         }
         queue.submit([enc.finish()]);
+    }
+
+    /// As texturas do tamanho do maior vidro e as instâncias de todos os passes do quadro.
+    fn preparar_vidros(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, l: &Lista) {
+        let degrau = |v: u32| v.div_ceil(256) * 256;
+        let cheia = l.vidros.iter().fold((1, 1), |m, v| (m.0.max(v.area[2]), m.1.max(v.area[3])));
+        let reduzida = l.vidros.iter().fold((1, 1), |m, v| {
+            let r = v.reduzida();
+            (m.0.max(r.0), m.1.max(r.1))
+        });
+        let cabe = |c: (u32, u32), q: (u32, u32)| c.0 >= q.0 && c.1 >= q.1;
+        if !self.copias.as_ref().is_some_and(|c| cabe(c.1, cheia) && cabe(c.2, reduzida)) {
+            let (cw, ch) = (degrau(cheia.0), degrau(cheia.1));
+            let (rw, rh) = (degrau(reduzida.0), degrau(reduzida.1));
+            let nova = |w: u32, h: u32| {
+                let t = device.create_texture(&wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    // Sem o "Srgb": o desfoque soma os valores como estão, em sRGB, como a CPU faz.
+                    format: self.formato.remove_srgb_suffix(),
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let g = grupo_textura(device, &self.camada_textura, &t, &self.amostrador);
+                (t, g)
+            };
+            self.copias = Some(([nova(cw, ch), nova(rw, rh), nova(rw, rh)], (cw, ch), (rw, rh)));
+        }
+        let (rw, rh) = self.copias.as_ref().expect("criadas acima").2;
+        let mut passes = Vec::with_capacity(l.vidros.len() * 7 * BORRAR);
+        let mut voltas = Vec::with_capacity(l.vidros.len() * GLIFO);
+        for v in &l.vidros {
+            let (d, k) = v.reducao();
+            let (sw, sh) = v.reduzida();
+            passes.extend_from_slice(&[0.0, k as f32, d as f32, 0.0, v.area[2] as f32, v.area[3] as f32, 0.0, 0.0]);
+            for _ in 0..3 {
+                passes.extend_from_slice(&[1.0, k as f32, d as f32, 0.0, sw as f32, sh as f32, 0.0, 0.0]);
+                passes.extend_from_slice(&[2.0, k as f32, d as f32, 0.0, sw as f32, sh as f32, 0.0, 0.0]);
+            }
+            let mut g = [0.0; GLIFO];
+            g[..4].copy_from_slice(&v.forma);
+            g[4..8].copy_from_slice(&[v.area[0] as f32, v.area[1] as f32, sw as f32, sh as f32]);
+            g[8..12].copy_from_slice(&[1.0, 1.0, 1.0, v.alfa]);
+            g[12..16].copy_from_slice(&v.raios);
+            g[16..20].copy_from_slice(&[3.0, d as f32, 1.0 / rw as f32, 1.0 / rh as f32]);
+            g[20..].copy_from_slice(&v.rec);
+            voltas.extend_from_slice(&g);
+        }
+        for (i, dados) in [passes, voltas].iter().enumerate() {
+            let b = bytes(dados);
+            if self.buffers_vidro[i].as_ref().map_or(true, |x| x.size() < b.len() as u64) {
+                let size = (b.len() as u64).next_power_of_two().max(1024);
+                self.buffers_vidro[i] = Some(device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }));
+            }
+            queue.write_buffer(self.buffers_vidro[i].as_ref().expect("criado acima"), 0, b);
+        }
+    }
+
+    /// O vidro `n`: copia a área, reduz, três caixas em cada direção e devolve com os cantos.
+    fn desfocar(&self, enc: &mut wgpu::CommandEncoder, alvo: &wgpu::TextureView, alvo_tex: &wgpu::Texture, l: &Lista, n: usize) {
+        let v = &l.vidros[n];
+        let Some(([a, b, c], _, _)) = &self.copias else { return };
+        let [x, y, w, h] = v.area;
+        enc.copy_texture_to_texture(
+            wgpu::ImageCopyTexture { texture: alvo_tex, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+            wgpu::ImageCopyTexture { texture: &a.0, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let (sw, sh) = v.reduzida();
+        let passes = self.buffers_vidro[0].as_ref().expect("preparado");
+        // Cópia -> b (reduz); depois b -> c (horizontal) e c -> b (vertical), três vezes.
+        let mut de_para = vec![(&a.1, &b.0)];
+        for _ in 0..3 {
+            de_para.push((&b.1, &c.0));
+            de_para.push((&c.1, &b.0));
+        }
+        for (i, (de, para)) in de_para.into_iter().enumerate() {
+            let vista = para.create_view(&Default::default());
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &vista, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.borrar);
+            pass.set_bind_group(0, &self.grupo, &[]);
+            pass.set_bind_group(1, de, &[]);
+            pass.set_viewport(0.0, 0.0, sw as f32, sh as f32, 0.0, 1.0);
+            pass.set_vertex_buffer(0, passes.slice(..));
+            let k = (n * 7 + i) as u32;
+            pass.draw(0..4, k..k + 1);
+        }
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: alvo, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.glifo);
+        pass.set_bind_group(0, &self.grupo, &[]);
+        pass.set_bind_group(1, &b.1, &[]);
+        pass.set_vertex_buffer(0, self.buffers_vidro[1].as_ref().expect("preparado").slice(..));
+        pass.draw(0..4, n as u32..n as u32 + 1);
     }
 }
 
@@ -623,7 +805,7 @@ impl GpuOffscreen {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        self.pintor.desenhar(&self.device, &self.queue, &t.create_view(&Default::default()), &mut r.gpu);
+        self.pintor.desenhar(&self.device, &self.queue, &t, &mut r.gpu);
         let linha = (4 * w).div_ceil(256) * 256;
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (linha * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
         let mut enc = self.device.create_command_encoder(&Default::default());
@@ -851,7 +1033,15 @@ struct GlifoOut {
     let corte = recorte(c, q.ret, q.rr, q.rk);
     if corte == 0.0 { discard; }
     var saida: vec4<f32>;
-    if q.params.x == 2.0 {
+    if q.params.x == 3.0 {
+        // Vidro: o desfoque reduzido, esticado de volta (bilinear) e com os cantos. Ele foi feito em
+        // sRGB (como a CPU): volta ao linear como uma imagem.
+        // uv = (origem da área, tamanho reduzido); params = (3, redução, 1 / tamanho da textura).
+        // A amostra fica dentro do reduzido: a borda se repete, como no `escalar` da CPU.
+        let tc = clamp((c - q.uv.xy) / q.params.y, vec2<f32>(0.5), q.uv.zw - vec2<f32>(0.5));
+        let t = textureSampleLevel(tex, amostra, tc * q.params.zw, 0.0);
+        saida = linear_pre(t) * q.cor.a * cobertura(q.dst, q.raios, c);
+    } else if q.params.x == 2.0 {
         // Imagem: suavizada (bilinear, como o `escalar` da CPU) e com os cantos.
         let t = textureSampleLevel(tex, amostra, (c - q.dst.xy) / q.dst.zw, 0.0);
         saida = linear_pre(t) * q.cor.a * cobertura(q.dst, q.raios, c);
@@ -865,6 +1055,54 @@ struct GlifoOut {
         }
     }
     return saida * corte;
+}
+
+struct BorrarIn {
+    @location(0) a: vec4<f32>,
+    @location(1) b: vec4<f32>,
+}
+struct BorrarOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) @interpolate(flat) a: vec4<f32>,
+    @location(1) @interpolate(flat) b: vec4<f32>,
+}
+
+// O vidro, passe a passo: a cobre o alvo inteiro (o viewport limita à área reduzida).
+@vertex fn vs_borrar(@builtin(vertex_index) i: u32, q: BorrarIn) -> BorrarOut {
+    var o: BorrarOut;
+    let p = canto(i);
+    o.pos = vec4<f32>(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+    o.a = q.a; o.b = q.b;
+    return o;
+}
+
+// a = (passe, raio da caixa, redução, _); b = (largura, altura da origem, _, _).
+// Passe 0 reduz (média de d × d); 1 e 2 são a caixa horizontal e a vertical (a `box_blur` da CPU,
+// com a borda repetida).
+@fragment fn fs_borrar(q: BorrarOut) -> @location(0) vec4<f32> {
+    let p = vec2<i32>(floor(q.pos.xy));
+    let k = i32(q.a.y);
+    let d = i32(q.a.z);
+    let lim = vec2<i32>(q.b.xy) - vec2<i32>(1);
+    var soma = vec4<f32>(0.0);
+    if q.a.x == 0.0 {
+        var n = 0.0;
+        for (var y = 0; y < d; y++) {
+            for (var x = 0; x < d; x++) {
+                let e = p * d + vec2<i32>(x, y);
+                if e.x <= lim.x && e.y <= lim.y {
+                    soma += textureLoad(tex, e, 0);
+                    n += 1.0;
+                }
+            }
+        }
+        return soma / max(n, 1.0);
+    }
+    let dir = select(vec2<i32>(0, 1), vec2<i32>(1, 0), q.a.x == 1.0);
+    for (var j = -k; j <= k; j++) {
+        soma += textureLoad(tex, clamp(p + dir * j, vec2<i32>(0), lim), 0);
+    }
+    return soma / f32(2 * k + 1);
 }
 
 struct TracoIn {

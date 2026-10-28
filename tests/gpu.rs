@@ -35,6 +35,31 @@ fn diferenca(nome: &str, cpu: &[u8], outro: &[u8], tol: u8, fracao: f64) {
 }
 
 #[test]
+fn vidro() {
+    // O vidro não passa pelas faixas: compara direto o tiny-skia com a GPU. Os dois desfocam em
+    // sRGB; sobra o arredondamento de 8 bits em cada passe e a borda suavizada dos cantos.
+    let cena = |r: &mut Renderer| {
+        for i in 0..12 {
+            let cor = if i % 2 == 0 { Color::rgb8(0xf5, 0x9e, 0x0b) } else { Color::rgb8(0x3b, 0x82, 0xf6) };
+            r.fill_quad(Rect { x: i as f32 * 20.0, y: 0.0, width: 20.0, height: 160.0 }, Some(&Background::Color(cor)), Border::default(), None);
+        }
+        // Só o vidro: um translúcido por cima já difere pela mistura em sRGB do tiny-skia.
+        r.blur(Rect { x: 30.0, y: 30.0, width: 170.0, height: 90.0 }, 20.0, [12.0; 4]);
+    };
+    let (tam, escala) = (Size::new(240.0, 160.0), 1.25);
+    let mut r = Renderer::new();
+    r.begin(tam, escala, FUNDO);
+    cena(&mut r);
+    let cpu = r.pixmap.data().to_vec();
+    let Some(mut g) = GpuOffscreen::new() else {
+        eprintln!("vidro: sem adaptador gráfico, pulando a GPU");
+        return;
+    };
+    let gpu = g.capture(&mut r, tam, escala, FUNDO, cena).unwrap_or_else(|m| panic!("vidro: caiu na CPU ({m})"));
+    diferenca("vidro", &cpu, &gpu, 6, 0.01);
+}
+
+#[test]
 fn quadros_com_borda_e_sombra() {
     comparar("quadros", Size::new(240.0, 160.0), 1.0, 6, 0.01, |r| {
         let caixa = Rect { x: 20.0, y: 20.0, width: 120.0, height: 70.0 };
