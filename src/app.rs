@@ -1535,8 +1535,10 @@ impl Gpu {
         for backends in [wgpu::Backends::PRIMARY, wgpu::Backends::GL] {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..Default::default() });
             let Ok(surface) = instance.create_surface(w.clone()) else { continue };
-            // A placa dedicada, se houver; o rasterizador em software (llvmpipe) só se não tiver outra.
-            let pedido = wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: Some(&surface), force_fallback_adapter: false };
+            // A placa que liga a tela (a integrada, no notebook de duas): a dedicada desenhava e copiava
+            // cada quadro para a outra, e no Windows isso deixava a janela lenta. O rasterizador em
+            // software (llvmpipe) só se não tiver outra.
+            let pedido = wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::LowPower, compatible_surface: Some(&surface), force_fallback_adapter: false };
             let Some(mut adapter) = futures::executor::block_on(instance.request_adapter(&pedido)) else { continue };
             if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
                 if let Some(a) = instance.enumerate_adapters(backends).into_iter().find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu && a.is_surface_supported(&surface)) {
