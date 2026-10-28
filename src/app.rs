@@ -489,6 +489,8 @@ struct Janela {
     cursor: Option<Point>,
     icon: CursorIcon,
     transparente: bool,
+    /// Para avisar `Event::Maximized` só quando muda.
+    maximizada: bool,
     fechar_ao_pedir: bool,
     /// O próximo quadro precisa ser inteiro (janela nova, resize, quadro perdido).
     tudo: bool,
@@ -769,7 +771,7 @@ impl<A: App> Runtime<A> {
             }
             w.set_visible(true);
             w.request_redraw();
-            self.janelas.push(Janela { id, w, tela, quadro: Quadro::default(), states: States::default(), cursor: None, icon: CursorIcon::Default, transparente: s.transparent && !cfg!(windows), fechar_ao_pedir: s.close_on_request, tudo: true, na_gpu: false, mover: false, ultimo_mover: std::time::Instant::now(), proximo: None, roda: None, roda_suave: None, acesso, leitor: false, arvore: None, dedo: None });
+            self.janelas.push(Janela { id, w, tela, quadro: Quadro::default(), states: States::default(), cursor: None, icon: CursorIcon::Default, transparente: s.transparent && !cfg!(windows), maximizada: false, fechar_ao_pedir: s.close_on_request, tudo: true, na_gpu: false, mover: false, ultimo_mover: std::time::Instant::now(), proximo: None, roda: None, roda_suave: None, acesso, leitor: false, arvore: None, dedo: None });
             let escala = self.janelas.last().map_or(1.0, |j| j.w.scale_factor() as f32);
             let m: Vec<_> = self.app.on_window_event(id, &Event::ScaleChanged(escala)).into_iter().collect();
             self.update(m);
@@ -1256,6 +1258,7 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
         let j = &mut self.janelas[i];
         j.acesso.process_event(&j.w, &we);
         let (id, escala) = (j.id, j.w.scale_factor());
+        let mut depois = None;
         let ev = match we {
             WindowEvent::RedrawRequested => return self.redraw(i),
             WindowEvent::CloseRequested => {
@@ -1272,6 +1275,11 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
             WindowEvent::Resized(s) => {
                 // A superfície muda de tamanho no `present`, uma vez por quadro.
                 j.tudo = true;
+                let maximizada = j.w.is_maximized();
+                if maximizada != j.maximizada {
+                    j.maximizada = maximizada;
+                    depois = Some(Event::Maximized(maximizada));
+                }
                 let l = s.to_logical::<f32>(escala);
                 Some(Event::Resized(Size::new(l.width, l.height)))
             }
@@ -1352,6 +1360,9 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
                 eprintln!("[pelicano] {ev:?} cursor={:?}", self.janelas[i].cursor);
             }
             self.event(i, ev);
+            if let (Some(ev), Some(i)) = (depois, self.indice(id)) {
+                self.event(i, ev);
+            }
         }
         self.abrir_janelas(el);
     }

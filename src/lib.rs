@@ -350,6 +350,9 @@ pub enum Event {
     Wheel { dx: f32, dy: f32, modifiers: Modifiers },
     Key { key: Key, text: Option<String>, modifiers: Modifiers, pressed: bool },
     Resized(Size),
+    /// A janela entrou (`true`) ou saiu de maximizada, por qualquer caminho (botão,
+    /// duplo clique, atalho do sistema). Vem logo depois do `Resized`.
+    Maximized(bool),
     /// A janela foi para outro lugar da tela (lógico). O Wayland nunca conta.
     Moved(Point),
     CloseRequested,

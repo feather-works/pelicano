@@ -1,6 +1,6 @@
 [package]
 name = "pelicano"
-version = "0.1.18"
+version = "0.1.19"
 description = "Biblioteca de interface da suíte FeatherWorks: widgets, layout e janela próprios, sem Iced"
 authors = ["FeatherWorks"]
 edition = "2021"
