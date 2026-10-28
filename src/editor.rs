@@ -388,7 +388,13 @@ impl Interno {
             let mut b = Buffer::new(fonts, metricas);
             // Sem altura, o set_text monta todas as linhas; com zero, nenhuma (o desenho monta as visíveis).
             b.set_size(fonts, None, Some(0.0));
-            b.set_text(fonts, &std::mem::take(&mut self.inicial), attrs, Shaping::Advanced);
+            let texto = std::mem::take(&mut self.inicial);
+            b.set_text(fonts, &texto, attrs, Shaping::Advanced);
+            // Texto vazio: o cosmic-text dá "\n" à única linha, e ela ia parar no fim de tudo o
+            // que se digitasse ("abc" virava "abc\n"). Num texto não vazio a última já vem sem.
+            if texto.is_empty() {
+                b.lines[0].set_ending(cosmic_text::LineEnding::None);
+            }
             let mut ed = Editor::new(b);
             if let Some(linha) = self.linha_inicial.take() {
                 let n = ed.with_buffer(|b| b.lines.len());
@@ -1708,6 +1714,18 @@ impl<'a, M: Clone + 'a> From<TextEditor<'a, M>> for crate::Element<'a, M> {
 #[cfg(test)]
 mod testes {
     use super::*;
+
+    /// Começar vazio e digitar não acrescenta quebra no fim.
+    #[test]
+    fn vazio_nao_ganha_quebra_no_fim() {
+        let c = Content::with_text("");
+        let el: crate::Element<'_, ()> = crate::text_editor(&c).into();
+        let _ = crate::capture(&el, crate::Size::new(300.0, 200.0), 1.0, &crate::Theme::light(), &mut Renderer::new(), None);
+        c.insert("abc");
+        assert_eq!(c.text(), "abc");
+        c.insert("\nde");
+        assert_eq!(c.text(), "abc\nde");
+    }
 
     /// A tabela inteira é achada mesmo começando acima da tela; sem o `|---|` não é tabela.
     #[test]
