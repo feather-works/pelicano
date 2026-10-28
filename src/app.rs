@@ -769,7 +769,7 @@ impl<A: App> Runtime<A> {
             }
             w.set_visible(true);
             w.request_redraw();
-            self.janelas.push(Janela { id, w, tela, quadro: Quadro::default(), states: States::default(), cursor: None, icon: CursorIcon::Default, transparente: s.transparent, fechar_ao_pedir: s.close_on_request, tudo: true, na_gpu: false, mover: false, ultimo_mover: std::time::Instant::now(), proximo: None, roda: None, roda_suave: None, acesso, leitor: false, arvore: None, dedo: None });
+            self.janelas.push(Janela { id, w, tela, quadro: Quadro::default(), states: States::default(), cursor: None, icon: CursorIcon::Default, transparente: s.transparent && !cfg!(windows), fechar_ao_pedir: s.close_on_request, tudo: true, na_gpu: false, mover: false, ultimo_mover: std::time::Instant::now(), proximo: None, roda: None, roda_suave: None, acesso, leitor: false, arvore: None, dedo: None });
             let escala = self.janelas.last().map_or(1.0, |j| j.w.scale_factor() as f32);
             let m: Vec<_> = self.app.on_window_event(id, &Event::ScaleChanged(escala)).into_iter().collect();
             self.update(m);
@@ -1123,7 +1123,8 @@ fn atributos(s: &Settings) -> winit::window::WindowAttributes {
         .with_title(&s.title)
         .with_inner_size(LogicalSize::new(s.size.width, s.size.height))
         .with_decorations(s.decorations)
-        .with_transparent(s.transparent)
+        // No Windows a superfície do wgpu (DX12/Vulkan) só sai opaca: o transparente virava canto preto.
+        .with_transparent(s.transparent && !cfg!(windows))
         .with_blur(s.blur)
         .with_resizable(s.resizable)
         .with_window_icon(s.icon.clone());
@@ -1149,6 +1150,10 @@ fn atributos(s: &Settings) -> winit::window::WindowAttributes {
     {
         use winit::platform::windows::WindowAttributesExtWindows;
         attrs = attrs.with_skip_taskbar(s.skip_taskbar);
+        // Sem a moldura do sistema, o canto arredondado é pedido ao DWM (Windows 11; no 10 fica reto).
+        if !s.decorations {
+            attrs = attrs.with_corner_preference(winit::platform::windows::CornerPreference::Round);
+        }
     }
     attrs
 }
