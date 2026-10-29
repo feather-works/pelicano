@@ -890,7 +890,7 @@ fn enter_e_colar_no_fim_guardam_a_quebra() {
 }
 
 #[test]
-fn clique_na_caixinha_marca_e_o_cursor_fica() {
+fn clique_na_caixinha_marca_e_o_cursor_fica_na_linha() {
     let mut h = H::new();
     let c = Content::with_text("a\n- [ ] tarefa");
     let el: Element<E> = text_editor(&c).markdown(true).on_change(E::Mudou).into();
@@ -901,7 +901,8 @@ fn clique_na_caixinha_marca_e_o_cursor_fica() {
     let y = r.y + 12.0 + (15.0f32 * 1.45).ceil() * 1.5;
     assert_eq!(h.click(&el, Point::new(x, y)), vec![E::Mudou]);
     assert_eq!(c.text(), "a\n- [x] tarefa");
-    assert_eq!(c.cursor(), (1, 1));
+    // O cursor fica na linha clicada: voltar para onde estava (fora da tela) rolava a tela até lá.
+    assert_eq!(c.cursor().0, 2);
     h.desenhar(&el, None);
     h.click(&el, Point::new(x, y));
     assert_eq!(c.text(), "a\n- [ ] tarefa");

@@ -425,6 +425,43 @@ impl Interno {
     }
 
     /// Uma edição: guarda o que mudou para o desfazer (letras seguidas juntam num passo).
+    /// Uma linha vazia na tabela logo embaixo de `depois` (do cabeçalho, embaixo do `|---|`), com o cursor nela.
+    fn tabela_linha(&mut self, linhas: std::ops::Range<usize>, colunas: usize, depois: usize) {
+        let depois = depois.max(linhas.start + 1);
+        let Some(fim) = self.ed.as_ref().map(|ed| ed.with_buffer(|b| b.lines[depois].text().len())) else { return };
+        self.editar(false, |ed| {
+            ed.set_selection(Selection::None);
+            ed.insert_at(Cursor::new(depois, fim), &format!("\n|{}", "  |".repeat(colunas.max(1))), None);
+            ed.set_cursor(Cursor::new(depois + 1, 2));
+        });
+        self.digitando = None;
+    }
+
+    /// Uma coluna no fim de cada linha da tabela; o título dela fica selecionado, para escrever por cima.
+    fn tabela_coluna(&mut self, linhas: std::ops::Range<usize>, colunas: usize) {
+        let Some(textos) = self.ed.as_ref().map(|ed| ed.with_buffer(|b| linhas.clone().map(|l| b.lines[l].text().to_owned()).collect::<Vec<_>>())) else { return };
+        let titulo = format!("Coluna {}", colunas + 1);
+        self.editar(false, |ed| {
+            let mut onde = 0;
+            for (k, t) in textos.iter().enumerate() {
+                // Linha sem a `|` do fim: fecha a última célula antes.
+                let fecha = if t.trim_end().ends_with('|') { "" } else { " |" };
+                let celula = match k {
+                    0 => format!(" {titulo} |"),
+                    1 => "---|".to_owned(),
+                    _ => "  |".to_owned(),
+                };
+                if k == 0 {
+                    onde = t.len() + fecha.len() + 1;
+                }
+                ed.insert_at(Cursor::new(linhas.start + k, t.len()), &format!("{fecha}{celula}"), None);
+            }
+            ed.set_selection(Selection::Normal(Cursor::new(linhas.start, onde)));
+            ed.set_cursor(Cursor::new(linhas.start, onde + titulo.len()));
+        });
+        self.digitando = None;
+    }
+
     fn editar(&mut self, digitacao: bool, f: impl FnOnce(&mut Editor<'static>)) {
         let Some(ed) = self.ed.as_mut() else { return };
         ed.start_change();
@@ -500,6 +537,8 @@ struct Tabela {
     /// Do último desenho: a borda esquerda (x lógico na janela) e (linha, topo, altura) das linhas à vista.
     x0: f32,
     filas: Vec<(usize, f32, f32)>,
+    /// Os "+" da borda direita (nova coluna) e de baixo (nova linha), do último desenho.
+    mais: [Option<Rect>; 2],
 }
 
 /// A folga de cada lado do texto da célula.
@@ -575,7 +614,7 @@ fn tabelas_em<'a>(linha: impl Fn(usize) -> Option<&'a str>, faixa: std::ops::Ran
         }
         if k - inicio >= 2 && linha(inicio + 1).is_some_and(separador_de_tabela) {
             let celulas = (inicio..k).map(|j| if j == inicio + 1 { Vec::new() } else { celulas(linha(j).unwrap_or_default(), j == inicio) }).collect();
-            achadas.push(Tabela { linhas: inicio..k, celulas, larguras: Vec::new(), x0: 0.0, filas: Vec::new() });
+            achadas.push(Tabela { linhas: inicio..k, celulas, larguras: Vec::new(), x0: 0.0, filas: Vec::new(), mais: [None; 2] });
         }
     }
     achadas
@@ -1303,8 +1342,8 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             let desce = (altura_linha - cx.renderer.measure(self.placeholder, self.size, self.font, None).height) / 2.0;
             cx.renderer.draw_text(self.placeholder, self.size, self.font, cx.theme.muted, Point::new(area.x, area.y + desce), Some(area.width));
         }
-        for t in &tabelas {
-            let (Some(a), Some(z)) = (t.filas.first(), t.filas.last()) else { continue };
+        for t in &mut tabelas {
+            let (Some(&a), Some(&z)) = (t.filas.first(), t.filas.last()) else { continue };
             let x0 = t.x0;
             let largura: f32 = t.larguras.iter().sum();
             let (topo, fundo) = (a.1, z.1 + z.2);
@@ -1323,6 +1362,20 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                 fio(Rect { x, y: topo, width: 1.0, height: fundo - topo }, cx);
             }
             cx.renderer.fill_quad(Rect { x: x0, y: topo, width: largura, height: fundo - topo }, None, Border::rounded(4.0).color(cx.theme.border, 1.0), None);
+            // Com o mouse na tabela, os "+" de nova coluna (canto de cima, à direita) e nova linha (canto de baixo,
+            // à esquerda), cada um só se o seu canto está à vista.
+            let lado = 18.0;
+            let mais = [(a.0 == t.linhas.start).then_some(Rect { x: x0 + largura + 4.0, y: topo + (a.2 - lado) / 2.0, width: lado, height: lado }), (z.0 + 1 == t.linhas.end).then_some(Rect { x: x0, y: fundo + 4.0, width: lado, height: lado })];
+            let perto = Rect { x: x0, y: topo, width: largura + 22.0, height: fundo - topo + 22.0 };
+            if mouse.is_some_and(|p| perto.contains(p)) {
+                for r in mais.into_iter().flatten() {
+                    let sob = mouse.is_some_and(|p| r.contains(p));
+                    cx.renderer.fill_quad(r, Some(&cx.theme.primary.alpha(if sob { 0.22 } else { 0.08 }).into()), Border::rounded(4.0), None);
+                    let m = cx.renderer.measure("+", self.size, Font::DEFAULT, None);
+                    cx.renderer.draw_text("+", self.size, Font::DEFAULT, cx.theme.primary, Point::new(r.x + (r.width - m.width) / 2.0, r.y + (r.height - m.height) / 2.0), None);
+                }
+            }
+            t.mais = mais;
             for &(l, y, h) in &t.filas {
                 for (c, cel) in t.celulas_da(l).iter().enumerate() {
                     let alto = cx.renderer.measure(&cel.texto, self.size, fonte_celula(cel.negrito), None).height;
@@ -1472,7 +1525,21 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                 link_em(b.lines[c.line].text(), c.index, &avisos)
             });
         }
+        // Clique num "+" da grade: a coluna ou a linha nova.
+        let mais = matches!(ev, Event::MousePressed(MouseButton::Left)).then(|| cx.cursor).flatten().and_then(|p| {
+            i.grade.iter().find_map(|t| t.mais.iter().position(|r| r.is_some_and(|r| r.contains(p))).map(|k| (k, t.linhas.clone(), t.larguras.len())))
+        });
         let resultado = match ev {
+            Event::MousePressed(MouseButton::Left) if self.markdown && mais.is_some() => {
+                let (k, linhas, colunas) = mais.expect("conferido");
+                cx.states.focus = Some(n.key);
+                if k == 0 {
+                    i.tabela_coluna(linhas, colunas);
+                } else {
+                    i.tabela_linha(linhas.clone(), colunas, linhas.end - 1);
+                }
+                Captured::Yes
+            }
             Event::ModifiersChanged(m) => {
                 cx.states.get_mut::<Mouse>(n.key).ctrl = m.control_key();
                 cx.redraw = true;
@@ -1521,7 +1588,6 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                 let celula = (self.markdown && vezes < 3).then(|| na_grade(&i.grade, cx.cursor.unwrap_or(Point::ORIGIN), cx.renderer, self.size, |b| self.fonte_celula(b))).flatten();
                 let fonts = cx.renderer.fonts();
                 let ed = i.ed.as_mut().expect("montado acima");
-                let antes = ed.cursor();
                 match celula {
                     // Dois cliques pegam a célula inteira.
                     Some((linha, _, (a, z))) if vezes == 2 => {
@@ -1535,7 +1601,8 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                     None => ed.action(fonts, acao),
                 }
                 let c = ed.cursor();
-                // Clique na caixinha desenhada: marca/desmarca e o cursor fica onde estava.
+                // Clique na caixinha desenhada: marca/desmarca. O cursor fica no clique: voltar para onde estava
+                // (às vezes fora da tela) fazia a tela rolar até ele.
                 let caixa = (self.markdown && vezes == 1).then(|| ed.with_buffer(|b| caixa_da_linha(b.lines[c.line].text()))).flatten();
                 let caixa = caixa.filter(|&(k, _)| (k..=k + 3).contains(&c.index));
                 cx.states.get_mut::<Mouse>(n.key).caixa = caixa.is_some();
@@ -1544,7 +1611,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                         ed.delete_range(Cursor::new(c.line, k + 1), Cursor::new(c.line, k + 2));
                         ed.insert_at(Cursor::new(c.line, k + 1), if marcada { " " } else { "x" }, None);
                         ed.set_selection(Selection::None);
-                        ed.set_cursor(antes);
+                        ed.set_cursor(c);
                     });
                 }
                 i.digitando = None;
@@ -1613,6 +1680,36 @@ impl<M: Clone> TextEditor<'_, M> {
 
     fn tecla(&self, i: &mut Interno, key: &Key, text: Option<&str>, modifiers: crate::Modifiers, cx: &mut EventCx<M>) -> Captured {
         let (ctrl, shift) = (modifiers.control_key() || modifiers.super_key(), modifiers.shift_key());
+        // Na grade: Enter abre uma linha embaixo; Tab vai para a próxima célula (no fim, linha nova), Shift+Tab volta.
+        if let (true, false, Key::Named(tecla @ (NamedKey::Enter | NamedKey::Tab))) = (self.markdown, ctrl, key) {
+            let c = i.ed.as_ref().expect("montado").cursor();
+            if let Some(t) = i.grade.iter().find(|t| t.linhas.contains(&c.line) && c.line != t.linhas.start + 1) {
+                let (linhas, colunas) = (t.linhas.clone(), t.larguras.len());
+                if *tecla == NamedKey::Enter {
+                    if !shift {
+                        i.tabela_linha(linhas, colunas, c.line);
+                        return Captured::Yes;
+                    }
+                } else {
+                    let atual = t.celulas_da(c.line).iter().rposition(|k| k.inicio <= c.index).unwrap_or(0);
+                    // As células em ordem de leitura, sem o `|---|`.
+                    let todas: Vec<(usize, usize, usize)> = linhas.clone().filter(|&l| l != linhas.start + 1).flat_map(|l| t.celulas_da(l).iter().map(move |k| (l, k.mapa[0], k.mapa[k.mapa.len() - 1]))).collect();
+                    let aqui = todas.iter().position(|&(l, a, _)| l == c.line && t.celulas_da(l).get(atual).is_some_and(|k| k.mapa[0] == a));
+                    let alvo = aqui.and_then(|k| if shift { k.checked_sub(1) } else { Some(k + 1) }).and_then(|k| todas.get(k).copied());
+                    match alvo {
+                        Some((l, a, z)) => {
+                            let ed = i.ed.as_mut().expect("montado");
+                            ed.set_selection(Selection::Normal(Cursor::new(l, a)));
+                            ed.set_cursor(Cursor::new(l, z));
+                            i.digitando = None;
+                        }
+                        None if !shift => i.tabela_linha(linhas.clone(), colunas, linhas.end - 1),
+                        None => {}
+                    }
+                    return Captured::Yes;
+                }
+            }
+        }
         // ↑ e ↓ na grade: a mesma coluna da linha de cima ou de baixo, pulando o `|---|`.
         if let (true, false, Key::Named(seta @ (NamedKey::ArrowUp | NamedKey::ArrowDown))) = (self.markdown, ctrl, key) {
             if let Some(alvo) = self.na_coluna(i, *seta == NamedKey::ArrowDown, cx.renderer) {
@@ -1876,5 +1973,25 @@ mod testes {
         assert_eq!(c.0.borrow().desfazer.len(), DESFAZER_MAX);
         c.undo();
         assert_eq!(c.text().trim_end(), "x".repeat(599));
+    }
+
+    /// Linha e coluna novas: entram no texto da tabela, num passo só do desfazer, com o cursor no lugar novo.
+    #[test]
+    fn linha_e_coluna_novas_na_tabela() {
+        let mut fonts = FontSystem::new();
+        let c = Content::with_text("| A | B |\n|---|---|\n| 1 | 2 |\nfim");
+        let mut i = c.0.borrow_mut();
+        i.editor(&mut fonts, 15.0, 15.0 * 1.45, 1.0, Font::DEFAULT, true);
+        i.tabela_linha(0..3, 2, 0);
+        drop(i);
+        assert_eq!(c.text(), "| A | B |\n|---|---|\n|  |  |\n| 1 | 2 |\nfim", "do cabeçalho, a linha entra depois do |---|");
+        assert_eq!(c.cursor(), (3, 3));
+        c.insert("x");
+        assert_eq!(c.line(3).unwrap(), "| x |  |");
+        c.0.borrow_mut().tabela_coluna(0..4, 2);
+        assert_eq!(c.text(), "| A | B | Coluna 3 |\n|---|---|---|\n| x |  |  |\n| 1 | 2 |  |\nfim");
+        assert_eq!(c.selection().as_deref(), Some("Coluna 3"));
+        c.undo();
+        assert_eq!(c.text(), "| A | B |\n|---|---|\n| x |  |\n| 1 | 2 |\nfim", "a coluna sai num Ctrl+Z só");
     }
 }
