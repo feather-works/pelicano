@@ -802,6 +802,7 @@ impl<A: App> Runtime<A> {
         let theme = self.app.theme();
         let j = &mut self.janelas[i];
         let (id, size) = (j.id, Self::logical_size(&j.w));
+        self.renderer.janela_do_evento(size, j.w.scale_factor() as f32);
         let mut msgs = Vec::new();
         let mut cmds = Vec::new();
         let (redraw, pegou) = {

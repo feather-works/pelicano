@@ -540,6 +540,14 @@ impl Renderer {
         self.desloc = (0, 0);
     }
 
+    /// Antes de um evento: o tamanho e a escala da janela que o recebe. O renderizador é um
+    /// só para todas as janelas e, entre um quadro e outro, ficava com o tamanho de outra;
+    /// a lista que abre para baixo achava que abria para cima e perdia o clique no item.
+    pub(crate) fn janela_do_evento(&mut self, size: Size, scale: f32) {
+        self.scale = scale;
+        self.tela = (((size.width * scale).round() as u32).max(1), ((size.height * scale).round() as u32).max(1));
+    }
+
     /// Tamanho lógico da janela inteira (mesmo durante um quadro parcial).
     pub fn window_size(&self) -> Size {
         Size::new(self.tela.0 as f32 / self.scale, self.tela.1 as f32 / self.scale)
