@@ -29,6 +29,11 @@ struct Interno {
     cercas: Option<(u64, usize, bool)>,
     /// As tabelas do último desenho, onde o clique e as setas acham a célula.
     grade: Vec<Tabela>,
+    /// Os botões "Copiar" das caixas de código do último desenho: (botão, primeira linha à vista
+    /// da caixa, se ela é a cerca que abre).
+    copiar: Vec<(Rect, usize, bool)>,
+    /// A caixa (pela primeira linha à vista) copiada há pouco: o botão diz "Copiado".
+    copiado: Option<(usize, std::time::Instant)>,
     #[cfg(feature = "highlighter")]
     realce: crate::highlight::Realce,
 }
@@ -47,7 +52,7 @@ impl Content {
     }
 
     pub fn with_text(texto: &str) -> Self {
-        Content(RefCell::new(Interno { ed: None, inicial: texto.to_owned(), linha_inicial: None, versao: 0, desfazer: Vec::new(), refazer: Vec::new(), digitando: None, config: None, cercas: None, grade: Vec::new(), #[cfg(feature = "highlighter")] realce: Default::default() }))
+        Content(RefCell::new(Interno { ed: None, inicial: texto.to_owned(), linha_inicial: None, versao: 0, desfazer: Vec::new(), refazer: Vec::new(), digitando: None, config: None, cercas: None, grade: Vec::new(), copiar: Vec::new(), copiado: None, #[cfg(feature = "highlighter")] realce: Default::default() }))
     }
 
     /// O texto inteiro, com as quebras de linha que o arquivo tinha.
@@ -99,6 +104,30 @@ impl Content {
             ed.delete_selection();
             ed.insert_string(texto, None);
         });
+    }
+
+    /// Troca o texto inteiro, num passo do desfazer (formatar um JSON, por exemplo). O cursor vai ao começo.
+    pub fn set_text(&self, texto: &str) {
+        let mut i = self.0.borrow_mut();
+        if i.ed.is_none() {
+            i.inicial = texto.to_owned();
+            i.versao += 1;
+            return;
+        }
+        i.editar(false, |ed| {
+            // Juntar tudo numa linha deixa nela a quebra da primeira: ela recebe antes a da última,
+            // senão sobra um "\n" no fim (e o desfazer devolve outro).
+            let fim = ed.with_buffer_mut(|b| {
+                let q = b.lines.last().map(|l| l.ending()).unwrap_or_default();
+                b.lines[0].set_ending(q);
+                Cursor::new(b.lines.len() - 1, b.lines.last().map_or(0, |l| l.text().len()))
+            });
+            ed.delete_range(Cursor::new(0, 0), fim);
+            ed.insert_at(Cursor::new(0, 0), texto, None);
+            ed.set_selection(Selection::None);
+            ed.set_cursor(Cursor::new(0, 0));
+        });
+        i.digitando = None;
     }
 
     /// Muda a cada edição (não com cursor ou rolagem).
@@ -462,6 +491,56 @@ impl Interno {
         self.digitando = None;
     }
 
+    /// O cursor não fica na cerca que fecha um bloco ``` (ela não aparece): vindo de cima vai à
+    /// linha de baixo (criada, se o bloco é o fim do texto: senão não há como escrever depois
+    /// dele); vindo de baixo, ao fim da de cima.
+    fn sair_da_cerca(&mut self, de: usize) {
+        let Some(ed) = self.ed.as_mut() else { return };
+        let c = ed.cursor();
+        let (fecha, ultima, tam, tam_acima) = ed.with_buffer(|b| {
+            (cerca_que_fecha(b, c.line), c.line + 1 == b.lines.len(), b.lines[c.line].text().len(), c.line.checked_sub(1).map_or(0, |k| b.lines[k].text().len()))
+        });
+        if !fecha {
+            return;
+        }
+        if de >= c.line {
+            ed.set_cursor(Cursor::new(c.line - 1, tam_acima));
+        } else if !ultima {
+            ed.set_cursor(Cursor::new(c.line + 1, 0));
+        } else {
+            self.editar(false, |ed| {
+                ed.set_selection(Selection::None);
+                ed.insert_at(Cursor::new(c.line, tam), "\n", None);
+                ed.set_cursor(Cursor::new(c.line + 1, 0));
+            });
+        }
+    }
+
+    /// Backspace no começo da linha depois da cerca que fecha (ou Delete no fim da de antes dela)
+    /// juntaria o texto com a cerca escondida e desfaria o bloco: o Backspace só passa por cima
+    /// dela e o Delete não faz nada. Linha vazia junta normal (some sem estragar o bloco).
+    fn barrar_na_cerca(&mut self, para_tras: bool) -> bool {
+        let Some(ed) = self.ed.as_mut() else { return false };
+        if ed.selection() != Selection::None {
+            return false;
+        }
+        let c = ed.cursor();
+        let alvo = ed.with_buffer(|b| {
+            let tam = |j: usize| b.lines[j].text().len();
+            if tam(c.line) == 0 {
+                None
+            } else if para_tras {
+                (c.index == 0 && c.line > 0 && cerca_que_fecha(b, c.line - 1)).then(|| Cursor::new(c.line - 2, tam(c.line - 2)))
+            } else {
+                (c.index == tam(c.line) && cerca_que_fecha(b, c.line + 1)).then_some(c)
+            }
+        });
+        let Some(alvo) = alvo else { return false };
+        ed.set_cursor(alvo);
+        self.digitando = None;
+        true
+    }
+
     fn editar(&mut self, digitacao: bool, f: impl FnOnce(&mut Editor<'static>)) {
         let Some(ed) = self.ed.as_mut() else { return };
         ed.start_change();
@@ -711,6 +790,46 @@ fn cor_ct(c: Color) -> cosmic_text::Color {
     cosmic_text::Color::rgba((c.r * 255.0) as u8, (c.g * 255.0) as u8, (c.b * 255.0) as u8, (c.a * 255.0) as u8)
 }
 
+/// O cosmic-text só segura a rolagem no fim a partir da segunda linha: com o texto todo
+/// cabendo (ou quase), a roda descia a primeira linha para fora. Aqui o fim para no pé da área.
+fn travar_no_fim(b: &mut Buffer, fonts: &mut FontSystem) {
+    b.shape_until_scroll(fonts, false);
+    let mut sc = b.scroll();
+    if sc.line != 0 || sc.vertical <= 0.0 {
+        return;
+    }
+    let (alto, lh) = (b.size().1.unwrap_or(f32::INFINITY), b.metrics().line_height);
+    let mut total = 0.0;
+    for k in 0..b.lines.len() {
+        if total >= sc.vertical + alto {
+            return;
+        }
+        total += b.line_layout(fonts, k).map_or(lh, |l| l.iter().map(|x| x.line_height_opt.unwrap_or(lh)).sum());
+    }
+    let maximo = (total - alto).max(0.0);
+    if sc.vertical > maximo {
+        sc.vertical = maximo;
+        b.set_scroll(sc);
+    }
+}
+
+/// Se a linha `j` é a cerca que fecha um bloco ``` (a que não aparece).
+fn cerca_que_fecha(b: &Buffer, j: usize) -> bool {
+    let cerca = |j: usize| b.lines.get(j).is_some_and(|l| l.text().trim_start().starts_with("```"));
+    cerca(j) && (0..j).filter(|&k| cerca(k)).count() % 2 == 1
+}
+
+/// O texto de dentro do bloco ``` que tem a linha `k` (a cerca que abre, se `abre`), sem as cercas.
+fn bloco_de_codigo<'t>(linha: impl Fn(usize) -> Option<&'t str>, k: usize, abre: bool) -> String {
+    let cerca = |j: usize| linha(j).is_some_and(|l| l.trim_start().starts_with("```"));
+    let inicio = if abre { k + 1 } else { (0..k).rev().find(|&j| cerca(j)).map_or(0, |j| j + 1) };
+    let mut fim = inicio;
+    while linha(fim).is_some() && !cerca(fim) {
+        fim += 1;
+    }
+    (inicio..fim).filter_map(&linha).collect::<Vec<_>>().join("\n")
+}
+
 /// Os estilos de uma linha de Markdown. `em_codigo` atravessa as linhas (blocos ```).
 fn markdown(texto: &str, base: Attrs<'static>, m: Metrics, t: &Tons, em_codigo: &mut bool, esconder: bool) -> AttrsList {
     let mut l = AttrsList::new(base);
@@ -722,7 +841,12 @@ fn markdown(texto: &str, base: Attrs<'static>, m: Metrics, t: &Tons, em_codigo: 
     let mono = base.family(Family::Monospace);
     if resto.starts_with("```") {
         *em_codigo = !*em_codigo;
-        l.add_span(0..n, mono.color(t.sinal));
+        // As crases somem como os outros sinais; o nome da linguagem fica, apagado.
+        let crases = recuo + resto.bytes().take_while(|&b| b == b'`').count();
+        l.add_span(0..crases, sumir(mono));
+        if crases < n {
+            l.add_span(crases..n, mono.color(t.sinal));
+        }
         return l;
     }
     if *em_codigo {
@@ -908,6 +1032,7 @@ pub struct TextEditor<'a, M> {
     stripes: Option<Color>,
     warnings: Vec<Warning>,
     on_link: Option<Box<dyn Fn(String) -> M + 'a>>,
+    colors: Option<Box<dyn Fn(&str) -> Vec<(std::ops::Range<usize>, Color)> + 'a>>,
     #[cfg(feature = "highlighter")]
     highlight: Option<(&'a str, crate::Highlight)>,
 }
@@ -924,7 +1049,7 @@ pub struct Warning {
 /// Editor de várias linhas sobre um [`Content`]. Edita o conteúdo direto e avisa com
 /// `on_change` (para o app marcar "não salvo").
 pub fn text_editor<'a, M>(content: &'a Content) -> TextEditor<'a, M> {
-    TextEditor { content, size: 15.0, font: Font::DEFAULT, wrap: true, line_numbers: false, padding: Padding::from(12.0), on_change: None, style: None, autofocus: None, invisibles: false, markdown: false, line_height: None, placeholder: "", id: None, on_key: None, idle_focus: true, current_line: None, stripes: None, warnings: Vec::new(), on_link: None, #[cfg(feature = "highlighter")] highlight: None }
+    TextEditor { content, size: 15.0, font: Font::DEFAULT, wrap: true, line_numbers: false, padding: Padding::from(12.0), on_change: None, style: None, autofocus: None, invisibles: false, markdown: false, line_height: None, placeholder: "", id: None, on_key: None, idle_focus: true, current_line: None, stripes: None, warnings: Vec::new(), on_link: None, colors: None, #[cfg(feature = "highlighter")] highlight: None }
 }
 
 impl<'a, M> TextEditor<'a, M> {
@@ -1006,6 +1131,12 @@ impl<'a, M> TextEditor<'a, M> {
     /// mouse em cima. Trecho fora do texto é ignorado.
     pub fn warnings(mut self, w: Vec<Warning>) -> Self {
         self.warnings = w;
+        self
+    }
+    /// Cores feitas pelo app, linha a linha: `f(linha)` devolve os trechos (bytes) e a cor de cada
+    /// um. Leve, sem gramáticas; serve para formatos simples (JSON, INI, log). Ignorado com Markdown.
+    pub fn colors(mut self, f: impl Fn(&str) -> Vec<(std::ops::Range<usize>, Color)> + 'a) -> Self {
+        self.colors = Some(Box::new(f));
         self
     }
     /// Com [`markdown`](Self::markdown): Ctrl+clique num `[texto](endereço)` manda o endereço (o
@@ -1139,6 +1270,8 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         }
         let fonts = cx.renderer.fonts();
         let vazio = ed.with_buffer(|b| b.lines.len() == 1 && b.lines[0].text().is_empty());
+        // As linhas de blocos ``` à vista (com as cercas): ganham a caixa de código no desenho.
+        let mut codigo: Vec<(usize, bool)> = Vec::new();
         ed.with_buffer_mut(|b| {
             b.set_size(fonts, Some(area.width * s), Some(area.height * s));
             // Só as linhas à vista (e algumas a mais) ganham estilo; as outras quando aparecerem.
@@ -1177,8 +1310,29 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                     // Na grade o texto some (o cursor ainda passa por ele) e o `|---|` vira um fio.
                     Some(t) if n == t.linhas.start + 1 => AttrsList::new(invisivel(base).metrics(Metrics::new(0.01, s))),
                     Some(_) => AttrsList::new(invisivel(base)),
-                    None if self.markdown => markdown(linha.text(), base, metricas, &tons, &mut em_codigo, true),
-                    None => AttrsList::new(base),
+                    None if self.markdown => {
+                        let antes = em_codigo;
+                        let a = markdown(linha.text(), base, metricas, &tons, &mut em_codigo, true);
+                        if antes || em_codigo {
+                            codigo.push((n, !antes));
+                        }
+                        // A cerca que fecha some de vez (como o `|---|`): o cursor não para nela.
+                        if antes && !em_codigo {
+                            AttrsList::new(invisivel(base).metrics(Metrics::new(0.01, s)))
+                        } else {
+                            a
+                        }
+                    }
+                    None => {
+                        let mut a = AttrsList::new(base);
+                        if let Some(f) = &self.colors {
+                            let n = linha.text().len();
+                            for (trecho, c) in f(linha.text()).into_iter().filter(|(t, _)| t.start < t.end && t.end <= n) {
+                                a.add_span(trecho, base.color(cor_ct(c)));
+                            }
+                        }
+                        a
+                    }
                 };
                 linha.set_attrs_list(estilos);
             }
@@ -1248,8 +1402,8 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                         }
                     }
                 }
-                // Na grade não há espaço nem fim de linha à vista para marcar.
-                if self.invisibles && na_grade.is_none() {
+                // Na grade e na linha que sumiu (a cerca que fecha) não há o que marcar.
+                if self.invisibles && na_grade.is_none() && run.line_height >= 2.0 * s {
                     if fim.is_some_and(|(l, ..)| l != run.line_i) {
                         marcar_fim(fim, &mut marcas);
                     }
@@ -1280,7 +1434,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                 }
                 faixas.push((run.line_i, y, run.line_height / s));
                 // O `|---|` da grade é um fio: o número dele cairia em cima do da linha seguinte.
-                let fio = na_grade.is_some_and(|ti| run.line_i == tabelas[ti].linhas.start + 1);
+                let fio = na_grade.is_some_and(|ti| run.line_i == tabelas[ti].linhas.start + 1) || run.line_height < 2.0 * s;
                 if run.line_i != anterior && !fio {
                     numeros.push((run.line_i + 1, y));
                     anterior = run.line_i;
@@ -1319,12 +1473,31 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         let mut chave = std::collections::hash_map::DefaultHasher::new();
         (versao, rolagem.line, rolagem.vertical.to_bits(), rolagem.horizontal.to_bits(), (area.width * s) as u32, (self.size * s * 64.0) as u32, self.wrap, self.invisibles, self.markdown).hash(&mut chave);
         self.warnings.hash(&mut chave);
+        self.colors.is_some().hash(&mut chave);
         for t in &tabelas {
             t.linhas.hash(&mut chave);
         }
         #[cfg(feature = "highlighter")]
         self.highlight.hash(&mut chave);
 
+        // A caixa de código: as linhas seguidas de um bloco ``` viram um retângulo só.
+        // (caixa, primeira linha à vista, se ela abre o bloco)
+        let mut caixas_codigo: Vec<(Rect, usize, bool)> = Vec::new();
+        for &(linha, y, h) in &faixas {
+            let Some(&(_, abre)) = codigo.iter().find(|c| c.0 == linha) else { continue };
+            match caixas_codigo.last_mut() {
+                // Uma cerca que abre começa outra caixa, mesmo colada na anterior.
+                Some((r, primeira, _)) if (r.y + r.height - y).abs() < 0.5 && !(abre && linha != *primeira) => r.height = y + h - r.y,
+                _ => caixas_codigo.push((Rect { x: area.x - 6.0, y, width: area.width + 6.0, height: h }, linha, abre)),
+            }
+        }
+        // Fora do recorte do texto (a caixa passa um pouco à esquerda dele), cortada só em cima e embaixo.
+        for (r, _, _) in &caixas_codigo {
+            let (topo, fundo) = (r.y.max(area.y), (r.y + r.height).min(area.y + area.height));
+            if fundo > topo {
+                cx.renderer.fill_quad(Rect { y: topo, height: fundo - topo, ..*r }, Some(&cx.theme.muted.alpha(0.10).into()), Border::rounded(6.0).color(cx.theme.muted.alpha(0.18), 1.0), None);
+            }
+        }
         cx.renderer.push_clip(area, [0.0; 4]);
         for &(linha, y, h) in &faixas {
             let tom = if focado && linha == linha_cursor { self.current_line } else { self.stripes.filter(|_| linha % 2 == 1) };
@@ -1440,6 +1613,26 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         if let Some(p) = caret {
             cx.renderer.fill_quad(Rect { x: p.x, y: p.y, width: 1.5, height: altura_linha }, Some(&cor.into()), Border::default(), None);
         }
+        // O "Copiar" no canto de cima de cada caixa de código (no topo à vista, se ela começa acima).
+        let mut copiar = Vec::new();
+        let tam = (self.size * 0.75).max(10.0);
+        for &(r, primeira, abre) in &caixas_codigo {
+            let rotulo = if i.copiado.is_some_and(|(k, t)| k == primeira && t.elapsed().as_millis() < 1500) { "Copiado" } else { "Copiar" };
+            let m = cx.renderer.measure(rotulo, tam, Font::DEFAULT, None);
+            let (w, h) = (m.width + 14.0, m.height + 6.0);
+            let topo = r.y.max(area.y) + 4.0;
+            if (r.y + r.height).min(area.y + area.height) - topo < h + 2.0 {
+                continue;
+            }
+            let b = Rect { x: r.x + r.width - w - 6.0, y: topo, width: w, height: h };
+            let sobre = cx.hovered(&b);
+            cx.renderer.fill_quad(b, Some(&cx.theme.surface.alpha(if sobre { 1.0 } else { 0.85 }).into()), Border::rounded(5.0).color(cx.theme.muted.alpha(0.3), 1.0), None);
+            cx.renderer.draw_text(rotulo, tam, Font::DEFAULT, if sobre { cx.theme.text } else { cx.theme.muted }, Point::new(b.x + 7.0, b.y + 3.0), None);
+            if sobre {
+                cx.cursor_icon = CursorIcon::Pointer;
+            }
+            copiar.push((b, primeira, abre));
+        }
         cx.renderer.pop_clip();
         // A dica do trecho sob o mouse, por cima de tudo (como a do `tooltip`).
         let p = cx.transition(n.key, if dica.is_some() { 1.0f32 } else { 0.0 }, if dica.is_some() { crate::Transition::new(120).delay(250) } else { crate::Transition::new(90) });
@@ -1460,6 +1653,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         }
         i.cercas = cercas;
         i.grade = tabelas;
+        i.copiar = copiar;
         #[cfg(feature = "highlighter")]
         {
             i.realce = realce;
@@ -1529,7 +1723,18 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         let mais = matches!(ev, Event::MousePressed(MouseButton::Left)).then(|| cx.cursor).flatten().and_then(|p| {
             i.grade.iter().find_map(|t| t.mais.iter().position(|r| r.is_some_and(|r| r.contains(p))).map(|k| (k, t.linhas.clone(), t.larguras.len())))
         });
+        // Clique no "Copiar" de uma caixa de código: o que está entre as cercas.
+        let copiar = matches!(ev, Event::MousePressed(MouseButton::Left)).then(|| cx.cursor).flatten().and_then(|p| i.copiar.iter().find(|c| c.0.contains(p)).map(|&(_, k, abre)| (k, abre)));
+        let linha_antes = i.ed.as_ref().expect("montado acima").cursor().line;
         let resultado = match ev {
+            Event::MousePressed(MouseButton::Left) if self.markdown && copiar.is_some() => {
+                let (k, abre) = copiar.expect("conferido");
+                let texto = i.ed.as_ref().expect("montado acima").with_buffer(|b| bloco_de_codigo(|j| b.lines.get(j).map(|l| l.text()), k, abre));
+                cx.clipboard.write(texto);
+                i.copiado = Some((k, std::time::Instant::now()));
+                cx.redraw = true;
+                Captured::Yes
+            }
             Event::MousePressed(MouseButton::Left) if self.markdown && mais.is_some() => {
                 let (k, linhas, colunas) = mais.expect("conferido");
                 cx.states.focus = Some(n.key);
@@ -1638,11 +1843,13 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                 Captured::Yes
             }
             Event::Wheel { dy, modifiers, .. } if dentro && !modifiers.control_key() => {
+                let fonts = cx.renderer.fonts();
                 let ed = i.ed.as_mut().expect("montado acima");
                 ed.with_buffer_mut(|b| {
                     let mut sc = b.scroll();
                     sc.vertical -= dy * s;
                     b.set_scroll(sc);
+                    travar_no_fim(b, fonts);
                 });
                 Captured::Yes
             }
@@ -1651,6 +1858,9 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
             _ => Captured::No,
         };
         if resultado == Captured::Yes {
+            if self.markdown {
+                i.sair_da_cerca(linha_antes);
+            }
             cx.redraw = true;
             if i.versao != antes {
                 if let Some(m) = &self.on_change {
@@ -1753,6 +1963,7 @@ impl<M: Clone> TextEditor<'_, M> {
             Key::Named(NamedKey::End) => movimento(if ctrl { Motion::BufferEnd } else { Motion::End }, i, fonts),
             Key::Named(NamedKey::PageUp) => movimento(Motion::PageUp, i, fonts),
             Key::Named(NamedKey::PageDown) => movimento(Motion::PageDown, i, fonts),
+            Key::Named(tecla @ (NamedKey::Backspace | NamedKey::Delete)) if self.markdown && i.barrar_na_cerca(*tecla == NamedKey::Backspace) => {}
             Key::Named(NamedKey::Backspace) => acao(Action::Backspace, false, i, fonts),
             Key::Named(NamedKey::Delete) => acao(Action::Delete, false, i, fonts),
             Key::Named(NamedKey::Enter) => acao(Action::Enter, false, i, fonts),
@@ -1973,6 +2184,109 @@ mod testes {
         assert_eq!(c.0.borrow().desfazer.len(), DESFAZER_MAX);
         c.undo();
         assert_eq!(c.text().trim_end(), "x".repeat(599));
+    }
+
+    #[test]
+    fn poucas_linhas_nao_rolam() {
+        let mut fonts = FontSystem::new();
+        let mut b = Buffer::new(&mut fonts, Metrics::new(15.0, 20.0));
+        b.set_size(&mut fonts, Some(300.0), Some(200.0));
+        let rolar = |b: &mut Buffer, fonts: &mut FontSystem, dy: f32| {
+            let mut sc = b.scroll();
+            sc.vertical += dy;
+            b.set_scroll(sc);
+            travar_no_fim(b, fonts);
+            b.scroll()
+        };
+        // 3 linhas numa área de 10: não sai do lugar.
+        b.set_text(&mut fonts, "a\nb\nc", Attrs::new(), Shaping::Advanced);
+        assert_eq!((rolar(&mut b, &mut fonts, 15.0).line, b.scroll().vertical), (0, 0.0));
+        // 12 linhas: desce só até a última encostar no pé (2 linhas = 40 px), e não passa.
+        b.set_text(&mut fonts, &("x\n".repeat(11) + "x"), Attrs::new(), Shaping::Advanced);
+        let sc = rolar(&mut b, &mut fonts, 500.0);
+        assert_eq!(sc.line as f32 * 20.0 + sc.vertical, 40.0);
+    }
+
+    #[test]
+    fn cursor_nao_para_na_cerca_que_fecha() {
+        let mut fonts = FontSystem::new();
+        let c = Content::with_text("```text\na\n```\nfim");
+        let mut i = c.0.borrow_mut();
+        i.editor(&mut fonts, 15.0, 15.0 * 1.45, 1.0, Font::DEFAULT, true);
+        let ir = |i: &mut Interno, de: usize| {
+            i.ed.as_mut().unwrap().set_cursor(Cursor::new(2, 1));
+            i.sair_da_cerca(de);
+            i.ed.as_ref().unwrap().cursor()
+        };
+        // Descendo vai para a linha de baixo; subindo, para o fim da de cima.
+        assert_eq!((ir(&mut i, 1).line, ir(&mut i, 3)), (3, Cursor::new(1, 1)));
+        // Bloco no fim do texto: descer cria a linha de depois (e o Ctrl+Z tira).
+        drop(i);
+        let c = Content::with_text("```\na\n```");
+        let mut i = c.0.borrow_mut();
+        i.editor(&mut fonts, 15.0, 15.0 * 1.45, 1.0, Font::DEFAULT, true);
+        assert_eq!(ir(&mut i, 1), Cursor::new(3, 0));
+        drop(i);
+        assert_eq!(c.text(), "```\na\n```\n");
+        c.undo();
+        assert_eq!(c.text(), "```\na\n```");
+        let mut i = c.0.borrow_mut();
+        // A cerca que abre não é pulada.
+        i.ed.as_mut().unwrap().set_cursor(Cursor::new(0, 2));
+        i.sair_da_cerca(1);
+        assert_eq!(i.ed.as_ref().unwrap().cursor(), Cursor::new(0, 2));
+    }
+
+    #[test]
+    fn backspace_e_delete_nao_juntam_com_a_cerca() {
+        let mut fonts = FontSystem::new();
+        let c = Content::with_text("```\na\n```\nfim");
+        let mut i = c.0.borrow_mut();
+        i.editor(&mut fonts, 15.0, 15.0 * 1.45, 1.0, Font::DEFAULT, true);
+        let em = |i: &mut Interno, l: usize, k: usize, para_tras: bool| {
+            i.ed.as_mut().unwrap().set_cursor(Cursor::new(l, k));
+            (i.barrar_na_cerca(para_tras), i.ed.as_ref().unwrap().cursor())
+        };
+        // Backspace no começo de "fim": vai ao fim do "a", sem apagar.
+        assert_eq!(em(&mut i, 3, 0, true), (true, Cursor::new(1, 1)));
+        // Delete no fim do "a": fica.
+        assert_eq!(em(&mut i, 1, 1, false), (true, Cursor::new(1, 1)));
+        // Longe da cerca (ou na que abre, que aparece): o normal.
+        assert!(!em(&mut i, 1, 0, true).0 && !em(&mut i, 3, 3, false).0);
+        // Linha vazia dentro do bloco: o Delete a tira, normal.
+        drop(i);
+        let c = Content::with_text("```\n\n```\nfim");
+        let mut i = c.0.borrow_mut();
+        i.editor(&mut fonts, 15.0, 15.0 * 1.45, 1.0, Font::DEFAULT, true);
+        assert!(!em(&mut i, 1, 0, false).0);
+    }
+
+    #[test]
+    fn copia_o_bloco_de_codigo() {
+        let t = ["antes", "```text", "a -> b", "  |-> c", "```", "depois"];
+        let linha = |j: usize| t.get(j).copied();
+        // Pela cerca que abre, ou rolado com a caixa começando no meio ou só com a cerca do fim à vista.
+        for (k, abre) in [(1, true), (3, false), (4, false)] {
+            assert_eq!(bloco_de_codigo(linha, k, abre), "a -> b\n  |-> c");
+        }
+        // Bloco sem fechar: vai até o fim.
+        assert_eq!(bloco_de_codigo(|j| ["```", "x"].get(j).copied(), 0, true), "x");
+    }
+
+    #[test]
+    fn trocar_tudo_num_passo() {
+        let mut fonts = FontSystem::new();
+        let c = Content::with_text("{\"a\": 1}\nresto");
+        c.0.borrow_mut().editor(&mut fonts, 15.0, 15.0 * 1.45, 1.0, Font::DEFAULT, true);
+        c.set_text("{\n  \"a\": 1\n}\n");
+        assert_eq!((c.text().as_str(), c.cursor()), ("{\n  \"a\": 1\n}\n", (1, 1)));
+        c.undo();
+        assert_eq!(c.text(), "{\"a\": 1}\nresto");
+        c.redo();
+        c.set_text("[1]");
+        assert_eq!(c.text(), "[1]");
+        c.undo();
+        assert_eq!(c.text(), "{\n  \"a\": 1\n}\n");
     }
 
     /// Linha e coluna novas: entram no texto da tabela, num passo só do desfazer, com o cursor no lugar novo.
