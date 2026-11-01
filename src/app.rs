@@ -1545,7 +1545,10 @@ impl Gpu {
         // Vulkan/DX12/Metal primeiro: só sondar o OpenGL já carrega o driver dele (no Mesa, ~15 MB a
         // mais) sem nunca usá-lo. O OpenGL fica para a placa que não tem os outros.
         let mut achado = None;
-        for backends in [wgpu::Backends::PRIMARY, wgpu::Backends::GL] {
+        // No Windows o OpenGL fica de fora: na Intel HD 2500 (Windows 10, sem DX12) ele desenhava a
+        // imagem deslocada da janela (feathersheet#135). Sem DX12/Vulkan, a janela mostra pela CPU.
+        let reserva = if cfg!(windows) { wgpu::Backends::empty() } else { wgpu::Backends::GL };
+        for backends in [wgpu::Backends::PRIMARY, reserva].into_iter().filter(|b| !b.is_empty()) {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..Default::default() });
             let Ok(surface) = instance.create_surface(w.clone()) else { continue };
             // A placa que liga a tela (a integrada, no notebook de duas): a dedicada desenhava e copiava
