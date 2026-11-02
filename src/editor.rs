@@ -3,7 +3,7 @@
 //! localizar/substituir e números de linha.
 use crate::widget::{CursorIcon, DrawCx, EventCx, Node, Style, Widget};
 use crate::{Border, Captured, Color, Event, Font, Key, LayoutCx, Length, Limits, MouseButton, NamedKey, Padding, Point, Rect, Renderer, Size, Status, Theme};
-use cosmic_text::{Action, Attrs, AttrsList, Buffer, Change, Cursor, Edit, Editor, Family, FontSystem, Metrics, Motion, Selection, Shaping, Style as Estilo, Weight, Wrap};
+use cosmic_text::{Action, Attrs, AttrsList, Buffer, BufferLine, Change, ChangeItem, Cursor, Edit, Editor, Family, FontSystem, Metrics, Motion, Selection, Shaping, Style as Estilo, Weight, Wrap};
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 
@@ -100,10 +100,7 @@ impl Content {
             i.versao += 1;
             return;
         }
-        i.editar(false, |ed| {
-            ed.delete_selection();
-            ed.insert_string(texto, None);
-        });
+        i.editar_com(false, |ed, feito| escrever(ed, feito, texto));
     }
 
     /// Troca o texto inteiro, num passo do desfazer (formatar um JSON, por exemplo). O cursor vai ao começo.
@@ -114,7 +111,7 @@ impl Content {
             i.versao += 1;
             return;
         }
-        i.editar(false, |ed| {
+        i.editar_com(false, |ed, feito| {
             // Juntar tudo numa linha deixa nela a quebra da primeira: ela recebe antes a da última,
             // senão sobra um "\n" no fim (e o desfazer devolve outro).
             let fim = ed.with_buffer_mut(|b| {
@@ -122,8 +119,10 @@ impl Content {
                 b.lines[0].set_ending(q);
                 Cursor::new(b.lines.len() - 1, b.lines.last().map_or(0, |l| l.text().len()))
             });
-            ed.delete_range(Cursor::new(0, 0), fim);
-            ed.insert_at(Cursor::new(0, 0), texto, None);
+            let tirado = apagar(ed, Cursor::new(0, 0), fim);
+            guardar(ed, feito, tirado);
+            let posto = inserir(ed, Cursor::new(0, 0), texto);
+            guardar(ed, feito, posto);
             ed.set_selection(Selection::None);
             ed.set_cursor(Cursor::new(0, 0));
         });
@@ -542,10 +541,21 @@ impl Interno {
     }
 
     fn editar(&mut self, digitacao: bool, f: impl FnOnce(&mut Editor<'static>)) {
+        self.editar_com(digitacao, |ed, _| f(ed));
+    }
+
+    /// O `editar` para quem também usa o [`inserir`] e o [`apagar`]: os itens deles entram no
+    /// desfazer pelo [`guardar`], na ordem em que aconteceram.
+    fn editar_com(&mut self, digitacao: bool, f: impl FnOnce(&mut Editor<'static>, &mut Vec<ChangeItem>)) {
         let Some(ed) = self.ed.as_mut() else { return };
         ed.start_change();
-        f(ed);
-        let Some(mudou) = ed.finish_change().filter(|c| !c.items.is_empty()) else { return };
+        let mut feito = Vec::new();
+        f(ed, &mut feito);
+        feito.extend(ed.finish_change().map(|c| c.items).unwrap_or_default());
+        if feito.is_empty() {
+            return;
+        }
+        let mudou = Change { items: feito };
         let agora = std::time::Instant::now();
         let junta = digitacao && self.digitando.is_some_and(|t| agora.duration_since(t).as_millis() < 1500);
         match self.desfazer.last_mut() {
@@ -568,8 +578,17 @@ impl Interno {
         c.reverse();
         let antes = ed.cursor();
         ed.set_selection(Selection::None);
-        ed.apply_change(&c);
-        // O apply_change move o cursor sem avisar a rolagem; ida e volta faz ela seguir.
+        // O `apply_change` do cosmic-text, com o `inserir` rápido.
+        for item in &c.items {
+            if item.insert {
+                let fim = inserir(ed, item.start, &item.text).end;
+                ed.set_cursor(fim);
+            } else {
+                apagar(ed, item.start, item.end);
+                ed.set_cursor(item.start);
+            }
+        }
+        // O cursor mudou sem avisar a rolagem; ida e volta faz ela seguir.
         let depois = ed.cursor();
         ed.set_cursor(antes);
         ed.set_cursor(depois);
@@ -577,6 +596,75 @@ impl Interno {
         self.digitando = None;
         self.versao += 1;
     }
+}
+
+/// O `insert_string` do cosmic-text (no lugar da seleção, cursor no fim) com o [`inserir`] rápido.
+fn escrever(ed: &mut Editor<'static>, feito: &mut Vec<ChangeItem>, texto: &str) {
+    apagar_selecao(ed, feito);
+    let item = inserir(ed, ed.cursor(), texto);
+    ed.set_cursor(item.end);
+    guardar(ed, feito, item);
+}
+
+/// Põe no desfazer um item feito por fora do cosmic-text, depois dos que ele já guardou neste passo
+/// (a ordem conta: o desfazer volta de trás para a frente).
+fn guardar(ed: &mut Editor<'static>, feito: &mut Vec<ChangeItem>, item: ChangeItem) {
+    feito.extend(ed.finish_change().map(|c| c.items).unwrap_or_default());
+    ed.start_change();
+    feito.push(item);
+}
+
+/// O `delete_selection` do cosmic-text com o [`apagar`] rápido. `false` se não havia seleção.
+fn apagar_selecao(ed: &mut Editor<'static>, feito: &mut Vec<ChangeItem>) -> bool {
+    let Some((a, z)) = ed.selection_bounds() else { return false };
+    ed.set_selection(Selection::None);
+    let item = apagar(ed, a, z);
+    ed.set_cursor(a);
+    guardar(ed, feito, item);
+    true
+}
+
+/// O `delete_range` do cosmic-text 0.12 com as linhas saindo de uma vez (`drain`): o dele tira
+/// uma por uma e monta o texto tirado inserindo no começo; apagar 100 mil linhas levava 1,7 s.
+fn apagar(ed: &mut Editor<'static>, a: Cursor, z: Cursor) -> ChangeItem {
+    let texto = ed.with_buffer_mut(|b| {
+        let depois = b.lines[z.line].split_off(z.index);
+        let fora: Vec<BufferLine> = b.lines.drain(a.line + 1..=z.line.max(a.line)).collect();
+        let primeira = b.lines[a.line].split_off(a.index);
+        b.lines[a.line].append(depois);
+        std::iter::once(primeira.text()).chain(fora.iter().map(|l| l.text())).collect::<Vec<_>>().join("\n")
+    });
+    ChangeItem { start: a, end: z, text: texto, insert: false }
+}
+
+/// O `insert_at` do cosmic-text 0.12, mas com as linhas novas entrando de uma vez (`splice`): o
+/// dele põe cada uma na mesma posição do `Vec`, empurrando as que já pôs, e colar 100 mil linhas
+/// levava 44 s. Mesmo texto, mesmas quebras e o mesmo item para o desfazer.
+fn inserir(ed: &mut Editor<'static>, em: Cursor, texto: &str) -> ChangeItem {
+    let fim = ed.with_buffer_mut(|b| {
+        while em.line >= b.lines.len() {
+            let (quebra, attrs) = b.lines.last().map_or((Default::default(), Attrs::new()), |l| (l.ending(), l.attrs_list().defaults()));
+            b.lines.push(BufferLine::new(String::new(), quebra, AttrsList::new(attrs), Shaping::Advanced));
+        }
+        if texto.is_empty() {
+            return em;
+        }
+        let linha = &mut b.lines[em.line];
+        let quebra = linha.ending();
+        let depois = linha.split_off(em.index);
+        let tam_depois = depois.text().len();
+        let attrs = AttrsList::new(linha.attrs_list().get_span(em.index.saturating_sub(1)));
+        let nova = |t: &str| BufferLine::new(t.strip_suffix(char::is_control).unwrap_or(t), quebra, attrs.clone(), Shaping::Advanced);
+        // Terminado em "\n": a última linha nova é vazia.
+        let mut partes = texto.split_inclusive('\n').chain(std::iter::once("").filter(|_| texto.ends_with('\n')));
+        linha.append(nova(partes.next().unwrap_or_default()));
+        let mut novas: Vec<BufferLine> = partes.map(nova).collect();
+        novas.last_mut().unwrap_or(linha).append(depois);
+        let n = novas.len();
+        b.lines.splice(em.line + 1..em.line + 1, novas);
+        Cursor::new(em.line + n, b.lines[em.line + n].text().len() - tam_depois)
+    });
+    ChangeItem { start: em, end: fim, text: texto.to_owned(), insert: true }
 }
 
 /// Caractere que não aparece (ou parece um espaço comum): controles, larguras zero, marcas
@@ -1953,7 +2041,15 @@ impl<M: Clone> TextEditor<'_, M> {
             ed.action(fonts, Action::Motion(m));
             i.digitando = None;
         };
-        let acao = |a: Action, digitacao: bool, i: &mut Interno, fonts: &mut FontSystem| i.editar(digitacao, |ed| ed.action(fonts, a));
+        // Com seleção, ela sai pelo `apagar` rápido (Ctrl+A e Delete num texto enorme); o Backspace
+        // e o Delete param aí, o Enter e a letra seguem.
+        let acao = |a: Action, digitacao: bool, i: &mut Interno, fonts: &mut FontSystem| {
+            i.editar_com(digitacao, |ed, feito| {
+                if !(apagar_selecao(ed, feito) && matches!(a, Action::Backspace | Action::Delete)) {
+                    ed.action(fonts, a);
+                }
+            })
+        };
         match key {
             Key::Named(NamedKey::ArrowLeft) => movimento(if ctrl { Motion::LeftWord } else { Motion::Left }, i, fonts),
             Key::Named(NamedKey::ArrowRight) => movimento(if ctrl { Motion::RightWord } else { Motion::Right }, i, fonts),
@@ -1984,14 +2080,16 @@ impl<M: Clone> TextEditor<'_, M> {
                     "x" => {
                         if let Some(t) = ed.copy_selection() {
                             cx.clipboard.write(t);
-                            i.editar(false, |ed| { ed.delete_selection(); });
+                            i.editar_com(false, |ed, feito| {
+                                apagar_selecao(ed, feito);
+                            });
                         }
                     }
                     "v" => {
                         if let Some(t) = cx.clipboard.read() {
                             // \r\n de outro programa vira \n (o buffer guarda a quebra de cada linha).
                             let t = t.replace("\r\n", "\n");
-                            i.editar(false, |ed| ed.insert_string(&t, None));
+                            i.editar_com(false, |ed, feito| escrever(ed, feito, &t));
                         }
                     }
                     "z" if shift => i.voltar(false),
@@ -2001,7 +2099,8 @@ impl<M: Clone> TextEditor<'_, M> {
                 }
             }
             _ => match text.filter(|t| !ctrl && !t.is_empty() && t.chars().all(|c| !c.is_control())) {
-                Some(t) => i.editar(true, |ed| {
+                Some(t) => i.editar_com(true, |ed, feito| {
+                    apagar_selecao(ed, feito);
                     for c in t.chars() {
                         ed.action(fonts, Action::Insert(c));
                     }
@@ -2022,6 +2121,66 @@ impl<'a, M: Clone + 'a> From<TextEditor<'a, M>> for crate::Element<'a, M> {
 #[cfg(test)]
 mod testes {
     use super::*;
+
+    /// O `inserir` rápido deixa o mesmo texto e o mesmo cursor que o `insert_at` do cosmic-text;
+    /// colar, desfazer e refazer 50 mil linhas não trava.
+    #[test]
+    fn inserir_faz_o_mesmo_que_o_cosmic_text() {
+        let montar = |t: &str| {
+            let c = Content::with_text(t);
+            {
+                let el: crate::Element<'_, ()> = crate::text_editor(&c).into();
+                let _ = crate::capture(&el, crate::Size::new(300.0, 200.0), 1.0, &crate::Theme::light(), &mut Renderer::new(), None);
+            }
+            c
+        };
+        let casos = [("", (0, 0), "abc"), ("abc", (0, 1), "x\ny\n"), ("um\ndois", (1, 2), "A\r\nB\nC"), ("x", (0, 1), "\n"), ("a\r\nb", (0, 0), "1\n2\n3\n"), ("a", (2, 0), "z"), ("ação", (0, 3), "é\nü")];
+        for (base, (l, k), novo) in casos {
+            let (a, b) = (montar(base), montar(base));
+            let fim_a = a.0.borrow_mut().ed.as_mut().unwrap().insert_at(Cursor::new(l, k), novo, None);
+            let fim_b = inserir(b.0.borrow_mut().ed.as_mut().unwrap(), Cursor::new(l, k), novo).end;
+            assert_eq!((a.text(), fim_a), (b.text(), fim_b), "{base:?} + {novo:?}");
+        }
+        // Apagar: o mesmo texto e o mesmo item do desfazer.
+        for (base, a, z) in [("abcdef", (0, 1), (0, 4)), ("um\ndois\ntrês\nquatro", (0, 1), (2, 4)), ("a\r\nb\r\nc", (0, 0), (2, 1)), ("x\ny", (0, 1), (1, 0)), ("ab", (0, 1), (0, 1))] {
+            let (c1, c2) = (montar(base), montar(base));
+            let (a, z) = (Cursor::new(a.0, a.1), Cursor::new(z.0, z.1));
+            let i1 = {
+                let mut i = c1.0.borrow_mut();
+                let ed = i.ed.as_mut().unwrap();
+                ed.start_change();
+                ed.delete_range(a, z);
+                ed.finish_change().unwrap().items.remove(0)
+            };
+            let i2 = apagar(c2.0.borrow_mut().ed.as_mut().unwrap(), a, z);
+            assert_eq!((c1.text(), i1.text, i1.start, i1.end), (c2.text(), i2.text, i2.start, i2.end), "{base:?}");
+        }
+        // Escrever por cima da seleção e desfazer: os passos voltam na ordem certa.
+        let c = montar("abcdef\nxyz");
+        assert!(c.find_next("cd", true));
+        c.insert("1\n2");
+        assert_eq!(c.text(), "ab1\n2ef\nxyz");
+        c.undo();
+        assert_eq!(c.text(), "abcdef\nxyz");
+        c.redo();
+        assert_eq!(c.text(), "ab1\n2ef\nxyz");
+        let c = montar("antes\n");
+        let t: String = (0..50_000).map(|k| format!("linha {k}\n")).collect();
+        let relogio = std::time::Instant::now();
+        // O cursor está no começo: o colado entra antes.
+        let colado = format!("{t}antes\n");
+        c.insert(&t);
+        assert!(c.text() == colado, "colar");
+        c.undo();
+        assert_eq!(c.text(), "antes\n");
+        c.redo();
+        assert!(c.text() == colado, "refazer");
+        c.set_text("");
+        assert!(c.text().trim().is_empty(), "apagar tudo");
+        c.undo();
+        assert!(c.text() == colado, "desfazer o apagar tudo");
+        assert!(relogio.elapsed() < std::time::Duration::from_secs(3), "{:?}", relogio.elapsed());
+    }
 
     /// Começar vazio e digitar não acrescenta quebra no fim.
     #[test]
