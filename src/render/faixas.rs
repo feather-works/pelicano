@@ -7,6 +7,92 @@ use tiny_skia::Pixmap;
 
 type V4 = [f32; 4];
 
+/// Pixels pintados por caminho desde a última [`contagem`] (`PELICANO_DANO=1` mostra no `[quadro]`).
+static CONTAS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+const QUAD_RAPIDO: usize = 0;
+const QUAD_LENTO: usize = 1;
+const SOMBRA: usize = 2;
+const IMAGEM_RAPIDA: usize = 3;
+const IMAGEM_LENTA: usize = 4;
+const TEXTO: usize = 5;
+const OUTRO: usize = 6;
+const OCULTO: usize = 7;
+
+fn contar(i: usize, n: u64) {
+    if n > 0 {
+        CONTAS[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Os pixels por caminho (milhares) desde a última chamada, e zera.
+pub(crate) fn contagem() -> String {
+    let n: Vec<u64> = CONTAS.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000).collect();
+    format!("[px mil: quad {}+{}lento sombra {} imagem {}+{}lenta texto {} outro {} pulados {}]", n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7])
+}
+
+/// Um desenho opaco grande: no retângulo `px` (pixels x0, y0, x1, y1, fim exclusivo), dentro do
+/// recorte `rec`, ele escreve todo pixel com cor opaca. O que vem antes dele ali não aparece.
+struct Oclusor {
+    ordem: usize,
+    px: [i64; 4],
+    rec: [f32; 12],
+}
+
+/// Imagens já conferidas: todo pixel opaco? (pelo número da imagem, que não muda de conteúdo).
+fn textura_opaca(id: u64, pm: &Pixmap) -> bool {
+    static VISTAS: std::sync::Mutex<Option<HashMap<u64, bool>>> = std::sync::Mutex::new(None);
+    let mut v = VISTAS.lock().unwrap_or_else(|e| e.into_inner());
+    let mapa = v.get_or_insert_with(HashMap::new);
+    if mapa.len() > 4096 {
+        mapa.clear();
+    }
+    *mapa.entry(id).or_insert_with(|| pm.pixels().iter().all(|p| p.alpha() == 255))
+}
+
+/// Os desenhos opacos grandes da lista (os 64 maiores, na ordem): o que eles cobrem não é pintado
+/// pelos de baixo. A folha debaixo da página do PDF e o fundo esticado debaixo do trecho nítido
+/// eram metade dos pixels de um quadro.
+fn oclusores(l: &Lista, texturas: &HashMap<u64, &Pixmap>) -> Vec<Oclusor> {
+    let mut v = Vec::new();
+    let (mut q, mut g, mut ordem) = (0, 0, 0);
+    for &(tipo, tex, n) in &l.lotes {
+        for _ in 0..n {
+            match tipo {
+                Tipo::Quad => {
+                    let d = &l.quads[q * QUAD..(q + 1) * QUAD];
+                    let (rect, raios, params) = (v4(&d[0..]), v4(&d[4..]), v4(&d[32..]));
+                    if params[1] != 1.0 && params[1] != 2.0 && d[11] >= 1.0 {
+                        // Como o miolo liso do `quad`: longe dos cantos e da borda.
+                        let mg = raios.iter().fold(params[0], |a, r| a.max(*r)) + 1.0;
+                        let px = [(rect[0] + mg - 0.5).ceil() as i64, (rect[1] + mg - 0.5).ceil() as i64, (rect[0] + rect[2] - mg - 0.5).floor() as i64 + 1, (rect[1] + rect[3] - mg - 0.5).floor() as i64 + 1];
+                        v.push(Oclusor { ordem, px, rec: std::array::from_fn(|i| d[40 + i]) });
+                    }
+                    q += 1;
+                }
+                Tipo::Glifo => {
+                    let d = &l.glifos[g * GLIFO..(g + 1) * GLIFO];
+                    let (dst, cor, raios, tp) = (v4(&d[0..]), v4(&d[8..]), v4(&d[12..]), d[16]);
+                    if tp == 2.0 && cor[3] >= 1.0 && raios == [0.0; 4] && texturas.get(&tex).is_some_and(|pm| textura_opaca(tex, pm)) {
+                        // Como o miolo do atalho da imagem: o pixel todo dentro.
+                        let px = [dst[0].ceil() as i64, dst[1].ceil() as i64, (dst[0] + dst[2]).floor() as i64, (dst[1] + dst[3]).floor() as i64];
+                        v.push(Oclusor { ordem, px, rec: std::array::from_fn(|i| d[20 + i]) });
+                    }
+                    g += 1;
+                }
+                _ => {}
+            }
+            ordem += 1;
+        }
+    }
+    v.retain(|o| o.px[2] > o.px[0] && o.px[3] > o.px[1] && (o.px[2] - o.px[0]) * (o.px[3] - o.px[1]) >= 4096);
+    if v.len() > 64 {
+        v.sort_by_key(|o| std::cmp::Reverse((o.px[2] - o.px[0]) * (o.px[3] - o.px[1])));
+        v.truncate(64);
+        v.sort_by_key(|o| o.ordem);
+    }
+    v
+}
+
 /// Pinta `l` em `pm` (do tamanho da lista) só dentro de `area` (x0, y0, x1, y1, pixels):
 /// limpa com o fundo e pinta tudo o que cai ali, na ordem dos lotes.
 pub(super) fn pintar(l: &Lista, pm: &mut Pixmap, area: [u32; 4]) {
@@ -17,6 +103,7 @@ pub(super) fn pintar(l: &Lista, pm: &mut Pixmap, area: [u32; 4]) {
     let w = pm.width() as usize;
     let texturas: HashMap<u64, &Pixmap> = l.usadas.iter().map(|(id, p)| (*id, &**p)).collect();
     let (dec, enc) = tabelas();
+    let opacos = oclusores(l, &texturas);
     let f = pre(rgba(l.fundo));
     let fundo = [enc[idx(f[0])], enc[idx(f[1])], enc[idx(f[2])], (f[3] * 255.0).round() as u8];
     let linhas = (y1 - y0) as usize;
@@ -27,7 +114,7 @@ pub(super) fn pintar(l: &Lista, pm: &mut Pixmap, area: [u32; 4]) {
     let faixa = |i: usize, px: &mut [u8]| {
         let fy0 = y0 + (i * por) as u32;
         let y1 = fy0 + (px.len() / (w * 4)) as u32;
-        let mut f = Faixa { px, w, x0, x1, y0: fy0, y1, dec, enc };
+        let mut f = Faixa { px, w, x0, x1, y0: fy0, y1, dec, enc, opacos: &opacos, ordem: 0 };
         f.limpar(fundo);
         f.lista(l, &texturas);
     };
@@ -52,6 +139,9 @@ struct Faixa<'a> {
     y1: u32,
     dec: &'a [f32; 256],
     enc: &'a [u8; ENC],
+    opacos: &'a [Oclusor],
+    /// O número do desenho sendo pintado (na ordem dos lotes).
+    ordem: usize,
 }
 
 /// Passos da tabela linear → sRGB: perto do preto um passo dá menos de 1 nível de sRGB.
@@ -100,6 +190,7 @@ impl Faixa<'_> {
                     // A lista com vidro não vem para as faixas (`App::redraw`, `capture_bands`).
                     Tipo::Vidro => {}
                 }
+                self.ordem += 1;
             }
         }
     }
@@ -111,6 +202,48 @@ impl Faixa<'_> {
             i..((b - 0.5).ceil().max(i as f32).min(max as f32) as u32)
         };
         (r(lo[0], hi[0], self.x0, self.x1), r(lo[1], hi[1], self.y0, self.y1))
+    }
+
+    /// As partes de `xs` na linha `y` que nenhum desenho opaco posterior cobre (até 8 trechos;
+    /// passando disso, o resto conta como descoberto: pinta a mais, nunca a menos).
+    fn lacunas(&self, y: u32, xs: std::ops::Range<u32>) -> ([(u32, u32); 9], usize) {
+        let mut cobre = [(0u32, 0u32); 8];
+        let mut n = 0;
+        let i = self.opacos.partition_point(|o| o.ordem <= self.ordem);
+        for o in &self.opacos[i..] {
+            if n == 8 {
+                break;
+            }
+            if (y as i64) < o.px[1] || (y as i64) >= o.px[3] {
+                continue;
+            }
+            let (l0, l1) = linha_lisa(&o.rec, y as f32 + 0.5);
+            let (a, b) = ((o.px[0].max(l0 as i64).max(xs.start as i64)) as u32, (o.px[2].min(l1 as i64).min(xs.end as i64).max(0)) as u32);
+            if a < b {
+                cobre[n] = (a, b);
+                n += 1;
+            }
+        }
+        let mut saida = [(0u32, 0u32); 9];
+        if n == 0 {
+            saida[0] = (xs.start, xs.end);
+            return (saida, 1);
+        }
+        cobre[..n].sort_unstable();
+        let (mut m, mut x) = (0, xs.start);
+        for &(a, b) in &cobre[..n] {
+            if a > x {
+                saida[m] = (x, a);
+                m += 1;
+            }
+            x = x.max(b);
+        }
+        if x < xs.end {
+            saida[m] = (x, xs.end);
+            m += 1;
+        }
+        contar(OCULTO, (xs.len() as u64).saturating_sub(saida[..m].iter().map(|(a, b)| (b - a) as u64).sum()));
+        (saida, m)
     }
 
     /// `src` pré-multiplicado por cima do pixel: o `One, OneMinusSrcAlpha` do pipeline.
@@ -135,20 +268,55 @@ impl Faixa<'_> {
         let (xs, ys) = self.pixels(caixa_lo(rect, m, rec), caixa_hi(rect, m, rec));
         // O miolo (longe dos cantos e da borda) tem cobertura 1 e borda 0: só a cor, sem a conta
         // por pixel, e nada a fazer se ela é transparente (o contorno de uma linha da tabela).
-        let liso = params[1] != 2.0 && rec[8..12] == [0.0; 4];
+        let liso = params[1] != 2.0;
         let mg = raios.iter().fold(params[0], |a, r| a.max(*r)) + 1.0;
         let cor = pre(v4(&q[8..]));
+        // Cor sólida e opaca (fundo, painel, página): misturar dá a própria cor, então o miolo é
+        // copiado linha a linha em bytes já codificados, sem a conta por pixel. Igual ao `misturar`
+        // com k = 0, e é a maior parte dos pixels de um quadro.
+        let opaca = (params[1] != 1.0 && cor[3] >= 1.0).then(|| [self.enc[idx(cor[0])], self.enc[idx(cor[1])], self.enc[idx(cor[2])], 255u8]);
+        let (mut rapidos, mut lentos) = (0u64, 0u64);
         for y in ys {
+            // Só o que nenhum opaco posterior cobre.
+            let (trechos, nt) = self.lacunas(y, xs.clone());
+            for &(t0, t1) in &trechos[..nt] {
+            let xs = t0..t1;
             let cy = y as f32 + 0.5;
             let (i0, i1) = if liso && cy >= rect[1] + mg && cy <= rect[1] + rect[3] - mg {
-                let a = (rect[0] + mg - 0.5).ceil().max(xs.start as f32).min(xs.end as f32) as u32;
-                (a, ((rect[0] + rect[2] - mg - 0.5).floor() + 1.0).max(a as f32).min(xs.end as f32) as u32)
+                let (l0, l1) = linha_lisa(rec, cy);
+                let a = (rect[0] + mg - 0.5).ceil().max(xs.start.max(l0) as f32).min(xs.end as f32) as u32;
+                (a, ((rect[0] + rect[2] - mg - 0.5).floor() + 1.0).min(l1 as f32).max(a as f32).min(xs.end as f32) as u32)
             } else {
                 (xs.end, xs.end)
             };
+            // Sombra: debaixo da caixa que a projeta ela é zero (`1 - cobertura` = 0); só a volta conta.
+            let (j0, j1) = match params[1] == 2.0 {
+                true => {
+                    let (b, mb) = (v4(&q[36..]), raios.iter().fold(0.0f32, |a, r| a.max(*r)) + 1.0);
+                    if cy >= b[1] + mb && cy <= b[1] + b[3] - mb {
+                        let a = (b[0] + mb - 0.5).ceil().max(xs.start as f32).min(xs.end as f32) as u32;
+                        (a, ((b[0] + b[2] - mb - 0.5).floor() + 1.0).max(a as f32).min(xs.end as f32) as u32)
+                    } else {
+                        (xs.end, xs.end)
+                    }
+                }
+                false => (xs.end, xs.end),
+            };
+            rapidos += (i1 - i0) as u64;
             for x in (xs.start..i0).chain(i1..xs.end) {
+                if x >= j0 && x < j1 {
+                    continue;
+                }
+                lentos += 1;
                 let saida = quad_pixel(q, [x as f32 + 0.5, cy]);
                 self.misturar(x, y, saida);
+            }
+            if let Some(bytes) = opaca.filter(|_| i1 > i0) {
+                let l = (y - self.y0) as usize * self.w * 4;
+                for p in self.px[l + i0 as usize * 4..l + i1 as usize * 4].chunks_exact_mut(4) {
+                    p.copy_from_slice(&bytes);
+                }
+                continue;
             }
             for x in i0..i1 {
                 if params[1] == 1.0 {
@@ -159,7 +327,10 @@ impl Faixa<'_> {
                     self.misturar(x, y, cor);
                 }
             }
+            }
         }
+        contar(QUAD_RAPIDO, rapidos);
+        contar(if params[1] == 2.0 { SOMBRA } else { QUAD_LENTO }, lentos);
     }
 
     fn glifo(&mut self, q: &[f32], tex: u64, l: &Lista, texturas: &HashMap<u64, &Pixmap>) {
@@ -169,25 +340,85 @@ impl Faixa<'_> {
             return;
         }
         let (xs, ys) = self.pixels(caixa_lo(dst, 0.0, rec), caixa_hi(dst, 0.0, rec));
-        // O caso de quase todo texto: máscara do atlas, sem recorte arredondado. Sem o laço geral
+        // O caso de quase todo texto: máscara do atlas. Sem o laço geral
         // (recorte e busca do bitmap por pixel), que custava várias vezes mais.
-        let mascara = (tex == DO_ATLAS && tipo == 0.0 && rec[8..12] == [0.0; 4]).then(|| l.atlas.bitmaps.get(uv[2] as usize)).flatten();
+        let mascara = (tex == DO_ATLAS && tipo == 0.0).then(|| l.atlas.bitmaps.get(uv[2] as usize)).flatten();
         if let Some(b) = mascara.filter(|b| b.len() == dst[2] as usize * dst[3] as usize) {
+            contar(TEXTO, (xs.len() * ys.len()) as u64);
             let gw = dst[2] as usize;
             let c = [cor[0] * cor[3], cor[1] * cor[3], cor[2] * cor[3], cor[3]];
             // floor(x + 0,5 - dst.x) = x + floor(0,5 - dst.x): o deslocamento sai do laço.
             let (ox, oy) = ((0.5 - dst[0]).floor() as i64, (0.5 - dst[1]).floor() as i64);
             for y in ys {
                 let linha = (y as i64 + oy) as usize * gw;
+                let (l0, l1) = linha_lisa(rec, y as f32 + 0.5);
                 for x in xs.clone() {
                     let cob = b[linha + (x as i64 + ox) as usize];
-                    if cob != 0 {
-                        self.misturar(x, y, mul(c, cob as f32 / 255.0));
+                    if cob == 0 {
+                        continue;
+                    }
+                    // Perto de um canto arredondado do recorte, a cobertura dele entra.
+                    let corte = if x >= l0 && x < l1 { 1.0 } else { recorte([x as f32 + 0.5, y as f32 + 0.5], rec) };
+                    if corte > 0.0 {
+                        self.misturar(x, y, mul(c, cob as f32 / 255.0 * corte));
                     }
                 }
             }
             return;
         }
+        // Imagem sem cantos nem opacidade (a página do PDF, em qualquer zoom): no miolo, com os 4
+        // texels opacos, o bilinear em bytes já é o resultado (decodificar e codificar de volta dá o
+        // mesmo nível), sem a conta em linear por pixel. As colunas são as mesmas em toda linha:
+        // calculadas uma vez. A borda e os texels translúcidos seguem pela conta geral.
+        if let Some(pm) = pm.filter(|_| tipo == 2.0 && cor[3] >= 1.0 && raios == [0.0; 4]) {
+            let (iw, ih) = (pm.width() as i64, pm.height() as i64);
+            // Como o `bilinear`: u = (c - dst.x) / dst.w; t = u * w - 0,5.
+            let eixo = |c: f32, o: f32, tam: f32, n: i64| {
+                let t = (c - o) / tam * n as f32 - 0.5;
+                let i = t.floor() as i64;
+                (i.clamp(0, n - 1) as usize, (i + 1).clamp(0, n - 1) as usize, t - t.floor())
+            };
+            let colunas: Vec<(usize, usize, f32)> = xs.clone().map(|x| eixo(x as f32 + 0.5, dst[0], dst[2], iw)).collect();
+            // Miolo: o pixel todo dentro da imagem (cobertura 1).
+            let (mx0, mx1) = ((dst[0].ceil() as i64).max(xs.start as i64), ((dst[0] + dst[2]).floor() as i64).min(xs.end as i64));
+            let (my0, my1) = ((dst[1].ceil() as i64).max(ys.start as i64), ((dst[1] + dst[3]).floor() as i64).min(ys.end as i64));
+            let d = pm.data();
+            let (mut rapidos, mut lentos) = (0u64, 0u64);
+            for y in ys.clone() {
+                let miolo_y = (y as i64) >= my0 && (y as i64) < my1;
+                let (ty0, ty1, fy) = eixo(y as f32 + 0.5, dst[1], dst[3], ih);
+                let (l0, l1) = linha_lisa(rec, y as f32 + 0.5);
+                let (trechos, nt) = self.lacunas(y, xs.clone());
+                for x in trechos[..nt].iter().flat_map(|&(t0, t1)| t0..t1) {
+                    let c = [x as f32 + 0.5, y as f32 + 0.5];
+                    if miolo_y && (x as i64) >= mx0 && (x as i64) < mx1 && x >= l0 && x < l1 {
+                        let (tx0, tx1, fx) = colunas[(x - xs.start) as usize];
+                        let ix = [(ty0, tx0), (ty0, tx1), (ty1, tx0), (ty1, tx1)].map(|(ty, tx)| (ty * iw as usize + tx) * 4);
+                        if ix.iter().all(|i| d[i + 3] == 255) {
+                            let o = ((y - self.y0) as usize * self.w + x as usize) * 4;
+                            for k in 0..3 {
+                                let (a, b, c, e) = (d[ix[0] + k] as f32, d[ix[1] + k] as f32, d[ix[2] + k] as f32, d[ix[3] + k] as f32);
+                                let v = (a * (1.0 - fx) + b * fx) * (1.0 - fy) + (c * (1.0 - fx) + e * fx) * fy;
+                                self.px[o + k] = (v + 0.5) as u8;
+                            }
+                            self.px[o + 3] = 255;
+                            rapidos += 1;
+                            continue;
+                        }
+                    }
+                    lentos += 1;
+                    let corte = recorte(c, rec);
+                    if corte > 0.0 {
+                        let s = mul(linear_pre(bilinear(pm, (c[0] - dst[0]) / dst[2], (c[1] - dst[1]) / dst[3])), cobertura(dst, raios, c));
+                        self.misturar(x, y, mul(s, corte));
+                    }
+                }
+            }
+            contar(IMAGEM_RAPIDA, rapidos);
+            contar(IMAGEM_LENTA, lentos);
+            return;
+        }
+        contar(OUTRO, (xs.len() * ys.len()) as u64);
         for y in ys {
             for x in xs.clone() {
                 let c = [x as f32 + 0.5, y as f32 + 0.5];
@@ -219,6 +450,7 @@ impl Faixa<'_> {
         let (xs, ys) = self.pixels(caixa_lo(caixa, 0.0, rec), caixa_hi(caixa, 0.0, rec));
         let ba = [ab[2] - ab[0], ab[3] - ab[1]];
         let bb = (ba[0] * ba[0] + ba[1] * ba[1]).max(1e-6);
+        contar(OUTRO, (xs.len() * ys.len()) as u64);
         for y in ys {
             for x in xs.clone() {
                 let c = [x as f32 + 0.5, y as f32 + 0.5];
@@ -341,6 +573,27 @@ fn cobertura(r: V4, k0: V4, c: [f32; 2]) -> f32 {
         cob *= (raio - dist + 0.5).clamp(0.0, 1.0);
     }
     cob
+}
+
+/// As colunas `x0..x1` da linha de centro `cy` em que o recorte vale 1 (o [`recorte`] sem conta).
+/// Recorte arredondado: só longe dos cantos (fora da faixa deles, vazio) e um pixel para dentro da
+/// borda suavizada. A mesa e os painéis têm cantos redondos: sem isso nada lá dentro ia pelo atalho.
+fn linha_lisa(rec: &[f32], cy: f32) -> (u32, u32) {
+    if cy < rec[1] || cy >= rec[3] {
+        return (0, 0);
+    }
+    let rk = v4(&rec[8..]);
+    let (lo, hi) = if rk == [0.0; 4] {
+        (rec[0], rec[2])
+    } else {
+        let (rr, k) = (v4(&rec[4..]), rk.iter().fold(0.0f32, |a, r| a.max(*r)) + 1.0);
+        if cy < rr[1] + k || cy > rr[1] + rr[3] - k {
+            return (0, 0);
+        }
+        (rec[0].max(rr[0] + 1.0), rec[2].min(rr[0] + rr[2] - 1.0))
+    };
+    let x0 = (lo - 0.5).ceil().max(0.0) as u32;
+    (x0, ((hi - 0.5).ceil().max(0.0) as u32).max(x0))
 }
 
 fn recorte(c: [f32; 2], rec: &[f32]) -> f32 {

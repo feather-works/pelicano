@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 #[path = "faixas.rs"]
 mod faixas;
+pub(crate) use faixas::contagem as contagem_faixas;
 
 /// Lado do atlas de glifos (RGBA: a máscara vai como branco pré-multiplicado, o emoji com as cores).
 const ATLAS: u32 = 2048;

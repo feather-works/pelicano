@@ -212,3 +212,20 @@ fn bench_cem_mil_segmentos() {
     let med = |v: &mut Vec<f64>| { v.sort_by(f64::total_cmp); v[v.len() / 2] };
     eprintln!("100k segmentos: CPU {:.2} ms · GPU (com leitura de volta) {:.2} ms", med(&mut cpu), med(&mut gpu));
 }
+
+/// A imagem 1:1 (o atalho das faixas) sai igual ao caminho geral, também fora do pixel inteiro.
+#[test]
+fn imagem_um_para_um_igual_ao_geral() {
+    let px: Vec<u8> = (0..64 * 48).flat_map(|i| [(i * 7 % 256) as u8, (i * 13 % 256) as u8, (i / 64 * 5) as u8, if i % 97 == 0 { 128 } else { 255 }]).collect();
+    let img = Image::from_rgba(64, 48, px).expect("tamanho confere");
+    let tam = Size::new(120.0, 90.0);
+    let mut r = Renderer::new();
+    for (x, y) in [(10.0, 10.0), (10.3, 7.6), (-5.5, 20.25)] {
+        let rect = Rect { x, y, width: 64.0, height: 48.0 };
+        let sombra = Some(Shadow { color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.4 }, offset: Point::new(0.0, 2.0), blur: 6.0 });
+        let rapido = r.capture_bands(tam, 1.0, FUNDO, |r| { r.fill_quad(rect, Some(&Background::Color(Color::WHITE)), Border::default(), sombra); r.draw_image(&img, rect, [0.0; 4]) }).expect("na lista");
+        let geral = r.capture_bands(tam, 1.0, FUNDO, |r| { r.fill_quad(rect, Some(&Background::Color(Color::WHITE)), Border { radius: [0.001; 4], ..Border::default() }, sombra); r.draw_image(&img, rect, [0.001; 4]) }).expect("na lista");
+        // Os cantos mudam com o raio de 0,001 que força o caminho geral: até 8 pixels.
+        diferenca(&format!("imagem 1:1 em {x},{y}"), &geral, &rapido, 1, 8.0 / (120.0 * 90.0));
+    }
+}

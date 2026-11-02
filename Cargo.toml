@@ -1,6 +1,6 @@
 [package]
 name = "pelicano"
-version = "0.1.22"
+version = "0.1.23"
 description = "Biblioteca de interface da suíte FeatherWorks: widgets, layout e janela próprios, sem Iced"
 authors = ["FeatherWorks"]
 edition = "2021"
@@ -66,3 +66,7 @@ required-features = ["terminal", "highlighter"]
 [[example]]
 name = "caderno"
 path = "examples/caderno/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+# Quantas linhas a roda do mouse rola por clique (a configuração do Windows).
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }

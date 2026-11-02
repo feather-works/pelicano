@@ -1097,7 +1097,8 @@ impl<A: App> Runtime<A> {
         // Os tempos acumulados de cada etapa do quadro (para achar o gargalo).
         if let Some(tipo) = tipo {
             let onde = if na_gpu { " gpu" } else if em_faixas { " faixas" } else { "" };
-            eprintln!("[quadro] {size:?} view {t1:.1?} layout {t2:.1?} gravar {t3:.1?} pintar {t4:.1?} tela {:.1?} {tipo}{onde}", t0.elapsed());
+            let px = if em_faixas { format!(" {}", crate::render::gpu::contagem_faixas()) } else { String::new() };
+            eprintln!("[quadro] {size:?} view {t1:.1?} layout {t2:.1?} gravar {t3:.1?} pintar {t4:.1?} tela {:.1?} {tipo}{onde}{px}", t0.elapsed());
         }
         if std::env::var_os("PELICANO_MEMORIA").is_some() {
             eprintln!("[memória] {}", self.renderer.memoria());
@@ -1306,7 +1307,7 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
                 let ev = match delta {
                     // Clique de mouse sem Ctrl/Alt (que costumam ser zoom, um passo por clique): desliza.
                     MouseScrollDelta::LineDelta(x, y) if (self.modifiers - crate::Modifiers::SHIFT).is_empty() => {
-                        let ev = Event::Wheel { dx: x * 48.0, dy: y * 48.0, modifiers: self.modifiers };
+                        let ev = Event::Wheel { dx: x * roda_px(), dy: y * roda_px(), modifiers: self.modifiers };
                         // Shift mudou no meio: o resto da anterior vai de uma vez, depois da que já esperava.
                         if let Some(resto) = juntar_roda(&mut j.roda_suave, ev) {
                             if let Some(antes) = juntar_roda(&mut j.roda, resto) {
@@ -1319,7 +1320,7 @@ impl<A: App> ApplicationHandler<Evento<A::Msg>> for Runtime<A> {
                         }
                         return;
                     }
-                    MouseScrollDelta::LineDelta(x, y) => Event::Wheel { dx: x * 48.0, dy: y * 48.0, modifiers: self.modifiers },
+                    MouseScrollDelta::LineDelta(x, y) => Event::Wheel { dx: x * roda_px(), dy: y * roda_px(), modifiers: self.modifiers },
                     MouseScrollDelta::PixelDelta(p) => Event::Wheel { dx: (p.x / escala) as f32, dy: (p.y / escala) as f32, modifiers: self.modifiers },
                 };
                 // Soma com a que espera; vai uma por quadro no `about_to_wait`, como o mouse.
@@ -1382,6 +1383,23 @@ fn pedido_do_leitor(a: accesskit::Action) -> Option<Pedido> {
         accesskit::Action::Focus => Some(Pedido::Focar),
         _ => None,
     }
+}
+
+/// Pixels lógicos por clique da roda. No Windows segue "rolar N linhas por vez" do sistema
+/// (3 por padrão = 100 px, como os navegadores); 48 era curto lá, um PDF pedia muitos cliques.
+fn roda_px() -> f32 {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWHEELSCROLLLINES};
+        let mut linhas: u32 = 3;
+        // SAFETY: SPI_GETWHEELSCROLLLINES escreve um u32 no ponteiro dado.
+        let ok = unsafe { SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, (&mut linhas as *mut u32).cast(), 0) } != 0;
+        // "Uma tela por vez" (WHEEL_PAGESCROLL, u32::MAX) não tem a altura aqui: vira 10 linhas.
+        let linhas = if !ok { 3 } else if linhas == u32::MAX { 10 } else { linhas };
+        linhas as f32 * 100.0 / 3.0
+    }
+    #[cfg(not(windows))]
+    48.0
 }
 
 /// Mouse e roda vão no máximo uma vez por quadro: `None` entrega já, senão a hora de entregar.
