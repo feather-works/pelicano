@@ -1605,6 +1605,11 @@ impl Gpu {
         if std::env::var_os("PELICANO_DANO").is_some() {
             eprintln!("[gpu] {} ({:?}, {:?}): desenho na {}", info.name, info.device_type, info.backend, if pintar { "GPU" } else { "CPU" });
         }
+        // No Windows, se a CPU pinta de qualquer jeito, mandar o quadro pelo wgpu só atrasa: na Intel
+        // HD 2500 a rolagem ficava mais pesada que com PELICANO_GPU=nenhuma. `PELICANO_GPU=0` mantém o wgpu.
+        if cfg!(windows) && !pintar && env.as_deref() != Some("0") {
+            return Err(format!("{} não desenha", info.name));
+        }
         let limites = limites.filter(|_| pintar).unwrap_or_else(|| wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()));
         let (device, queue) = futures::executor::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: limites }, None)).map_err(|e| e.to_string())?;
         let caps = surface.get_capabilities(&adapter);
