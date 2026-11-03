@@ -95,6 +95,20 @@ impl Image {
     pub fn size(&self) -> Size {
         Size::new(self.0.width() as f32, self.0.height() as f32)
     }
+    /// Cor RGBA8 sem pré-multiplicar do pixel `(x, y)`; `None` fora da imagem.
+    /// Para ler cores sem o app guardar uma segunda cópia dos pixels.
+    pub fn pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+        let c = self.0.pixel(x, y)?.demultiply();
+        Some([c.red(), c.green(), c.blue(), c.alpha()])
+    }
+}
+
+#[test]
+fn pixel_devolve_a_cor_sem_pre_multiplicar() {
+    let i = Image::from_rgba(2, 1, vec![10, 20, 30, 255, 200, 100, 0, 128]).unwrap();
+    assert_eq!(i.pixel(0, 0), Some([10, 20, 30, 255]));
+    assert_eq!(i.pixel(1, 0).map(|p| p[3]), Some(128));
+    assert_eq!(i.pixel(2, 0), None);
 }
 
 /// SVG analisado uma vez; a rasterização fica em cache por tamanho e cor.
