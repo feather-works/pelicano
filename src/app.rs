@@ -31,6 +31,11 @@ pub trait App: Sized + 'static {
     fn theme(&self) -> Theme {
         Theme::dark()
     }
+    /// O tema de uma janela (um post-it com as cores dele, por exemplo); o padrão é o [`App::theme`].
+    fn theme_window(&self, id: WindowId) -> Theme {
+        let _ = id;
+        self.theme()
+    }
     /// Todo evento da janela passa aqui também (atalhos, fechar, redimensionar).
     fn on_event(&self, _ev: &Event) -> Option<Self::Msg> {
         None
@@ -799,7 +804,7 @@ impl<A: App> Runtime<A> {
             self.inspecionar = !self.inspecionar;
             return self.update(Vec::new());
         }
-        let theme = self.app.theme();
+        let theme = self.app.theme_window(self.janelas[i].id);
         let j = &mut self.janelas[i];
         let (id, size) = (j.id, Self::logical_size(&j.w));
         self.renderer.janela_do_evento(size, j.w.scale_factor() as f32);
@@ -977,7 +982,7 @@ impl<A: App> Runtime<A> {
     }
 
     fn redraw(&mut self, i: usize) {
-        let theme = self.app.theme();
+        let theme = self.app.theme_window(self.janelas[i].id);
         let j = &mut self.janelas[i];
         let w = j.w.clone();
         let size = Self::logical_size(&w);
