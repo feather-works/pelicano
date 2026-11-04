@@ -1,0 +1,18 @@
+# Publica no crates.io a cada tag vX.Y.Z (a versão do Cargo.toml tem que ser a mesma da tag).
+name: publicar
+on:
+  push:
+    tags: ['v*']
+jobs:
+  crates-io:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tag igual à versão
+        run: |
+          versao=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$versao" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, Cargo.toml $versao"; exit 1; }
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -1,12 +1,14 @@
 [package]
 name = "pelicano"
-version = "0.1.27"
+version = "0.1.28"
 description = "Biblioteca de interface da suíte FeatherWorks: widgets, layout e janela próprios, sem Iced"
 authors = ["FeatherWorks"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/feather-works/pelicano"
-publish = false
+readme = "README.md"
+keywords = ["gui", "ui", "widgets", "desktop", "tiny-skia"]
+categories = ["gui"]
 
 [dependencies]
 # Janela e eventos.
