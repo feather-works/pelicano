@@ -1,71 +1,73 @@
 # Pelicano
 
-Biblioteca de interface da suíte FeatherWorks, em Rust, **sem Iced**. O modelo é o
-mesmo que a suíte já usa (estado, `update`, `view`), mas com tudo aberto para
-personalizar — a ideia é chegar perto do que HTML + CSS permitem.
+GUI library of the FeatherWorks suite, in Rust. It uses the familiar Elm-style
+model (state, `update`, `view`), with everything
+open to customize — the goal is to get close to what HTML + CSS allow.
 
-![vitrine](docs/vitrine.png)
+[Leia em português](README.pt-BR.md)
 
-## O que ele faz que o Iced 0.13 travava
+![showcase](docs/vitrine.png)
 
-- **Janela sem moldura de verdade**: arrasta (`WindowCmd::Drag`) e redimensiona pela borda (`WindowCmd::DragResize`).
-- **Janela translúcida** com cantos arredondados, e desfoque do desktop atrás (`Settings { transparent, blur }`; KDE/Windows/macOS — o GNOME ignora o desfoque).
-- **Vidro em qualquer caixa**: `Style::backdrop_blur` (o `backdrop-filter` do CSS) e o preset `Style::glass(raio)`.
-- **Recorte pelo raio**: `container(...).clip(true)` corta imagem, lista e qualquer filho nos cantos arredondados.
-- Raio por canto, borda, sombra desfocada e gradiente em todo contêiner; **padding e margin**.
-- **Transições e animações** como no CSS: `Style::transition`; `animate(..)` com opacidade, deslocamento, escala e rotação, `:hover`/`:active`, entrada, saída e laço; os widgets prontos já animam. O loop só desenha quadros enquanto algo anda (`cargo run --release --example animacoes`).
-- **Acessibilidade** com AccessKit: botões, campos, caixas e textos chegam aos leitores de tela; `access_label` para ícones.
-- Hover que respeita camadas (o botão debaixo de um menu aberto não acende) e cursor do mouse que muda sozinho.
-- **Inspetor de layout** como o do navegador — desligado por padrão: `Settings { debug: true }` libera o F12 (ou `PELICANO_DEBUG=1`). Margem em laranja, padding em verde, conteúdo em azul, com o tamanho.
-- **Captura sem janela**: `capture(&app.view(), tamanho, escala, &tema, &mut Renderer::new(), None)` devolve o PNG — para testes e miniaturas.
-- **Demonstração gravada**: `PELICANO_ROTEIRO=demo.txt` faz o app seguir um roteiro com um cursor desenhado ("Claude", laranja): vai até o widget pelo texto dele, clica, digita, aperta teclas e rola; `PELICANO_GRAVAR=demo.mp4` grava a janela pelo `ffmpeg` (sozinho, grava você usando). Formato do roteiro em `src/roteiro.rs`. Com o app rodando, `Task::window_of(id, WindowCmd::Roteiro(texto))` faz o mesmo em qualquer janela (é por onde uma IA controla o app pelo MCP); `validar_roteiro` confere o texto antes.
-- `Widget` é um trait pequeno e público, e todo estilo é uma closure `Fn(&Theme, Status) -> Style`; `canvas` para desenho livre.
+## Highlights
 
-![inspetor](docs/inspetor.png)
+- **True frameless window**: drag it (`WindowCmd::Drag`) and resize it from the edge (`WindowCmd::DragResize`).
+- **Translucent window** with rounded corners, and the desktop blurred behind it (`Settings { transparent, blur }`; KDE/Windows/macOS — GNOME ignores the blur).
+- **Glass on any box**: `Style::backdrop_blur` (CSS `backdrop-filter`) and the `Style::glass(radius)` preset.
+- **Clip to the radius**: `container(...).clip(true)` cuts images, lists and any child at the rounded corners.
+- Per-corner radius, border, blurred shadow and gradient on every container; **padding and margin**.
+- **Transitions and animations** like CSS: `Style::transition`; `animate(..)` with opacity, offset, scale and rotation, `:hover`/`:active`, enter, exit and loop; the built-in widgets already animate. The loop only draws frames while something moves (`cargo run --release --example animacoes`).
+- **Accessibility** with AccessKit: buttons, fields, boxes and text reach screen readers; `access_label` for icons.
+- Hover that respects layers (the button under an open menu does not light up) and a mouse cursor that changes by itself.
+- **Layout inspector** like the browser's — off by default: `Settings { debug: true }` enables F12 (or `PELICANO_DEBUG=1`). Margin in orange, padding in green, content in blue, with the sizes.
+- **Capture without a window**: `capture(&app.view(), size, scale, &theme, &mut Renderer::new(), None)` returns the PNG — for tests and thumbnails.
+- **Recorded demos**: `PELICANO_ROTEIRO=demo.txt` makes the app follow a script with a drawn cursor ("Claude", orange): it moves to a widget by its text, clicks, types, presses keys and scrolls; `PELICANO_GRAVAR=demo.mp4` records the window with `ffmpeg` (on its own, it records you using the app). Script format in `src/roteiro.rs`. With the app running, `Task::window_of(id, WindowCmd::Roteiro(text))` does the same in any window (this is how an AI drives the app over MCP); `validar_roteiro` checks the text first.
+- `Widget` is a small public trait, and every style is a closure `Fn(&Theme, Status) -> Style`; `canvas` for free drawing.
+
+![inspector](docs/inspetor.png)
 
 ## Widgets
 
-`text`, `button`, `container`, `row!`/`column!` (com `.wrap()`), `stack!`, `Space`,
-`mouse_area` (com duplo clique), `opaque`, `scrollable` (roda e polegar arrastável),
-`text_input` (com modo senha), `checkbox`, `toggler`, `pick_list`, `slider`,
-`progress_bar`, `tooltip`, `image` (Fill/Contain/Cover), `svg` (com cor), `horizontal_rule`/`vertical_rule`, `canvas`.
+`text`, `button`, `container`, `row!`/`column!` (with `.wrap()`), `stack!`, `Space`,
+`mouse_area` (with double click), `opaque`, `scrollable` (wheel and draggable thumb),
+`text_input` (with password mode), `checkbox`, `toggler`, `pick_list`, `slider`,
+`progress_bar`, `tooltip`, `image` (Fill/Contain/Cover), `svg` (with color), `horizontal_rule`/`vertical_rule`, `canvas`.
 
-## Exemplo
-
-```sh
-cargo run --example vitrine --features terminal,highlighter   # tudo o que o pelicano faz, por seção (F12 = inspetor)
-cargo run --example vitrine --features terminal,highlighter -- --capturar pasta/   # só gera os PNGs
-cargo run --example explorer --features terminal   # gerenciador de arquivos com terminal e monitor do sistema
-cargo run --example xadrez                       # xadrez com temas (Clássico, Verde, Vidro)
-```
-
-![xadrez](docs/xadrez-vidro.png)
-
-### Pack de jogos offline
-
-Paciência, buraco, pôquer, damas e xadrez em pixel art, todos contra bots, num menu só
-(fontes Press Start 2P e Pixelify Sans, OFL, em `examples/assets`):
+## Examples
 
 ```sh
-cargo run --release --example jogos              # o menu com os cinco
-cargo run --release --example paciencia          # ou cada um sozinho: buraco, poker, damas, xadrez_pixel
+cargo run --example vitrine --features terminal,highlighter   # everything pelicano does, by section (F12 = inspector)
+cargo run --example vitrine --features terminal,highlighter -- --capturar folder/   # only writes the PNGs
+cargo run --example explorer --features terminal   # file manager with a terminal and a system monitor
+cargo run --example xadrez                       # chess with themes (Classic, Green, Glass)
 ```
 
-![jogos](docs/jogos.png)
+![chess](docs/xadrez-vidro.png)
 
-![paciência](docs/paciencia.png)
+### Offline game pack
+
+Solitaire, buraco, poker, checkers and chess in pixel art, all against bots, in a single menu
+(Press Start 2P and Pixelify Sans fonts, OFL, in `examples/assets`):
+
+```sh
+cargo run --release --example jogos              # the menu with all five
+cargo run --release --example paciencia          # or each one alone: buraco, poker, damas, xadrez_pixel
+```
+
+![games](docs/jogos.png)
+
+![solitaire](docs/paciencia.png)
 
 ![buraco](docs/buraco.png)
 
-## Como funciona
+## How it works
 
-winit abre a janela; o quadro é desenhado na CPU com tiny-skia (texto com
-cosmic-text, SVG com resvg) e o wgpu só leva a imagem pronta para a tela com alfa
-pré-multiplicado — é isso que dá a transparência no Wayland.
+winit opens the window; the frame is drawn on the CPU with tiny-skia (text with
+cosmic-text, SVG with resvg), and wgpu only carries the finished image to the screen
+with premultiplied alpha — that is what gives transparency on Wayland.
 
-## Ainda falta
+## Still missing
 
-Seleção no `text_input`, navegação por Tab, assinaturas de tempo (`every`),
-executor tokio (para `reqwest`) e grid.
+Selection in `text_input`, Tab navigation, time subscriptions (`every`),
+a tokio executor (for `reqwest`) and grid.
 
-Licença MIT.
+MIT license.
