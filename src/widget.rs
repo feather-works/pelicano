@@ -1773,6 +1773,7 @@ pub struct TextInput<'a, M> {
     id: Option<u64>,
     placeholder_color: Option<Color>,
     selection_color: Option<Color>,
+    align_x: Align,
 }
 
 /// O último pedido de foco ([`TextInput::autofocus`]) que o widget já atendeu.
@@ -1800,7 +1801,7 @@ pub(crate) fn atender_foco(ev: &Event, states: &mut States, key: u64, pedido: Op
 }
 
 pub fn text_input<'a, M>(placeholder: impl Into<Cow<'a, str>>, value: impl Into<Cow<'a, str>>) -> TextInput<'a, M> {
-    TextInput { placeholder: placeholder.into(), value: value.into(), on_input: None, on_submit: None, size: 14.0, font: Font::DEFAULT, padding: [6u16, 10].into(), width: Length::FILL, secure: false, style: None, autofocus: None, id: None, placeholder_color: None, selection_color: None }
+    TextInput { placeholder: placeholder.into(), value: value.into(), on_input: None, on_submit: None, size: 14.0, font: Font::DEFAULT, padding: [6u16, 10].into(), width: Length::FILL, secure: false, style: None, autofocus: None, id: None, placeholder_color: None, selection_color: None, align_x: Align::Start }
 }
 
 impl<'a, M> TextInput<'a, M> {
@@ -1890,6 +1891,24 @@ impl<'a, M> TextInput<'a, M> {
     fn scroll(&self, r: &mut Renderer, cursor: usize, largura: f32) -> f32 {
         (self.caret_x(r, cursor) - largura + 2.0).max(0.0)
     }
+    /// Quanto o texto anda para a esquerda: a rolagem até o cursor quando o texto
+    /// não cabe; quando cabe, negativo para centralizar ou alinhar à direita.
+    fn deslocamento(&self, r: &mut Renderer, cursor: usize, largura: f32, focado: bool) -> f32 {
+        let total = self.caret_x(r, self.value.len());
+        let fator = match self.align_x { Align::Center => 0.5, Align::End => 1.0, _ => 0.0 };
+        if total + 2.0 <= largura && fator > 0.0 && !self.value.is_empty() {
+            -(largura - total - 2.0) * fator
+        } else if focado {
+            self.scroll(r, cursor, largura)
+        } else {
+            0.0
+        }
+    }
+    /// Alinhamento horizontal do texto quando ele cabe no campo (padrão: início).
+    pub fn align_x(mut self, a: Align) -> Self {
+        self.align_x = a;
+        self
+    }
 }
 
 /// O campo padrão: superfície com borda que fica na cor primária com foco.
@@ -1954,7 +1973,7 @@ impl<M: Clone> Widget<M> for TextInput<'_, M> {
         let estado = cx.states.get::<Cursor>(n.key);
         let cursor = fronteira(&self.value, estado.map_or(self.value.len(), |c| c.pos));
         let ancora = estado.and_then(|c| c.ancora).map(|a| fronteira(&self.value, a));
-        let rolar = if focado { self.scroll(cx.renderer, cursor, dentro.width) } else { 0.0 };
+        let rolar = self.deslocamento(cx.renderer, cursor, dentro.width, focado);
         cx.renderer.push_clip(dentro, [0.0; 4]);
         if let (true, Some(a)) = (focado, ancora.filter(|&a| a != cursor)) {
             let (x0, x1) = (self.caret_x(cx.renderer, a.min(cursor)), self.caret_x(cx.renderer, a.max(cursor)));
@@ -1983,7 +2002,7 @@ impl<M: Clone> Widget<M> for TextInput<'_, M> {
         let arrastando = estado.is_some_and(|e| e.arrastando);
         let anterior = |c: usize| v[..c].char_indices().next_back().map_or(0, |(i, _)| i);
         let proximo = |c: usize| v[c..].chars().next().map_or(c, |ch| c + ch.len_utf8());
-        let x_em = |cx: &mut EventCx<M>, c: usize| cx.cursor.map_or(0.0, |p| p.x) - n.rect.x - self.padding.left + if focado { self.scroll(cx.renderer, c, n.rect.width - self.padding.horizontal()) } else { 0.0 };
+        let x_em = |cx: &mut EventCx<M>, c: usize| cx.cursor.map_or(0.0, |p| p.x) - n.rect.x - self.padding.left + self.deslocamento(cx.renderer, c, n.rect.width - self.padding.horizontal(), focado);
         match ev {
             Event::MousePressed(MouseButton::Left) if cx.cursor.is_some_and(|p| n.rect.contains(p)) => {
                 let x = x_em(cx, c);

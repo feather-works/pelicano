@@ -444,6 +444,27 @@ fn campo_senha_mapeia_o_clique_para_o_valor() {
     assert_eq!(h.tecla(&el, Key::Character("-".into()), Some("-")), vec![M::Texto("ç-ãb".into())]);
 }
 
+/// Texto que cabe no campo centralizado ou à direita: o clique cai no texto onde ele
+/// aparece (o deslocamento do desenho é o mesmo do clique).
+#[test]
+fn campo_alinhado_clica_onde_o_texto_aparece() {
+    let mut h = H::new();
+    let campo = |a| -> Element<M> { text_input("", "abcd").on_input(M::Texto).width(200.0).align_x(a).into() };
+    let r = h.node(&campo(Align::Center)).rect;
+    // No meio do campo: com o texto centralizado, o cursor fica no meio de "abcd".
+    h.click(&campo(Align::Center), Point::new(r.x + r.width / 2.0, r.y + 5.0));
+    assert_eq!(h.tecla(&campo(Align::Center), Key::Character("-".into()), Some("-")), vec![M::Texto("ab-cd".into())]);
+    // Alinhado ao início, o mesmo clique cai depois do fim do texto.
+    let mut h = H::new();
+    h.click(&campo(Align::Start), Point::new(r.x + r.width / 2.0, r.y + 5.0));
+    assert_eq!(h.tecla(&campo(Align::Start), Key::Character("-".into()), Some("-")), vec![M::Texto("abcd-".into())]);
+    // À direita: o clique perto da borda direita fica no fim; desenhar não quebra.
+    let mut h = H::new();
+    h.click(&campo(Align::End), Point::new(r.x + r.width - 12.0, r.y + 5.0));
+    assert_eq!(h.tecla(&campo(Align::End), Key::Character("-".into()), Some("-")), vec![M::Texto("abcd-".into())]);
+    h.desenhar(&campo(Align::End), None);
+}
+
 #[test]
 fn senha_trocada_pelo_app_nao_corta_caractere() {
     let mut h = H::new();
