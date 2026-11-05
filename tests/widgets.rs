@@ -816,6 +816,18 @@ fn autofocus_nao_volta_depois_do_esc() {
 }
 
 #[test]
+fn sugestoes_aparecem_com_foco_e_somem_vazias() {
+    let mut h = H::new();
+    let c = Content::with_text("def teste():\n    tes");
+    let itens = vec!["teste".to_string(), "tempo".to_string()];
+    let el: Element<E> = text_editor(&c).completions(itens.clone(), 5).into();
+    // Sem foco não há cursor, e a lista não aparece; com a escolhida fora da lista, não quebra.
+    h.desenhar(&el, None);
+    let vazio: Element<E> = text_editor(&c).completions(Vec::new(), 0).into();
+    h.desenhar(&vazio, None);
+}
+
+#[test]
 fn acha_e_conta_caracteres_ocultos() {
     let mut h = H::new();
     let c = Content::with_text("a\u{200b}b\nc d\u{a0}e\u{feff}");

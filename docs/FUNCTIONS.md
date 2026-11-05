@@ -590,6 +590,7 @@ Enche o espaço; dentro de um `scrollable` (sem limite), fica com 400 × 300.
 | `.line_height(f32)` | Altura da linha em pixels lógicos. Padrão: 1,45 × o tamanho. |
 | `.placeholder(&str)` | O texto apagado do editor vazio. |
 | `.on_key(f)` | `Fn(&Key, Modifiers) -> Option<M>`: vê cada tecla antes do editor (com foco). `Some(msg)` manda a mensagem e o editor ignora a tecla (Tab que recua, Enter que envia). |
+| `.completions(itens, selecionada)` | `Vec<String>`, `usize`: lista de sugestões colada no cursor (autocompletar), com a escolhida realçada; mostra até 8 e acompanha a escolhida. O app filtra as palavras e trata as teclas no `on_key`. Vazia, não aparece. |
 | `.highlight(ext, Highlight)` | Cores de código pela extensão (`"rs"`, `"py"`…). Precisa da feature `highlighter` (syntect). Temas: `Highlight::ALL`. |
 | `.style(f)` | `Fn(&Theme, Status) -> Style`. |
 

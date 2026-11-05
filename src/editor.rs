@@ -1119,6 +1119,8 @@ pub struct TextEditor<'a, M> {
     current_line: Option<Color>,
     stripes: Option<Color>,
     warnings: Vec<Warning>,
+    completions: Vec<String>,
+    completion_sel: usize,
     on_link: Option<Box<dyn Fn(String) -> M + 'a>>,
     colors: Option<Box<dyn Fn(&str) -> Vec<(std::ops::Range<usize>, Color)> + 'a>>,
     #[cfg(feature = "highlighter")]
@@ -1137,7 +1139,7 @@ pub struct Warning {
 /// Editor de várias linhas sobre um [`Content`]. Edita o conteúdo direto e avisa com
 /// `on_change` (para o app marcar "não salvo").
 pub fn text_editor<'a, M>(content: &'a Content) -> TextEditor<'a, M> {
-    TextEditor { content, size: 15.0, font: Font::DEFAULT, wrap: true, line_numbers: false, padding: Padding::from(12.0), on_change: None, style: None, autofocus: None, invisibles: false, markdown: false, line_height: None, placeholder: "", id: None, on_key: None, idle_focus: true, current_line: None, stripes: None, warnings: Vec::new(), on_link: None, colors: None, #[cfg(feature = "highlighter")] highlight: None }
+    TextEditor { content, size: 15.0, font: Font::DEFAULT, wrap: true, line_numbers: false, padding: Padding::from(12.0), on_change: None, style: None, autofocus: None, invisibles: false, markdown: false, line_height: None, placeholder: "", id: None, on_key: None, idle_focus: true, current_line: None, stripes: None, warnings: Vec::new(), completions: Vec::new(), completion_sel: 0, on_link: None, colors: None, #[cfg(feature = "highlighter")] highlight: None }
 }
 
 impl<'a, M> TextEditor<'a, M> {
@@ -1219,6 +1221,13 @@ impl<'a, M> TextEditor<'a, M> {
     /// mouse em cima. Trecho fora do texto é ignorado.
     pub fn warnings(mut self, w: Vec<Warning>) -> Self {
         self.warnings = w;
+        self
+    }
+    /// Lista de sugestões colada no cursor (o autocompletar), com `selecionada` realçada. O app
+    /// escolhe as palavras e trata as teclas pelo `on_key` (setas, Tab, Enter, Esc). Vazia, some.
+    pub fn completions(mut self, itens: Vec<String>, selecionada: usize) -> Self {
+        self.completions = itens;
+        self.completion_sel = selecionada;
         self
     }
     /// Cores feitas pelo app, linha a linha: `f(linha)` devolve os trechos (bytes) e a cor de cada
@@ -1700,6 +1709,30 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
         }
         if let Some(p) = caret {
             cx.renderer.fill_quad(Rect { x: p.x, y: p.y, width: 1.5, height: altura_linha }, Some(&cor.into()), Border::default(), None);
+        }
+        // As sugestões, por cima de tudo: embaixo da linha do cursor (sem espaço, em cima).
+        if let (Some(p), false) = (caret, self.completions.is_empty()) {
+            const VISIVEIS: usize = 8;
+            let sel = self.completion_sel.min(self.completions.len() - 1);
+            let desde = sel.saturating_sub(VISIVEIS - 1);
+            let itens: Vec<String> = self.completions.iter().skip(desde).take(VISIVEIS).cloned().collect();
+            let (theme, janela, tam, fonte, lh) = (*cx.theme, cx.renderer.window_size(), self.size, self.font, altura_linha);
+            cx.overlay(move |rd| {
+                let w = itens.iter().map(|t| rd.measure(t, tam, fonte, None).width).fold(140.0, f32::max) + 20.0;
+                let h = itens.len() as f32 * lh + 8.0;
+                let x = p.x.clamp(4.0, (janela.width - w - 4.0).max(4.0));
+                let y = if p.y + lh + 2.0 + h > janela.height { p.y - h - 2.0 } else { p.y + lh + 2.0 };
+                let sombra = crate::Shadow { color: Color::BLACK.alpha(0.3), offset: Point::new(0.0, 4.0), blur: 12.0 };
+                rd.fill_quad(Rect { x, y, width: w, height: h }, Some(&theme.surface.into()), Border::rounded(6.0).color(theme.border, 1.0), Some(sombra));
+                let desce = (lh - rd.measure("·", tam, fonte, None).height) / 2.0;
+                for (k, t) in itens.iter().enumerate() {
+                    let linha_y = y + 4.0 + k as f32 * lh;
+                    if desde + k == sel {
+                        rd.fill_quad(Rect { x: x + 4.0, y: linha_y, width: w - 8.0, height: lh }, Some(&theme.primary.alpha(0.22).into()), Border::rounded(4.0), None);
+                    }
+                    rd.draw_text(t, tam, fonte, theme.text, Point::new(x + 10.0, linha_y + desce), None);
+                }
+            });
         }
         // O "Copiar" no canto de cima de cada caixa de código (no topo à vista, se ela começa acima).
         let mut copiar = Vec::new();
