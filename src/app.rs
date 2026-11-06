@@ -163,6 +163,8 @@ pub fn validar_roteiro(texto: &str) -> Result<(), String> {
 #[derive(Clone, Copy)]
 pub(crate) enum Op {
     Focus(u64),
+    /// Foca o campo e põe a seleção de `.1` a `.2` (bytes; iguais = só o cursor; `usize::MAX` = o fim).
+    Selecionar(u64, usize, usize),
     /// Deslocamento absoluto, ou relativo (0 a 1) quando o `bool` diz.
     Scroll(u64, Point, bool),
 }
@@ -233,6 +235,18 @@ impl<M: Send + 'static> Task<M> {
     /// Põe o foco no campo `.id(id)` (já desenhado).
     pub fn focus(id: impl Hash) -> Self {
         Task(vec![Action::Widget(Op::Focus(crate::id_hash(&id)))])
+    }
+    /// Foca o `text_input(..).id(id)` com o texto todo selecionado: digitar troca o valor.
+    pub fn select_all(id: impl Hash) -> Self {
+        Task(vec![Action::Widget(Op::Selecionar(crate::id_hash(&id), 0, usize::MAX))])
+    }
+    /// Foca o campo e põe o cursor em `pos` (byte do valor; passa do fim, vai ao fim).
+    pub fn move_cursor(id: impl Hash, pos: usize) -> Self {
+        Task(vec![Action::Widget(Op::Selecionar(crate::id_hash(&id), pos, pos))])
+    }
+    /// Foca o campo e seleciona os bytes `de..ate` do valor.
+    pub fn select_range(id: impl Hash, de: usize, ate: usize) -> Self {
+        Task(vec![Action::Widget(Op::Selecionar(crate::id_hash(&id), de, ate))])
     }
     /// Copia `texto` para a área de transferência.
     pub fn write_clipboard(texto: impl Into<String>) -> Self {
@@ -629,11 +643,15 @@ impl<A: App> Runtime<A> {
     fn widget_op(&mut self, o: Op) {
         for j in &mut self.janelas {
             let id = match o {
-                Op::Focus(id) | Op::Scroll(id, ..) => id,
+                Op::Focus(id) | Op::Selecionar(id, ..) | Op::Scroll(id, ..) => id,
             };
             let Some(key) = j.states.ids.borrow().get(&id).copied() else { continue };
             match o {
                 Op::Focus(_) => j.states.focus = Some(key),
+                Op::Selecionar(_, de, ate) => {
+                    j.states.focus = Some(key);
+                    widget::selecionar_campo(&mut j.states, key, de, ate);
+                }
                 Op::Scroll(_, p, rel) => widget::rolar(&mut j.states, key, p, rel),
             }
             j.w.request_redraw();
@@ -817,7 +835,24 @@ impl<A: App> Runtime<A> {
             let pegou = widget::dispatch(&el, &node, &ev, &mut cx);
             (cx.redraw, pegou)
         };
-        if pegou == crate::Captured::No {
+        // Tab num campo de texto anda para o próximo campo (Shift+Tab, o anterior). Só com o foco
+        // num campo: o Tab solto continua do app (a grade do FeatherSheet anda de célula com ele).
+        let tab = match &ev {
+            Event::Key { key: crate::Key::Named(crate::NamedKey::Tab), modifiers: m, pressed: true, .. }
+                if pegou == crate::Captured::No && !m.control_key() && !m.alt_key() =>
+            {
+                Some(m.shift_key())
+            }
+            _ => None,
+        };
+        let andou = tab.is_some_and(|volta| {
+            let j = &mut self.janelas[i];
+            let proximo = widget::proximo_campo(&j.states.focaveis.borrow(), j.states.focus, volta);
+            proximo.inspect(|&k| j.states.focus = Some(k)).is_some()
+        });
+        if andou {
+            self.janelas[i].w.request_redraw();
+        } else if pegou == crate::Captured::No {
             msgs.extend(self.app.on_unhandled_event(id, &ev));
         }
         // O mouse andou: o quadro é gravado e comparado; se nada mudou, nem pinta.

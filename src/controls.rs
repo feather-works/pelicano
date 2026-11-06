@@ -30,10 +30,17 @@ pub struct Toggle<'a, M> {
     on_toggle: Option<Box<dyn Fn(bool) -> M + 'a>>,
     size: f32,
     color: Option<Color>,
+    /// Aro (caixa, rádio) ou trilho (chave) desmarcado; fundo da caixa e do rádio; texto do rótulo.
+    border_color: Option<Color>,
+    background: Option<Color>,
+    text_color: Option<Color>,
+    spacing: f32,
+    /// Lado da caixa e do rádio, altura da chave.
+    box_size: Option<f32>,
 }
 
 pub fn checkbox<'a, M>(label: impl Into<Cow<'a, str>>, checked: bool) -> Toggle<'a, M> {
-    Toggle { forma: Forma::Caixa, label: label.into(), checked, on_toggle: None, size: 14.0, color: None }
+    Toggle { forma: Forma::Caixa, label: label.into(), checked, on_toggle: None, size: 14.0, color: None, border_color: None, background: None, text_color: None, spacing: 8.0, box_size: None }
 }
 
 /// Escolha única: marcado quando `selected == Some(value)`; o clique manda `value`.
@@ -60,10 +67,36 @@ impl<'a, M> Toggle<'a, M> {
         self.color = Some(c);
         self
     }
+    /// A cor do aro (caixa, rádio) ou do trilho (chave) quando desmarcado.
+    pub fn border_color(mut self, c: Color) -> Self {
+        self.border_color = Some(c);
+        self
+    }
+    /// O fundo da caixa e do rádio.
+    pub fn background(mut self, c: Color) -> Self {
+        self.background = Some(c);
+        self
+    }
+    /// A cor do rótulo (desabilitado, ele fica apagado do mesmo jeito).
+    pub fn text_color(mut self, c: Color) -> Self {
+        self.text_color = Some(c);
+        self
+    }
+    /// O espaço entre a marca e o rótulo (padrão 8).
+    pub fn spacing(mut self, s: f32) -> Self {
+        self.spacing = s;
+        self
+    }
+    /// O lado da caixa e do rádio, ou a altura da chave (padrão 16 e 18).
+    pub fn box_size(mut self, s: f32) -> Self {
+        self.box_size = Some(s);
+        self
+    }
     fn marca(&self) -> Size {
-        match self.forma {
-            Forma::Caixa | Forma::Radio => Size::new(16.0, 16.0),
-            Forma::Chave => Size::new(34.0, 18.0),
+        match (self.forma, self.box_size) {
+            (Forma::Caixa | Forma::Radio, b) => Size::new(b.unwrap_or(16.0), b.unwrap_or(16.0)),
+            (Forma::Chave, Some(h)) => Size::new(h * 34.0 / 18.0, h),
+            (Forma::Chave, None) => Size::new(34.0, 18.0),
         }
     }
 }
@@ -72,7 +105,7 @@ impl<M> Widget<M> for Toggle<'_, M> {
     fn layout(&self, cx: &mut LayoutCx, l: Limits) -> Node {
         let m = self.marca();
         let t = if self.label.is_empty() { Size::ZERO } else { cx.renderer.measure(&self.label, self.size, Font::DEFAULT, None) };
-        let gap = if self.label.is_empty() { 0.0 } else { 8.0 };
+        let gap = if self.label.is_empty() { 0.0 } else { self.spacing };
         Node::leaf(cx.key(), Size::new((m.width + gap + t.width).min(l.max.width), m.height.max(t.height)))
     }
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
@@ -104,24 +137,27 @@ impl<M> Widget<M> for Toggle<'_, M> {
             Forma::Caixa => {
                 // A caixa enche de cor e o visto aparece junto.
                 let p = cx.transition(n.key, if self.checked { 1.0f32 } else { 0.0 }, Transition::new(140));
-                let vazia = if hover { t.muted } else { t.border };
-                let (bg, borda) = (t.surface.lerp(&ativa, p), vazia.lerp(&ativa, p));
-                cx.renderer.fill_quad(r, Some(&bg.alpha(apagado).into()), Border::rounded(4.0).color(borda.alpha(apagado), 1.0), None);
+                let vazia = if hover { t.muted } else { self.border_color.unwrap_or(t.border) };
+                let (bg, borda) = (self.background.unwrap_or(t.surface).lerp(&ativa, p), vazia.lerp(&ativa, p));
+                cx.renderer.fill_quad(r, Some(&bg.alpha(apagado).into()), Border::rounded(4.0 * m.width / 16.0).color(borda.alpha(apagado), 1.0), None);
                 if p > 0.0 {
-                    let q = |x: f32, y: f32| Point::new(r.x + x, r.y + y);
+                    // O visto foi desenhado para 16 px: acompanha o tamanho da caixa.
+                    let k = m.width / 16.0;
+                    let q = |x: f32, y: f32| Point::new(r.x + x * k, r.y + y * k);
                     cx.renderer.stroke(&[q(4.0, 8.5), q(7.0, 11.5), q(12.0, 5.0)], 2.0, t.on_primary.alpha(p));
                 }
             }
             Forma::Radio => {
                 // O anel engrossa até virar o ponto.
                 let p = cx.transition(n.key, if self.checked { 1.0f32 } else { 0.0 }, Transition::new(160));
-                let vazia = if hover { t.muted } else { t.border };
-                cx.renderer.fill_quad(r, Some(&t.surface.alpha(apagado).into()), Border::rounded(8.0).color(vazia.lerp(&ativa, p).alpha(apagado), 1.0 + 4.0 * p), None);
+                let vazia = if hover { t.muted } else { self.border_color.unwrap_or(t.border) };
+                let k = m.width / 16.0;
+                cx.renderer.fill_quad(r, Some(&self.background.unwrap_or(t.surface).alpha(apagado).into()), Border::rounded(m.width / 2.0).color(vazia.lerp(&ativa, p).alpha(apagado), (1.0 + 4.0 * p) * k), None);
             }
             Forma::Chave => {
                 // A bolinha desliza até o outro lado em vez de pular.
                 let p = cx.transition(n.key, if self.checked { 1.0f32 } else { 0.0 }, Transition::new(160));
-                let trilho = t.text.alpha(0.2).lerp(&ativa, p);
+                let trilho = self.border_color.unwrap_or(t.text.alpha(0.2)).lerp(&ativa, p);
                 cx.renderer.fill_quad(r, Some(&trilho.alpha(trilho.a * apagado).into()), Border::rounded(m.height / 2.0), None);
                 let d = m.height - 4.0;
                 let x = r.x + 2.0 + (m.width - d - 4.0) * p;
@@ -131,8 +167,8 @@ impl<M> Widget<M> for Toggle<'_, M> {
         }
         if !self.label.is_empty() {
             let th = cx.renderer.measure(&self.label, self.size, Font::DEFAULT, None).height;
-            let cor = if st == Status::Disabled { t.muted } else { cx.text_color };
-            cx.renderer.draw_text(&self.label, self.size, Font::DEFAULT, cor, Point::new(r.x + m.width + 8.0, n.rect.y + (n.rect.height - th) / 2.0), None);
+            let cor = if st == Status::Disabled { t.muted } else { self.text_color.unwrap_or(cx.text_color) };
+            cx.renderer.draw_text(&self.label, self.size, Font::DEFAULT, cor, Point::new(r.x + m.width + self.spacing, n.rect.y + (n.rect.height - th) / 2.0), None);
         }
     }
     fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {

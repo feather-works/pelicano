@@ -80,3 +80,19 @@ fn letras_que_passam_da_linha_baixa_nao_deixam_fantasma() {
     cena(&mut cheio, "x");
     assert!(cheio.pixmap.data() == r.pixmap.data(), "sobrou pedaço do texto de antes");
 }
+
+#[test]
+fn dica_com_barra_mostra_a_fracao() {
+    let el: Element<()> = tooltip(Space::new(100.0, 50.0), "", TooltipPosition::Bottom).text_size(11.0).meter("Semana", 0.95, "95%").into();
+    let (mut r, st) = (Renderer::new(), States::default());
+    r.begin(TELA, 1.0, Color::TRANSPARENT);
+    let n = layout(&el, TELA, &mut r, &st, &Theme::dark());
+    draw(&el, &n, &mut r, &st, &Theme::dark(), Some(Point::new(10.0, 10.0)), false);
+    // Acima de 90% a barra enche na cor de perigo: algum pixel dela embaixo do botão.
+    let perigo = Theme::dark().danger;
+    let alvo = [perigo.r, perigo.g, perigo.b].map(|c| (c * 255.0).round() as i32);
+    let achou = (56..110).any(|y| (0..200).any(|x| r.pixmap.pixel(x, y).is_some_and(|p| {
+        [p.red() as i32, p.green() as i32, p.blue() as i32].iter().zip(alvo).all(|(a, b)| (a - b).abs() <= 3) && p.alpha() == 255
+    })));
+    assert!(achou);
+}

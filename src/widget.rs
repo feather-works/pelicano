@@ -357,6 +357,7 @@ impl<'a, M: 'a> From<String> for Element<'a, M> {
 
 /// Layout da árvore inteira em `size` lógico.
 pub fn layout<M>(el: &Element<'_, M>, size: Size, renderer: &mut Renderer, states: &States, theme: &Theme) -> Node {
+    states.focaveis.borrow_mut().clear();
     let mut cx = LayoutCx { renderer, states, theme, key: 0 };
     let mut n = el.0.layout(&mut cx, Limits::new(size));
     n.place(Point::ORIGIN);
@@ -1030,10 +1031,11 @@ pub struct Stack<'a, M> {
     children: Vec<Element<'a, M>>,
     width: Length,
     height: Length,
+    fit_base: bool,
 }
 
 pub fn stack<'a, M>(children: impl IntoIterator<Item = Element<'a, M>>) -> Stack<'a, M> {
-    Stack { children: children.into_iter().collect(), width: Length::Shrink, height: Length::Shrink }
+    Stack { children: children.into_iter().collect(), width: Length::Shrink, height: Length::Shrink, fit_base: false }
 }
 
 impl<'a, M: 'a> Stack<'a, M> {
@@ -1049,6 +1051,12 @@ impl<'a, M: 'a> Stack<'a, M> {
         self.height = h.into();
         self
     }
+    /// As camadas de cima ficam do tamanho da de baixo: um traço `Length::FILL` sobre um botão
+    /// tem a largura do botão, não a do espaço todo que sobra.
+    pub fn fit_base(mut self) -> Self {
+        self.fit_base = true;
+        self
+    }
 }
 
 impl<M> Widget<M> for Stack<'_, M> {
@@ -1061,7 +1069,14 @@ impl<M> Widget<M> for Stack<'_, M> {
     fn layout(&self, cx: &mut LayoutCx, l: Limits) -> Node {
         let (wl, hl) = Widget::<M>::size(self);
         let max = Size::new(Limits::resolve(wl, l.max.width, l.max.width), Limits::resolve(hl, l.max.height, l.max.height));
-        let nos: Vec<Node> = self.children.iter().enumerate().map(|(i, c)| cx.child(i, c, Limits::new(max))).collect();
+        let mut nos: Vec<Node> = Vec::with_capacity(self.children.len());
+        for (i, c) in self.children.iter().enumerate() {
+            let limite = match nos.first() {
+                Some(base) if self.fit_base => base.rect.size(),
+                _ => max,
+            };
+            nos.push(cx.child(i, c, Limits::new(limite)));
+        }
         let w = nos.iter().map(|n| n.rect.width).fold(0.0, f32::max);
         let h = nos.iter().map(|n| n.rect.height).fold(0.0, f32::max);
         Node { rect: Rect::new(Point::ORIGIN, Size::new(Limits::resolve(wl, l.max.width, w), Limits::resolve(hl, l.max.height, h))), key: cx.key(), children: nos, ..Default::default() }
@@ -1287,6 +1302,7 @@ pub struct MouseArea<'a, M> {
     on_release: Option<M>,
     on_right_press: Option<M>,
     on_right_press_at: Option<Box<dyn Fn(Point) -> M + 'a>>,
+    on_press_through: Option<Box<dyn Fn(Point) -> M + 'a>>,
     on_double_click: Option<M>,
     icon: Option<CursorIcon>,
     on_enter: Option<M>,
@@ -1303,7 +1319,7 @@ struct EmCima(bool);
 struct UltimoClique(Option<std::time::Instant>);
 
 pub fn mouse_area<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> MouseArea<'a, M> {
-    MouseArea { content: content.into(), on_press: None, on_release: None, on_right_press: None, on_right_press_at: None, on_double_click: None, icon: None, on_enter: None, on_exit: None, on_move: None, on_scroll: None }
+    MouseArea { content: content.into(), on_press: None, on_release: None, on_right_press: None, on_right_press_at: None, on_press_through: None, on_double_click: None, icon: None, on_enter: None, on_exit: None, on_move: None, on_scroll: None }
 }
 
 impl<'a, M> MouseArea<'a, M> {
@@ -1340,6 +1356,12 @@ impl<'a, M> MouseArea<'a, M> {
     /// Clique direito com a posição na janela (lógica): onde abrir o menu de contexto.
     pub fn on_right_press_at(mut self, f: impl Fn(Point) -> M + 'a) -> Self {
         self.on_right_press_at = Some(Box::new(f));
+        self
+    }
+    /// Qualquer clique (os dois botões) em cima manda `f(ponto)` antes do filho, e o filho recebe o
+    /// clique também: saber que lado de um editor dividido foi clicado, sem o editor perder o clique.
+    pub fn on_press_through(mut self, f: impl Fn(Point) -> M + 'a) -> Self {
+        self.on_press_through = Some(Box::new(f));
         self
     }
     /// Duplo clique (até 400 ms): na barra de título, maximizar.
@@ -1383,6 +1405,11 @@ impl<M: Clone> Widget<M> for MouseArea<'_, M> {
                 (false, true) => self.on_enter.iter().for_each(|m| cx.publish(m.clone())),
                 (true, false) => self.on_exit.iter().for_each(|m| cx.publish(m.clone())),
                 _ => {}
+            }
+        }
+        if let (Event::MousePressed(_), Some(f), true) = (ev, &self.on_press_through, dentro) {
+            if let Some(p) = cx.cursor {
+                cx.publish(f(p));
             }
         }
         if self.content.0.event(&n.children[0], ev, cx) == Captured::Yes {
@@ -1749,6 +1776,20 @@ struct Cursor {
     arrastando: bool,
 }
 
+/// Põe a seleção do campo `key` de `de` a `ate` (o cursor fica em `ate`); as posições são
+/// ajustadas ao valor no próximo desenho ([`fronteira`]).
+pub(crate) fn selecionar_campo(states: &mut States, key: u64, de: usize, ate: usize) {
+    *states.get_mut::<Cursor>(key) = Cursor { pos: ate, ancora: (de != ate).then_some(de), arrastando: false };
+}
+
+/// O campo seguinte (ou o anterior, com `volta`) ao focado, dando a volta. `None` se o foco
+/// não está num campo da lista.
+pub(crate) fn proximo_campo(campos: &[u64], foco: Option<u64>, volta: bool) -> Option<u64> {
+    let i = campos.iter().position(|k| Some(*k) == foco)?;
+    let n = campos.len();
+    Some(campos[if volta { (i + n - 1) % n } else { (i + 1) % n }])
+}
+
 /// `i` dentro de `v` e numa fronteira de caractere (o app pode ter trocado o valor).
 fn fronteira(v: &str, i: usize) -> usize {
     let mut i = i.min(v.len());
@@ -1928,6 +1969,9 @@ impl<M: Clone> Widget<M> for TextInput<'_, M> {
     fn layout(&self, cx: &mut LayoutCx, l: Limits) -> Node {
         if let Some(id) = self.id {
             cx.states.ids.borrow_mut().insert(id, cx.key());
+        }
+        if self.on_input.is_some() {
+            cx.states.focaveis.borrow_mut().push(cx.key());
         }
         let h = cx.renderer.measure("Ag", self.size, self.font, None).height + self.padding.vertical();
         let w = Limits::resolve(self.width, l.max.width, 160.0);
@@ -2192,10 +2236,11 @@ pub struct SvgView {
     width: Length,
     height: Length,
     color: Option<Color>,
+    cor_do_texto: bool,
 }
 
 pub fn svg(svg: Svg) -> SvgView {
-    SvgView { svg, width: Length::Shrink, height: Length::Shrink, color: None }
+    SvgView { svg, width: Length::Shrink, height: Length::Shrink, color: None, cor_do_texto: false }
 }
 
 impl SvgView {
@@ -2212,6 +2257,12 @@ impl SvgView {
         self.color = Some(c);
         self
     }
+    /// Pinta na cor do texto em volta (o `currentColor` do CSS): dentro de um botão, o ícone
+    /// acompanha o hover e o desabilitado como o rótulo.
+    pub fn current_color(mut self) -> Self {
+        self.cor_do_texto = true;
+        self
+    }
 }
 
 impl<M> Widget<M> for SvgView {
@@ -2223,7 +2274,8 @@ impl<M> Widget<M> for SvgView {
     }
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
         let r = fit(ContentFit::Contain, n.rect, self.svg.size());
-        cx.renderer.draw_svg(&self.svg, r, self.color);
+        let cor = if self.cor_do_texto { Some(cx.text_color) } else { self.color };
+        cx.renderer.draw_svg(&self.svg, r, cor);
     }
 }
 
@@ -2234,13 +2286,15 @@ pub struct ProgressBar {
     width: Length,
     height: f32,
     color: Option<Color>,
+    track: Option<Color>,
+    radius: Option<f32>,
 }
 
 /// `value` dentro de `range`; fora dele, a barra fica vazia ou cheia.
 pub fn progress_bar(range: std::ops::RangeInclusive<f32>, value: f32) -> ProgressBar {
     let span = range.end() - range.start();
     let fraction = if span > 0.0 { ((value - range.start()) / span).clamp(0.0, 1.0) } else { 0.0 };
-    ProgressBar { fraction, width: Length::FILL, height: 6.0, color: None }
+    ProgressBar { fraction, width: Length::FILL, height: 6.0, color: None, track: None, radius: None }
 }
 
 impl ProgressBar {
@@ -2256,6 +2310,16 @@ impl ProgressBar {
         self.color = Some(c);
         self
     }
+    /// A cor do trilho, a parte vazia (padrão: o texto do tema a 12%).
+    pub fn track(mut self, c: Color) -> Self {
+        self.track = Some(c);
+        self
+    }
+    /// O raio dos cantos (padrão: metade da altura, a barra redonda).
+    pub fn radius(mut self, r: f32) -> Self {
+        self.radius = Some(r);
+        self
+    }
 }
 
 impl<M> Widget<M> for ProgressBar {
@@ -2266,8 +2330,8 @@ impl<M> Widget<M> for ProgressBar {
         Node::leaf(cx.key(), Size::new(Limits::resolve(self.width, l.max.width, 120.0), self.height))
     }
     fn draw(&self, n: &Node, cx: &mut DrawCx) {
-        let raio = Border::rounded(self.height / 2.0);
-        cx.renderer.fill_quad(n.rect, Some(&cx.theme.text.alpha(0.12).into()), raio, None);
+        let raio = Border::rounded(self.radius.unwrap_or(self.height / 2.0));
+        cx.renderer.fill_quad(n.rect, Some(&self.track.unwrap_or(cx.theme.text.alpha(0.12)).into()), raio, None);
         let f = self.fraction as f64;
         // A barra escorrega até o valor novo em vez de pular.
         let fraction = cx.transition(n.key, self.fraction, Transition::new(300).easing(crate::Easing::EaseOut));
@@ -2301,15 +2365,35 @@ pub struct Tooltip<'a, M> {
     position: TooltipPosition,
     padding: Padding,
     style: Option<Box<dyn Fn(&Theme) -> Style + 'a>>,
+    text_size: f32,
+    max_width: f32,
+    /// Barras embaixo do texto: (rótulo, fração de 0 a 1, valor escrito à direita).
+    meters: Vec<(String, f32, String)>,
 }
 
 pub fn tooltip<'a, M: 'a>(content: impl Into<Element<'a, M>>, tip: impl Into<Cow<'a, str>>, position: TooltipPosition) -> Tooltip<'a, M> {
-    Tooltip { content: content.into(), tip: tip.into(), position, padding: Padding { top: 4.0, right: 8.0, bottom: 4.0, left: 8.0 }, style: None }
+    Tooltip { content: content.into(), tip: tip.into(), position, padding: Padding { top: 4.0, right: 8.0, bottom: 4.0, left: 8.0 }, style: None, text_size: 12.0, max_width: 320.0, meters: Vec::new() }
 }
 
 impl<'a, M> Tooltip<'a, M> {
     pub fn padding(mut self, p: impl Into<Padding>) -> Self {
         self.padding = p.into();
+        self
+    }
+    /// O tamanho da letra da dica (padrão 12).
+    pub fn text_size(mut self, s: f32) -> Self {
+        self.text_size = s;
+        self
+    }
+    /// A largura máxima antes de quebrar a linha (padrão 320).
+    pub fn max_width(mut self, w: f32) -> Self {
+        self.max_width = w;
+        self
+    }
+    /// Uma barra embaixo do texto: rótulo à esquerda, valor à direita e a fração (0 a 1) cheia
+    /// na cor primária (acima de 90%, na de erro). Chame mais de uma vez para várias barras.
+    pub fn meter(mut self, rotulo: impl Into<String>, fracao: f32, valor: impl Into<String>) -> Self {
+        self.meters.push((rotulo.into(), fracao.clamp(0.0, 1.0), valor.into()));
         self
     }
     /// A caixa do balão: fundo, borda, sombra e cor do texto (o padrão é a superfície do tema).
@@ -2341,11 +2425,17 @@ impl<'a, M> Widget<M> for Tooltip<'a, M> {
             None => Style { background: Some(theme.surface.into()), border: Border::rounded(6.0).color(theme.border, 1.0), shadow: Some(Shadow { color: Color::BLACK.alpha(0.3), offset: Point::new(0.0, 2.0), blur: 6.0 }), ..Default::default() },
         };
         let (tip, r, pos, pd) = (self.tip.to_string(), n.rect, self.position, self.padding);
+        let (tam, larg, barras) = (self.text_size, self.max_width, self.meters.clone());
         let janela = cx.renderer.window_size();
         cx.overlay(move |rd| {
             rd.push_opacity(p);
-            let t = rd.measure(&tip, 12.0, Font::DEFAULT, Some(320.0));
-            let (w, h) = (t.width + pd.horizontal(), t.height + pd.vertical());
+            let t = if tip.is_empty() { Size::ZERO } else { rd.measure(&tip, tam, Font::DEFAULT, Some(larg)) };
+            // Cada barra: a linha do rótulo e valor, e a barra de 4 px embaixo.
+            let linha = rd.measure("Ag", tam, Font::DEFAULT, None).height;
+            let alto_barra = linha + 8.0;
+            let largura_barras = if barras.is_empty() { 0.0 } else { (larg * 0.6).max(160.0) };
+            let corpo_h = t.height + barras.len() as f32 * alto_barra + if t.height > 0.0 && !barras.is_empty() { 6.0 } else { 0.0 };
+            let (w, h) = (t.width.max(largura_barras) + pd.horizontal(), corpo_h + pd.vertical());
             let (x, y) = match pos {
                 TooltipPosition::Bottom => (r.x + (r.width - w) / 2.0, r.y + r.height + 6.0),
                 TooltipPosition::Top => (r.x + (r.width - w) / 2.0, r.y - h - 6.0),
@@ -2355,7 +2445,24 @@ impl<'a, M> Widget<M> for Tooltip<'a, M> {
             let x = x.clamp(4.0, (janela.width - w - 4.0).max(4.0));
             let caixa = Rect { x, y, width: w, height: h };
             rd.fill_quad(caixa, st.background.as_ref(), st.border, st.shadow);
-            rd.draw_text(&tip, 12.0, Font::DEFAULT, st.text_color.unwrap_or(theme.text), Point::new(x + pd.left, y + pd.top), Some(320.0));
+            let cor = st.text_color.unwrap_or(theme.text);
+            if !tip.is_empty() {
+                rd.draw_text(&tip, tam, Font::DEFAULT, cor, Point::new(x + pd.left, y + pd.top), Some(larg));
+            }
+            let mut by = y + pd.top + t.height + if t.height > 0.0 { 6.0 } else { 0.0 };
+            let largura = w - pd.horizontal();
+            for (rotulo, f, valor) in &barras {
+                rd.draw_text(rotulo, tam, Font::DEFAULT, theme.muted, Point::new(x + pd.left, by), None);
+                let vw = rd.measure(valor, tam, Font::DEFAULT, None).width;
+                rd.draw_text(valor, tam, Font::DEFAULT, cor, Point::new(x + pd.left + largura - vw, by), None);
+                let trilho = Rect { x: x + pd.left, y: by + linha + 2.0, width: largura, height: 4.0 };
+                rd.fill_quad(trilho, Some(&theme.text.alpha(0.12).into()), Border::rounded(2.0), None);
+                if *f > 0.0 {
+                    let cheio = if *f > 0.9 { theme.danger } else { theme.primary };
+                    rd.fill_quad(Rect { width: largura * f, ..trilho }, Some(&cheio.into()), Border::rounded(2.0), None);
+                }
+                by += alto_barra;
+            }
             rd.pop_opacity();
         });
     }
@@ -2522,5 +2629,140 @@ impl<M> Widget<M> for Responsive<'_, M> {
 impl<'a, M: 'a> From<Responsive<'a, M>> for Element<'a, M> {
     fn from(w: Responsive<'a, M>) -> Self {
         Element::new(w)
+    }
+}
+
+// ---------- Lista virtual ----------
+
+/// A lista que só monta as linhas à vista: dez mil linhas custam o mesmo que as trinta que
+/// cabem na tela. Ponha dentro de um [`scrollable`]; veja [`virtual_list`].
+pub struct VirtualList<'a, M> {
+    n: usize,
+    altura: f32,
+    largura: Length,
+    linha: Box<dyn Fn(usize) -> Element<'a, M> + 'a>,
+    /// As linhas montadas no layout (índice e elemento), na ordem dos filhos do nó.
+    montadas: std::cell::RefCell<Vec<(usize, Element<'a, M>)>>,
+}
+
+/// `n` linhas de `altura` fixa; `linha(i)` monta a linha `i` só quando ela aparece. A altura
+/// total (n × altura) vale para a rolagem; cada linha guarda o próprio estado pelo índice.
+pub fn virtual_list<'a, M>(n: usize, altura: impl Into<Num>, linha: impl Fn(usize) -> Element<'a, M> + 'a) -> VirtualList<'a, M> {
+    VirtualList { n, altura: altura.into().0.max(1.0), largura: Length::FILL, linha: Box::new(linha), montadas: std::cell::RefCell::new(Vec::new()) }
+}
+
+impl<'a, M> VirtualList<'a, M> {
+    pub fn width(mut self, w: impl Into<Length>) -> Self {
+        self.largura = w.into();
+        self
+    }
+    fn montar(&self, cx: &mut LayoutCx, i: usize, largura: f32) -> (Element<'a, M>, Node) {
+        let el = (self.linha)(i);
+        let mut no = cx.child(i, &el, Limits::new(Size::new(largura, self.altura)));
+        no.place(Point::new(0.0, i as f32 * self.altura));
+        (el, no)
+    }
+}
+
+impl<'a, M> Widget<M> for VirtualList<'a, M> {
+    fn size(&self) -> (Length, Length) {
+        (self.largura, Length::Shrink)
+    }
+    fn layout(&self, cx: &mut LayoutCx, l: Limits) -> Node {
+        let w = Limits::resolve(self.largura, l.max.width, l.max.width);
+        // Antes do primeiro desenho: as que cabem na janela, do começo.
+        let cabem = (cx.renderer.window_size().height / self.altura).ceil() as usize + 1;
+        let (de, ate) = cx.states.faixas.borrow().get(&cx.key()).copied().unwrap_or((0, cabem));
+        let (de, ate) = (de.min(self.n), ate.min(self.n));
+        let mut montadas = Vec::with_capacity(ate - de);
+        let mut filhos = Vec::with_capacity(ate - de);
+        for i in de..ate {
+            let (el, no) = self.montar(cx, i, w);
+            montadas.push((i, el));
+            filhos.push(no);
+        }
+        *self.montadas.borrow_mut() = montadas;
+        Node { rect: Rect::new(Point::ORIGIN, Size::new(w, self.n as f32 * self.altura)), key: cx.key(), children: filhos, ..Default::default() }
+    }
+    fn draw(&self, n: &Node, cx: &mut DrawCx) {
+        let tela = Rect::new(Point::ORIGIN, cx.renderer.window_size());
+        let v = cx.renderer.visible_rect().unwrap_or(tela).intersect(&n.rect);
+        let de = (((v.y - n.rect.y) / self.altura).floor().max(0.0) as usize).min(self.n);
+        let ate = ((((v.y + v.height) - n.rect.y) / self.altura).ceil().max(0.0) as usize).clamp(de, self.n);
+        cx.states.faixas.borrow_mut().insert(n.key, (de, ate));
+        let montadas = self.montadas.borrow();
+        for i in de..ate {
+            match montadas.iter().position(|(j, _)| *j == i) {
+                Some(k) => montadas[k].1 .0.draw(&n.children[k], cx),
+                None => {
+                    // Rolou para além do que o layout montou: monta aqui (o próximo layout já traz).
+                    let mut lcx = LayoutCx { renderer: cx.renderer, states: cx.states, theme: cx.theme, key: n.key };
+                    let (el, mut no) = self.montar(&mut lcx, i, n.rect.width);
+                    no.translate(n.rect.x, n.rect.y);
+                    el.0.draw(&no, cx);
+                }
+            }
+        }
+    }
+    fn event(&self, n: &Node, ev: &Event, cx: &mut EventCx<M>) -> Captured {
+        for ((_, el), no) in self.montadas.borrow().iter().zip(&n.children) {
+            if el.0.event(no, ev, cx) == Captured::Yes {
+                return Captured::Yes;
+            }
+        }
+        Captured::No
+    }
+    fn opaque_at(&self, n: &Node, p: Point) -> bool {
+        self.montadas.borrow().iter().zip(&n.children).any(|((_, el), no)| el.0.opaque_at(no, p))
+    }
+}
+
+impl<'a, M: 'a> From<VirtualList<'a, M>> for Element<'a, M> {
+    fn from(w: VirtualList<'a, M>) -> Self {
+        Element::new(w)
+    }
+}
+
+#[cfg(test)]
+mod testes_foco {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum M {
+        A(String),
+        B(String),
+    }
+
+    #[test]
+    fn campos_entram_na_ordem_e_o_tab_da_a_volta() {
+        let (st, mut r) = (States::default(), Renderer::new());
+        let el: Element<M> = column![text_input("a", "um").on_input(M::A), text("x"), text_input("b", "").on_input(M::B), text_input("c", "")].into();
+        r.begin(Size::new(300.0, 200.0), 1.0, Color::TRANSPARENT);
+        layout(&el, Size::new(300.0, 200.0), &mut r, &st, &Theme::dark());
+        // O campo sem on_input (desabilitado) não entra.
+        let campos = st.focaveis.borrow().clone();
+        assert_eq!(campos.len(), 2);
+        assert_eq!(proximo_campo(&campos, Some(campos[0]), false), Some(campos[1]));
+        assert_eq!(proximo_campo(&campos, Some(campos[1]), false), Some(campos[0]));
+        assert_eq!(proximo_campo(&campos, Some(campos[0]), true), Some(campos[1]));
+        // Foco fora dos campos: o Tab é do app.
+        assert_eq!(proximo_campo(&campos, None, false), None);
+    }
+
+    #[test]
+    fn selecionar_tudo_e_digitar_troca_o_valor() {
+        let (mut st, mut r) = (States::default(), Renderer::new());
+        let el: Element<M> = text_input("a", "Planilha1").on_input(M::A).into();
+        let tela = Size::new(300.0, 200.0);
+        r.begin(tela, 1.0, Color::TRANSPARENT);
+        let n = layout(&el, tela, &mut r, &st, &Theme::dark());
+        st.focus = Some(n.key);
+        selecionar_campo(&mut st, n.key, 0, usize::MAX);
+        let mut msgs = Vec::new();
+        let mut area = MemoryClipboard::default();
+        let mut cx = EventCx { renderer: &mut r, states: &mut st, cursor: None, messages: &mut msgs, window: &mut Vec::new(), redraw: false, clipboard: &mut area };
+        let ev = Event::Key { key: crate::Key::Character("V".into()), text: Some("V".into()), modifiers: crate::Modifiers::empty(), pressed: true };
+        dispatch(&el, &n, &ev, &mut cx);
+        assert_eq!(msgs, [M::A("V".into())]);
     }
 }

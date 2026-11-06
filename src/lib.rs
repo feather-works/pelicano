@@ -20,6 +20,7 @@ mod editor;
 mod pickers;
 mod render;
 mod markdown;
+mod menu;
 mod rich;
 mod roteiro;
 #[cfg(feature = "terminal")]
@@ -43,8 +44,9 @@ pub use controls::*;
 pub use editor::{is_invisible, text_editor, Content, TextEditor, Warning};
 pub use pickers::*;
 pub use markdown::markdown;
+pub use menu::{context_menu, menu_item, menu_separator, MenuItem};
 #[cfg(feature = "terminal")]
-pub use terminal::{terminal, Terminal, TerminalEvent, TerminalSettings, TerminalView};
+pub use terminal::{palavra_em, terminal, Terminal, TerminalEvent, TerminalSettings, TerminalView};
 pub use rich::{rich_text, span, RichText, Span};
 pub use widget::*;
 pub use winit::keyboard::{Key, ModifiersState as Modifiers, NamedKey};
@@ -416,6 +418,11 @@ pub struct States {
     /// Os widgets com `.id(..)` do último quadro: id → chave. É por aqui que um [`Task`] acha
     /// o campo a focar ou a rolagem a mexer.
     pub(crate) ids: RefCell<HashMap<u64, u64>>,
+    /// Os campos que aceitam o foco pelo Tab, na ordem da tela (refeita a cada layout).
+    pub(crate) focaveis: RefCell<Vec<u64>>,
+    /// As linhas que cada [`widget::VirtualList`] mostrou no último desenho (primeira, fim):
+    /// o layout seguinte monta só essas, e os eventos chegam nelas.
+    pub(crate) faixas: RefCell<HashMap<u64, (usize, usize)>>,
 }
 
 /// O sistema está no tema escuro? (GNOME/KDE pelo portal, Windows e macOS pelas preferências.)

@@ -67,7 +67,6 @@ with premultiplied alpha — that is what gives transparency on Wayland.
 
 ## Still missing
 
-Selection in `text_input`, Tab navigation, time subscriptions (`every`),
-a tokio executor (for `reqwest`) and grid.
+A grid layout. The virtual list (`virtual_list`), selection in `text_input`, Tab between fields, `Subscription::every` and the tokio executor are done.
 
 MIT license.

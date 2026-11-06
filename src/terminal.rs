@@ -264,8 +264,9 @@ impl Cores<'_> {
 
 // ---------- O widget ----------
 
-pub struct TerminalView<'a> {
+pub struct TerminalView<'a, M = ()> {
     term: &'a Terminal,
+    on_link: Option<Box<dyn Fn(String) -> M + 'a>>,
     size: f32,
     font: Font,
     text_color: Option<Color>,
@@ -277,11 +278,17 @@ pub struct TerminalView<'a> {
 
 /// Mostra um [`Terminal`]. Clique dá o foco; com foco, o teclado vai para o programa
 /// (Ctrl+Shift+C/V copiam e colam, Shift+PageUp/PageDown rolam o histórico).
-pub fn terminal(t: &Terminal) -> TerminalView<'_> {
-    TerminalView { term: t, size: 13.0, font: Font::MONO, text_color: None, background: None, palette: None, padding: 6.0, id: None }
+pub fn terminal<M>(t: &Terminal) -> TerminalView<'_, M> {
+    TerminalView { term: t, on_link: None, size: 13.0, font: Font::MONO, text_color: None, background: None, palette: None, padding: 6.0, id: None }
 }
 
-impl TerminalView<'_> {
+impl<'a, M> TerminalView<'a, M> {
+    /// Ctrl+clique numa palavra (um endereço, um `src/main.rs:42:5`) manda `f(palavra)`: o app
+    /// abre o que fizer sentido. O clique sem Ctrl continua selecionando.
+    pub fn on_link(mut self, f: impl Fn(String) -> M + 'a) -> Self {
+        self.on_link = Some(Box::new(f));
+        self
+    }
     pub fn size(mut self, s: f32) -> Self {
         self.size = s;
         self
@@ -325,6 +332,15 @@ impl TerminalView<'_> {
         Rect { x: n.rect.x + p, y: n.rect.y + p, width: (n.rect.width - 2.0 * p).max(1.0), height: (n.rect.height - 2.0 * p).max(1.0) }
     }
 
+    /// A palavra sob `p` na tela, se parece um link ([`palavra_em`]).
+    fn link_em(&self, n: &Node, p: Point, cw: f32, ch: f32) -> Option<String> {
+        let (lin, col, _) = self.celula_em(n, p, cw, ch);
+        let t = self.term.term.lock();
+        let q = viewport_to_point(t.grid().display_offset(), alacritty_terminal::index::Point::new(lin, Column(col)));
+        let linha: String = (0..t.columns()).map(|c| t.grid()[q.line][Column(c)].c).collect();
+        palavra_em(&linha, col)
+    }
+
     /// A célula sob `p` (linha e coluna da tela) e o lado dela.
     fn celula_em(&self, n: &Node, p: Point, cw: f32, ch: f32) -> (usize, usize, Side) {
         let a = self.area(n);
@@ -340,10 +356,11 @@ impl TerminalView<'_> {
 #[derive(Default)]
 struct Mouse {
     selecionando: bool,
+    ctrl: bool,
     ultimo: Option<(std::time::Instant, u8)>,
 }
 
-impl<M> Widget<M> for TerminalView<'_> {
+impl<M> Widget<M> for TerminalView<'_, M> {
     fn size(&self) -> (Length, Length) {
         (Length::FILL, Length::FILL)
     }
@@ -470,6 +487,15 @@ impl<M> Widget<M> for TerminalView<'_> {
         let focado = cx.states.focus == Some(n.key);
         let (cw, ch) = self.celula(cx.renderer);
         match ev {
+            Event::ModifiersChanged(m) => {
+                cx.states.get_mut::<Mouse>(n.key).ctrl = m.control_key() || m.super_key();
+                Captured::No
+            }
+            Event::MousePressed(MouseButton::Left) if dentro && self.on_link.is_some() && cx.states.get::<Mouse>(n.key).is_some_and(|m| m.ctrl) && self.link_em(n, cx.cursor.unwrap_or(Point::ORIGIN), cw, ch).is_some() => {
+                let palavra = self.link_em(n, cx.cursor.unwrap_or(Point::ORIGIN), cw, ch).expect("conferido");
+                cx.publish((self.on_link.as_ref().expect("conferido"))(palavra));
+                Captured::Yes
+            }
             Event::MousePressed(MouseButton::Left) if dentro => {
                 cx.states.focus = Some(n.key);
                 let (lin, col, lado) = self.celula_em(n, cx.cursor.unwrap_or(Point::ORIGIN), cw, ch);
@@ -537,8 +563,8 @@ impl<M> Widget<M> for TerminalView<'_> {
     }
 }
 
-impl TerminalView<'_> {
-    fn tecla<M>(&self, key: &Key, text: Option<&str>, m: Modifiers, cx: &mut EventCx<M>) -> Captured {
+impl<M> TerminalView<'_, M> {
+    fn tecla(&self, key: &Key, text: Option<&str>, m: Modifiers, cx: &mut EventCx<M>) -> Captured {
         let (ctrl, shift, alt) = (m.control_key(), m.shift_key(), m.alt_key());
         let modo = *self.term.term.lock().mode();
         let app = modo.contains(TermMode::APP_CURSOR);
@@ -661,15 +687,42 @@ fn colagem(texto: &str, bracketed: bool) -> Vec<u8> {
     if bracketed { format!("\x1b[200~{}\x1b[201~", t.replace('\x1b', "")) } else { t }.into_bytes()
 }
 
-impl<'a, M: 'a> From<TerminalView<'a>> for crate::Element<'a, M> {
-    fn from(w: TerminalView<'a>) -> Self {
+impl<'a, M: 'a> From<TerminalView<'a, M>> for crate::Element<'a, M> {
+    fn from(w: TerminalView<'a, M>) -> Self {
         crate::Element::new(w)
     }
+}
+
+/// A palavra da `linha` na coluna `col` (entre espaços, sem aspas e parênteses em volta, sem a
+/// pontuação do fim), se parece um link: tem `://`, ou `/` ou `.` (um caminho com ou sem `:linha`).
+pub fn palavra_em(linha: &str, col: usize) -> Option<String> {
+    let letras: Vec<char> = linha.chars().collect();
+    let corta = |c: char| c.is_whitespace() || "\"'`()<>[]{}|".contains(c);
+    if letras.get(col).is_none_or(|c| corta(*c)) {
+        return None;
+    }
+    let ini = letras[..col].iter().rposition(|c| corta(*c)).map_or(0, |i| i + 1);
+    let fim = letras[col..].iter().position(|c| corta(*c)).map_or(letras.len(), |i| col + i);
+    let palavra: String = letras[ini..fim].iter().collect();
+    let palavra = palavra.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+    (palavra.contains("://") || palavra.contains('/') || palavra.contains('.')).then(|| palavra.to_string())
 }
 
 #[cfg(test)]
 mod testes {
     use super::*;
+
+    #[test]
+    fn palavra_sob_o_clique_vira_link() {
+        let l = "error: --> src/main.rs:42:5: oi (https://exemplo.com/a). fim";
+        let col = |t: &str| l.find(t).unwrap() + 2;
+        assert_eq!(palavra_em(l, col("src/")).as_deref(), Some("src/main.rs:42:5"));
+        assert_eq!(palavra_em(l, col("https")).as_deref(), Some("https://exemplo.com/a"));
+        // Palavra comum, espaço e fora da linha não são link.
+        assert_eq!(palavra_em(l, col("fim")), None);
+        assert_eq!(palavra_em(l, 6), None);
+        assert_eq!(palavra_em(l, 999), None);
+    }
 
     #[test]
     fn roda_um_comando_e_mostra_a_saida() {

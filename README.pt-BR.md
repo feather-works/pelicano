@@ -65,7 +65,6 @@ pré-multiplicado — é isso que dá a transparência no Wayland.
 
 ## Ainda falta
 
-Seleção no `text_input`, navegação por Tab, assinaturas de tempo (`every`),
-executor tokio (para `reqwest`) e grid.
+Grade (grid). Lista virtual (`virtual_list`), seleção no `text_input`, Tab entre os campos, `Subscription::every` e o executor tokio já existem.
 
 Licença MIT.

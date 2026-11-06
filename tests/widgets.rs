@@ -756,6 +756,7 @@ fn sombra_grande_sem_emenda() {
 #[derive(Clone, Debug, PartialEq)]
 enum E {
     Mudou,
+    Clicou(usize, usize),
 }
 
 #[test]
@@ -813,6 +814,153 @@ fn autofocus_nao_volta_depois_do_esc() {
     h.tecla(&campo, nomeada(NamedKey::Escape), None);
     // O cursor do campo não apaga o pedido já atendido: o mesmo pedido não pega o foco de novo.
     assert_eq!(h.tecla(&campo, Key::Character("b".into()), Some("b")), vec![]);
+}
+
+#[test]
+fn menu_flutuante_escolhe_fecha_e_nao_sai_da_janela() {
+    let mut h = H::new();
+    #[derive(Clone, Debug, PartialEq)]
+    enum C {
+        Abrir,
+        Salvar,
+        Fechar,
+    }
+    let itens = || vec![menu_item("Abrir", C::Abrir).shortcut("Ctrl+O"), menu_separator(""), menu_item("Salvar", C::Salvar).checked(true), menu_item("Sair", C::Fechar).disabled()];
+    // Pedido perto do canto de baixo à direita: abre para dentro, inteiro na tela.
+    let el: Element<C> = context_menu(itens(), Point::new(390.0, 290.0), C::Fechar).into();
+    let n = h.node(&el);
+    let mut caixas = Vec::new();
+    fn juntar(n: &Node, v: &mut Vec<Rect>) {
+        v.push(n.rect);
+        n.children.iter().for_each(|c| juntar(c, v));
+    }
+    juntar(&n, &mut caixas);
+    let menu = caixas.iter().filter(|r| (r.width - 250.0).abs() < 0.5).copied().next().expect("a caixa do menu");
+    assert!(menu.x + menu.width <= TELA.width && menu.y + menu.height <= TELA.height, "{menu:?}");
+    // O primeiro item fica no topo da caixa; o último (desabilitado) não manda nada.
+    let primeiro = Point::new(menu.x + 40.0, menu.y + 15.0);
+    assert_eq!(h.click(&el, primeiro), [C::Abrir]);
+    assert_eq!(h.click(&el, Point::new(10.0, 10.0)), [C::Fechar]);
+    h.desenhar(&el, Some(primeiro));
+}
+
+#[test]
+fn icone_acompanha_a_cor_do_botao_no_hover() {
+    let mut h = H::new();
+    let quadrado = || Svg::from_bytes(br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="#000"/></svg>"##).unwrap();
+    let el: Element<M> = button(svg(quadrado()).width(10.0).height(10.0).current_color())
+        .on_press(M::Enviar)
+        .padding(0)
+        .style(|_, s| Style::default().text_color(if s == Status::Hovered { Color::rgb(1.0, 0.0, 0.0) } else { Color::rgb(0.0, 0.0, 1.0) }))
+        .into();
+    let cor = |h: &mut H, cursor| {
+        h.desenhar(&el, cursor);
+        let p = h.r.pixmap.pixel(5, 5).unwrap();
+        (p.red(), p.blue())
+    };
+    assert_eq!(cor(&mut h, None), (0, 255));
+    assert_eq!(cor(&mut h, Some(Point::new(5.0, 5.0))), (255, 0));
+}
+
+#[test]
+fn marca_e_barra_aceitam_tamanho_espaco_e_cores() {
+    let mut h = H::new();
+    let padrao: Element<M> = checkbox("Gravar", true).into();
+    let ajustado: Element<M> = checkbox("Gravar", true).box_size(20.0).spacing(4.0).border_color(Color::rgb(1.0, 0.0, 0.0)).background(Color::WHITE).text_color(Color::BLACK).into();
+    let (a, b) = (h.node(&padrao).rect.width, h.node(&ajustado).rect.width);
+    // 4 px a mais de caixa e 4 a menos de espaço: a mesma largura.
+    assert!((a - b).abs() < 0.01, "{a} x {b}");
+    // Chave com 9 de altura: 17 de largura, mais o espaço e o rótulo.
+    let chave: Element<M> = toggler("", false).box_size(9.0).into();
+    assert_eq!(h.node(&chave).rect.width, 17.0);
+    h.desenhar(&ajustado, None);
+    h.desenhar(&radio("r", 1, Some(1), |_| M::Enviar).box_size(12.0).into(), None);
+    let barra: Element<M> = progress_bar(0.0..=1.0, 0.5).track(Color::rgb(0.2, 0.2, 0.2)).radius(0.0).into();
+    h.desenhar(&barra, None);
+}
+
+#[test]
+fn camada_do_tamanho_da_base_e_clique_que_passa() {
+    let mut h = H::new();
+    // Sem fit_base, o traço FILL pega a linha toda e empurra o botão do lado para fora.
+    let traco = || container(Space::new(Length::FILL, 2.0));
+    let aba = |fit: bool| {
+        let s = stack![button(text("aba")).padding(6), traco()];
+        if fit { s.fit_base() } else { s }
+    };
+    for fit in [false, true] {
+        let el: Element<M> = row![aba(fit), button(text("Rodar"))].into();
+        let n = h.node(&el);
+        let (a, b) = (n.children[0].rect, n.children[1].rect);
+        assert_eq!(a.width < 100.0, fit, "aba com {} de largura", a.width);
+        assert_eq!(b.width > 0.0 && b.x < TELA.width, fit);
+    }
+    // O clique passa para o botão e ainda avisa quem está por fora.
+    #[derive(Clone, Debug, PartialEq)]
+    enum C {
+        Fora,
+        Botao,
+    }
+    let el: Element<C> = mouse_area(button(text("ok")).on_press(C::Botao).padding(10)).on_press_through(|_| C::Fora).into();
+    let n = h.node(&el);
+    let m = h.click(&el, centro(n.rect));
+    assert_eq!(m, [C::Fora, C::Botao]);
+}
+
+#[test]
+fn editor_so_leitura_anda_mas_nao_muda() {
+    let mut h = H::new();
+    let c = Content::with_text("fixo");
+    let el: Element<E> = text_editor(&c).read_only(true).on_change(E::Mudou).into();
+    h.desenhar(&el, None);
+    h.click(&el, Point::new(20.0, 20.0));
+    for (k, t) in [(Key::Character("x".into()), Some("x")), (nomeada(NamedKey::Backspace), None), (nomeada(NamedKey::Enter), None)] {
+        h.tecla(&el, k, t);
+    }
+    assert_eq!(c.text().trim_end(), "fixo");
+    h.tecla(&el, nomeada(NamedKey::End), None);
+    assert_eq!(c.cursor(), (1, 5));
+}
+
+#[test]
+fn editor_avisa_onde_clicou_e_busca_para_tras() {
+    let mut h = H::new();
+    let c = Content::with_text("um dois um\ntrês um");
+    let el: Element<E> = text_editor(&c).on_click(E::Clicou).into();
+    h.desenhar(&el, None);
+    let m = h.click(&el, Point::new(14.0, 15.0));
+    assert!(matches!(m.first(), Some(E::Clicou(1, _))), "{m:?}");
+    c.set_cursor(2, 9);
+    assert!(c.find_previous("um", true));
+    assert_eq!(c.cursor(), (2, 6));
+    assert!(c.find_previous("um", true));
+    assert_eq!(c.cursor(), (1, 9));
+    assert!(c.find_previous("um", true));
+    assert_eq!(c.cursor(), (1, 1));
+    // Do começo, volta ao fim do texto.
+    assert!(c.find_previous("um", true));
+    assert_eq!(c.cursor(), (2, 6));
+    assert!(!c.find_previous("zzz", true));
+}
+
+#[test]
+fn content_seleciona_e_move_o_cursor_pelo_app() {
+    let mut h = H::new();
+    let c = Content::with_text("ação\nsegunda linha");
+    let el: Element<E> = text_editor(&c).into();
+    h.desenhar(&el, None);
+    // Colunas em letras: "çã" são 4 bytes.
+    c.select((1, 2), (1, 4));
+    assert_eq!(c.selection().as_deref(), Some("çã"));
+    c.set_cursor(2, 8);
+    assert_eq!(c.cursor(), (2, 8));
+    assert_eq!(c.selection(), None);
+    c.select_all();
+    assert_eq!(c.selection().as_deref(), Some("ação\nsegunda linha"));
+    // Trocar a seleção: o autocompletar troca o prefixo pela palavra inteira.
+    c.select((2, 1), (2, 8));
+    c.insert("terceira");
+    assert_eq!(c.text().lines().nth(1), Some("terceira linha"));
 }
 
 #[test]
@@ -1027,4 +1175,28 @@ fn clique_direito_no_campo_mantem_o_foco() {
     assert!(foco.is_some());
     h.ev(&el, centro(r), Event::MousePressed(MouseButton::Right));
     assert_eq!(h.st.focus, foco);
+}
+
+#[test]
+fn lista_virtual_monta_so_o_que_aparece() {
+    let mut h = H::new();
+    let montou = std::cell::Cell::new(0usize);
+    let lista = || -> Element<usize> {
+        scrollable(virtual_list(10_000, 20.0, |i| {
+            montou.set(montou.get() + 1);
+            mouse_area(Space::new(Length::FILL, 20.0)).on_press(i).into()
+        }))
+        .into()
+    };
+    let el = lista();
+    let n = h.node(&el);
+    assert_eq!(n.children[0].rect.height, 200_000.0, "a rolagem vê a altura toda");
+    h.desenhar(&el, None);
+    assert!(montou.get() < 60, "montou {} linhas", montou.get());
+    // Rola 100 linhas para baixo; o clique cai na linha certa.
+    h.ev(&el, Point::new(100.0, 100.0), Event::Wheel { dx: 0.0, dy: -2000.0, modifiers: Modifiers::empty() });
+    let el = lista();
+    h.desenhar(&el, None);
+    assert_eq!(h.click(&el, Point::new(100.0, 50.0)), [102]);
+    assert!(montou.get() < 300, "montou {} linhas", montou.get());
 }

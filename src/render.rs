@@ -1507,6 +1507,12 @@ impl Renderer {
         self.clips.pop();
     }
 
+    /// A parte da janela que ainda aparece dentro dos recortes abertos (coordenadas lógicas);
+    /// sem recorte, `None` (a janela toda). Quem desenha muita coisa usa para pular o resto.
+    pub fn visible_rect(&self) -> Option<Rect> {
+        self.clips.last().map(|c| c.tela)
+    }
+
     /// `r` (lógico, com `folga` em volta para sombras) cai todo fora do recorte atual: quem
     /// desenha pode pular. Com camada ou transformação aberta, nunca (a área não bate).
     pub fn clipped_out(&self, r: Rect, folga: f32) -> bool {

@@ -185,6 +185,39 @@ impl Content {
         i.digitando = None;
     }
 
+    /// Leva o cursor à `linha` e `coluna` (as duas contando de 1, como [`Content::cursor`];
+    /// coluna em letras). Fora do texto, vai ao mais perto. Antes do primeiro desenho, só a linha vale.
+    pub fn set_cursor(&self, linha: usize, coluna: usize) {
+        self.select((linha, coluna), (linha, coluna));
+    }
+
+    /// Seleciona de `de` até `ate` (linha e coluna contando de 1, coluna em letras); o cursor
+    /// fica em `ate`. Com `de == ate`, só move o cursor.
+    pub fn select(&self, de: (usize, usize), ate: (usize, usize)) {
+        let mut i = self.0.borrow_mut();
+        let Some(ed) = i.ed.as_mut() else {
+            i.linha_inicial = Some(ate.0);
+            return;
+        };
+        let ponto = |ed: &mut Editor<'static>, (l, c): (usize, usize)| {
+            ed.with_buffer(|b| {
+                let linha = l.clamp(1, b.lines.len().max(1)) - 1;
+                let texto = b.lines.get(linha).map_or("", |x| x.text());
+                let byte = texto.char_indices().nth(c.saturating_sub(1)).map_or(texto.len(), |(b, _)| b);
+                Cursor::new(linha, byte)
+            })
+        };
+        let (a, z) = (ponto(ed, de), ponto(ed, ate));
+        ed.set_selection(if a == z { Selection::None } else { Selection::Normal(a) });
+        ed.set_cursor(z);
+        i.digitando = None;
+    }
+
+    /// Seleciona o texto todo (o Ctrl+A, pelo app: o "Selecionar tudo" de um menu).
+    pub fn select_all(&self) {
+        self.select((1, 1), (usize::MAX, usize::MAX));
+    }
+
     /// Põe `antes` e `depois` em volta da seleção (sem seleção, no cursor, que fica no meio).
     /// Se já estão lá, tira: o mesmo atalho liga e desliga. `inicio` diz onde o texto de uma linha
     /// começa (depois de um `## `, por exemplo): a seleção nunca começa antes disso.
@@ -334,6 +367,30 @@ impl Content {
         let Some((linha, a, z)) = achado else { return false };
         ed.set_selection(Selection::Normal(Cursor::new(linha, a)));
         ed.set_cursor(Cursor::new(linha, z));
+        true
+    }
+
+    /// Seleciona a ocorrência de `termo` antes da seleção (ou do cursor); do começo, volta ao fim.
+    /// `false` se não há nenhuma.
+    pub fn find_previous(&self, termo: &str, maiusculas: bool) -> bool {
+        let mut i = self.0.borrow_mut();
+        let Some(ed) = i.ed.as_mut() else { return false };
+        if termo.is_empty() {
+            return false;
+        }
+        let ate = ed.selection_bounds().map_or(ed.cursor(), |(ini, _)| ini);
+        let achado = ed.with_buffer(|b| {
+            let n = b.lines.len();
+            (0..=n).find_map(|k| {
+                let linha = (ate.line + n * 2 - k) % n;
+                let fim = if k == 0 { ate.index } else { usize::MAX };
+                let texto = b.lines[linha].text();
+                achar_antes(texto, termo, fim.min(texto.len()), maiusculas).map(|(a, z)| (linha, a, z))
+            })
+        });
+        let Some((linha, a, z)) = achado else { return false };
+        ed.set_selection(Selection::Normal(Cursor::new(linha, z)));
+        ed.set_cursor(Cursor::new(linha, a));
         true
     }
 
@@ -1065,6 +1122,30 @@ fn inline(texto: &str, desde: usize, l: &mut AttrsList, base: Attrs<'static>, t:
 }
 
 /// `termo` em `texto` a partir do byte `desde`: (início, fim) em bytes.
+/// A tecla muda o texto? (letra, Enter, apagar, Tab, colar, recortar, desfazer, refazer)
+fn edita(key: &Key, texto: Option<&str>, m: crate::Modifiers) -> bool {
+    let ctrl = m.control_key() || m.super_key();
+    match key {
+        Key::Named(NamedKey::Enter | NamedKey::Backspace | NamedKey::Delete | NamedKey::Tab) => true,
+        Key::Character(c) if ctrl => matches!(c.to_lowercase().as_str(), "v" | "x" | "z" | "y"),
+        _ => !ctrl && texto.is_some_and(|t| !t.is_empty() && t.chars().all(|c| !c.is_control())),
+    }
+}
+
+/// A última ocorrência de `termo` que termina até `ate` (byte), como [`achar`] mas para trás.
+fn achar_antes(texto: &str, termo: &str, ate: usize, maiusculas: bool) -> Option<(usize, usize)> {
+    let mut melhor = None;
+    let mut desde = 0;
+    while let Some((a, z)) = achar(texto, termo, desde, maiusculas) {
+        if z > ate {
+            break;
+        }
+        melhor = Some((a, z));
+        desde = texto[a..].chars().next().map_or(texto.len(), |c| a + c.len_utf8());
+    }
+    melhor
+}
+
 fn achar(texto: &str, termo: &str, desde: usize, maiusculas: bool) -> Option<(usize, usize)> {
     if maiusculas {
         return texto.get(desde..)?.find(termo).map(|a| (desde + a, desde + a + termo.len()));
@@ -1121,6 +1202,9 @@ pub struct TextEditor<'a, M> {
     warnings: Vec<Warning>,
     completions: Vec<String>,
     completion_sel: usize,
+    read_only: bool,
+    selection_color: Option<Color>,
+    on_click: Option<Box<dyn Fn(usize, usize) -> M + 'a>>,
     on_link: Option<Box<dyn Fn(String) -> M + 'a>>,
     colors: Option<Box<dyn Fn(&str) -> Vec<(std::ops::Range<usize>, Color)> + 'a>>,
     #[cfg(feature = "highlighter")]
@@ -1139,7 +1223,7 @@ pub struct Warning {
 /// Editor de várias linhas sobre um [`Content`]. Edita o conteúdo direto e avisa com
 /// `on_change` (para o app marcar "não salvo").
 pub fn text_editor<'a, M>(content: &'a Content) -> TextEditor<'a, M> {
-    TextEditor { content, size: 15.0, font: Font::DEFAULT, wrap: true, line_numbers: false, padding: Padding::from(12.0), on_change: None, style: None, autofocus: None, invisibles: false, markdown: false, line_height: None, placeholder: "", id: None, on_key: None, idle_focus: true, current_line: None, stripes: None, warnings: Vec::new(), completions: Vec::new(), completion_sel: 0, on_link: None, colors: None, #[cfg(feature = "highlighter")] highlight: None }
+    TextEditor { content, size: 15.0, font: Font::DEFAULT, wrap: true, line_numbers: false, padding: Padding::from(12.0), on_change: None, style: None, autofocus: None, invisibles: false, markdown: false, line_height: None, placeholder: "", id: None, on_key: None, idle_focus: true, current_line: None, stripes: None, warnings: Vec::new(), completions: Vec::new(), completion_sel: 0, read_only: false, selection_color: None, on_click: None, on_link: None, colors: None, #[cfg(feature = "highlighter")] highlight: None }
 }
 
 impl<'a, M> TextEditor<'a, M> {
@@ -1221,6 +1305,22 @@ impl<'a, M> TextEditor<'a, M> {
     /// mouse em cima. Trecho fora do texto é ignorado.
     pub fn warnings(mut self, w: Vec<Warning>) -> Self {
         self.warnings = w;
+        self
+    }
+    /// Só leitura: anda, seleciona e copia, mas não muda o texto (prévia, código de exemplo).
+    pub fn read_only(mut self, sim: bool) -> Self {
+        self.read_only = sim;
+        self
+    }
+    /// Cor da seleção (padrão: a primária do tema, mais apagada sem foco).
+    pub fn selection_color(mut self, c: Color) -> Self {
+        self.selection_color = Some(c);
+        self
+    }
+    /// Clique no texto: manda `f(linha, coluna)`, as duas contando de 1 (coluna em letras),
+    /// depois de o cursor ir para lá.
+    pub fn on_click(mut self, f: impl Fn(usize, usize) -> M + 'a) -> Self {
+        self.on_click = Some(Box::new(f));
         self
     }
     /// Lista de sugestões colada no cursor (o autocompletar), com `selecionada` realçada. O app
@@ -1602,7 +1702,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                 cx.renderer.fill_quad(Rect { x: area.x, y, width: area.width, height: h }, Some(&tom.into()), Border::default(), None);
             }
         }
-        let cor_selecao = cx.theme.primary.alpha(if focado { 0.30 } else { 0.18 });
+        let cor_selecao = self.selection_color.unwrap_or(cx.theme.primary).alpha(if focado { 0.30 } else { 0.18 });
         for r in &realces {
             cx.renderer.fill_quad(*r, Some(&cor_selecao.into()), Border::default(), None);
         }
@@ -1856,7 +1956,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                 cx.redraw = true;
                 Captured::Yes
             }
-            Event::MousePressed(MouseButton::Left) if self.markdown && mais.is_some() => {
+            Event::MousePressed(MouseButton::Left) if self.markdown && mais.is_some() && !self.read_only => {
                 let (k, linhas, colunas) = mais.expect("conferido");
                 cx.states.focus = Some(n.key);
                 if k == 0 {
@@ -1929,7 +2029,7 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                 let c = ed.cursor();
                 // Clique na caixinha desenhada: marca/desmarca. O cursor fica no clique: voltar para onde estava
                 // (às vezes fora da tela) fazia a tela rolar até ele.
-                let caixa = (self.markdown && vezes == 1).then(|| ed.with_buffer(|b| caixa_da_linha(b.lines[c.line].text()))).flatten();
+                let caixa = (self.markdown && vezes == 1 && !self.read_only).then(|| ed.with_buffer(|b| caixa_da_linha(b.lines[c.line].text()))).flatten();
                 let caixa = caixa.filter(|&(k, _)| (k..=k + 3).contains(&c.index));
                 cx.states.get_mut::<Mouse>(n.key).caixa = caixa.is_some();
                 if let Some((k, marcada)) = caixa {
@@ -1941,6 +2041,13 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                     });
                 }
                 i.digitando = None;
+                if let Some(f) = &self.on_click {
+                    let (l, col) = i.ed.as_ref().expect("montado acima").with_buffer(|b| {
+                        let c = i.ed.as_ref().expect("montado acima").cursor();
+                        (c.line + 1, b.lines.get(c.line).map_or(0, |x| x.text()[..c.index.min(x.text().len())].chars().count()) + 1)
+                    });
+                    cx.publish(f(l, col));
+                }
                 Captured::Yes
             }
             Event::CursorMoved(p) if cx.states.get::<Mouse>(n.key).is_some_and(|m| m.arrastando) => {
@@ -1975,6 +2082,8 @@ impl<M: Clone> Widget<M> for TextEditor<'_, M> {
                 Captured::Yes
             }
             Event::Key { key, modifiers, pressed: true, .. } if focado && self.on_key.as_ref().and_then(|f| f(key, *modifiers)).map(|m| cx.publish(m)).is_some() => Captured::Yes,
+            // Só leitura: a tecla que mudaria o texto é engolida; setas, seleção e Ctrl+C seguem.
+            Event::Key { key, text, modifiers, pressed: true } if focado && self.read_only && edita(key, text.as_deref(), *modifiers) => Captured::Yes,
             Event::Key { key, text, modifiers, pressed: true } if focado => self.tecla(&mut i, key, text.as_deref(), *modifiers, cx),
             _ => Captured::No,
         };

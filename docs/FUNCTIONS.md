@@ -124,6 +124,9 @@ O trabalho que o `update` devolve. Futuros e fluxos rodam no tokio, fora da thre
 | `Task::scroll_to(id, offset)` | `impl Hash`, `Point` | Rola o `scrollable(..).id(id)` até o deslocamento (lógico; `f32::INFINITY` = o fim). |
 | `Task::snap_to(id, rel)` | `impl Hash`, `Point` | Rola até a fração (0 = começo, 1 = fim) de cada eixo. |
 | `Task::focus(id)` | `impl Hash` | Foco no `text_input(..).id(id)` ou `text_editor(..).id(id)` (já desenhado). |
+| `Task::select_all(id)` | `impl Hash` | Foca o `text_input` com o texto todo selecionado: digitar troca o valor (renomear). |
+| `Task::move_cursor(id, pos)` | `impl Hash`, `usize` | Foca o campo com o cursor no byte `pos` do valor (passa do fim, vai ao fim). |
+| `Task::select_range(id, de, ate)` | `impl Hash`, `usize`, `usize` | Foca o campo com os bytes `de..ate` selecionados. |
 | `Task::write_clipboard(texto)` | `impl Into<String>` | Copia para a área de transferência. |
 | `Task::read_clipboard(f)` | `FnOnce(Option<String>) -> M` | Lê a área de transferência e manda `f(texto)`. |
 | `Task::window_handle(id, f)` | `WindowId`, `FnOnce(RawWindowHandle) -> M` | Chama `f` na thread da janela com a alça crua dela (`pelicano::raw_window_handle`): id X11, subclasse no Windows. Antes de ela abrir, espera. |
@@ -369,6 +372,8 @@ stack(children) -> Stack      // ou stack![a, b]
 ```
 
 Camadas umas sobre as outras. A última fica por cima e recebe os eventos primeiro. Métodos: `.push(e)`, `.width(l)` e `.height(l)`.
+`.fit_base()`: as camadas de cima ficam do tamanho da de baixo. Sem ele, uma camada `Length::FILL` (o traço embaixo de
+uma aba) pega todo o espaço que sobra na linha e empurra os vizinhos para fora.
 
 ### `opaque`
 
@@ -390,6 +395,13 @@ A posição da rolagem fica guardada sozinha entre quadros.
 | `.id(id)` | O nome para `Task::scroll_to` / `Task::snap_to`. |
 | `.on_scroll(f)` | `Fn(Viewport) -> M`: avisa cada mudança. `Viewport { offset, bounds, content }` e `.relative()` (0 a 1). |
 
+### `virtual_list`
+
+`virtual_list(n, altura, |i| -> Element) -> VirtualList`: `n` linhas de altura fixa que só monta as que
+aparecem. Ponha dentro de um `scrollable`: ele vê a altura toda (`n × altura`), mas cada quadro chama `linha(i)`
+só para as linhas à vista. Cada linha guarda o próprio estado pelo índice. `.width(l)` (padrão `Length::FILL`).
+Para desenhar só o visível, `Renderer::visible_rect()` dá a parte da janela que ainda aparece dentro dos recortes.
+
 ### `image` e `Image`
 
 | Função | Entrada | Saída |
@@ -407,17 +419,35 @@ A posição da rolagem fica guardada sozinha entre quadros.
 
 `Svg::from_bytes(bytes) -> Option<Svg>`, `svg.size() -> Size` e `svg(s) -> SvgView`.
 `SvgView`: `.width(l)`, `.height(l)` e `.color(Color)` (pinta tudo nessa cor, mantendo o alfa; bom para ícones).
+`.current_color()` pinta na cor do texto em volta (o `currentColor` do CSS): dentro de um botão, o ícone acompanha o
+hover e o desabilitado como o rótulo.
 O SVG é analisado uma vez, e a rasterização fica em cache por tamanho e cor. Maior que 2048² pixels (zoom), só a
 parte à mostra é rasterizada, sem cache; o mesmo vale para imagem esticada além de 4096².
 
 ### `progress_bar`
 
 `progress_bar(range: RangeInclusive<f32>, value: f32) -> ProgressBar`. Fora do intervalo, a barra fica vazia ou cheia.
-Métodos: `.width(l)`, `.height(f32)` e `.color(Color)`.
+Métodos: `.width(l)`, `.height(f32)`, `.color(Color)`, `.track(Color)` (a parte vazia; padrão: o texto do tema a 12%) e
+`.radius(f32)` (padrão: metade da altura).
 
 ### `tooltip`
 
-`tooltip(content, dica: impl Into<Cow<str>>, TooltipPosition::Top | Bottom | Left | Right) -> Tooltip`: mostra a dica com o mouse em cima. `.style(Fn(&Theme) -> Style)` troca a caixa do balão (fundo, borda, sombra, `text_color`) e `.padding(..)` o espaço em volta do texto (padrão 4 × 8).
+`tooltip(content, dica: impl Into<Cow<str>>, TooltipPosition::Top | Bottom | Left | Right) -> Tooltip`: mostra a dica com o mouse em cima. `.style(Fn(&Theme) -> Style)` troca a caixa do balão (fundo, borda, sombra, `text_color`) e `.padding(..)` o espaço em volta do texto (padrão 4 × 8). `.text_size(f32)` (padrão 12) e `.max_width(f32)` (padrão 320)
+mudam a letra e onde ela quebra. `.meter(rótulo, fração, valor)` põe uma barra embaixo do texto (rótulo à esquerda,
+valor à direita, cheia na cor de perigo acima de 90%); chame mais vezes para várias barras.
+
+### `context_menu` (menu flutuante)
+
+```rust
+context_menu(itens: Vec<MenuItem<M>>, canto: Point, fechar: M) -> Element      // M: Clone
+menu_item(rotulo, msg) -> MenuItem          // .shortcut("Ctrl+S"), .checked(bool), .disabled()
+menu_separator(titulo) -> MenuItem          // a linha entre grupos; título vazio = só a linha
+```
+
+O menu do botão direito (ou de um botão da barra) com o canto de cima à esquerda em `canto` (posição na janela; o
+`on_right_press_at` do `mouse_area` dá o ponto). Ponha por último num `stack` da janela inteira. Perto da borda, abre
+para dentro; clique fora manda `fechar`; o Esc fica com o app. Largura 250, item de 27 px, visto à esquerda, atalho à
+direita, desabilitado apagado.
 
 ### `canvas`
 
@@ -545,6 +575,8 @@ Estilos prontos: `button_primary` (padrão: cor primária, mais clara no hover e
 `mouse_area(content) -> MouseArea`: dá cliques a qualquer coisa.
 Métodos: `.on_press(m)`, `.on_release(m)`, `.on_right_press(m)`, `.on_double_click(m)` (até 400 ms; use para maximizar pela barra de título) e `.cursor_icon(CursorIcon)`.
 Mais: `.on_enter(m)` e `.on_exit(m)` (o mouse entrou ou saiu), `.on_move(Fn(Point) -> M)` e `.on_scroll(Fn(dx, dy, Modifiers) -> M)` (pega a roda: o scrollable de fora não rola).
+`.on_press_through(Fn(Point) -> M)`: qualquer clique em cima avisa com o ponto **antes** do filho, e o filho recebe o
+clique também (o editor pega o clique esquerdo antes de um `on_press`; assim o app sabe que lado foi clicado).
 
 ### `text_input`
 
@@ -565,6 +597,8 @@ O campo não guarda o texto: o app guarda e passa de volta em `value` a cada `vi
 | `.style(f)` | `Fn(&Theme, Status) -> Style`. Padrão: `input_default`. |
 
 Teclas: setas, Home, End, Backspace, Delete, Enter (submit), Esc (tira o foco) e Ctrl+C/X/V (copia e recorta o campo todo). Clicar fora tira o foco.
+Tab e Shift+Tab andam pelos campos com `on_input`, na ordem da tela, dando a volta. Só com o foco num campo: o Tab
+solto continua indo para o `on_unhandled_event` do app.
 
 ### `text_editor` e `Content`
 
@@ -590,6 +624,9 @@ Enche o espaço; dentro de um `scrollable` (sem limite), fica com 400 × 300.
 | `.line_height(f32)` | Altura da linha em pixels lógicos. Padrão: 1,45 × o tamanho. |
 | `.placeholder(&str)` | O texto apagado do editor vazio. |
 | `.on_key(f)` | `Fn(&Key, Modifiers) -> Option<M>`: vê cada tecla antes do editor (com foco). `Some(msg)` manda a mensagem e o editor ignora a tecla (Tab que recua, Enter que envia). |
+| `.read_only(bool)` | Anda, seleciona e copia, mas não muda o texto (letras, Enter, apagar, Tab, colar, desfazer são engolidos). |
+| `.selection_color(Color)` | Cor da seleção (padrão: a primária do tema, mais apagada sem foco). |
+| `.on_click(f)` | `Fn(linha, coluna) -> M`, contando de 1: o clique no texto, depois de o cursor ir para lá. |
 | `.completions(itens, selecionada)` | `Vec<String>`, `usize`: lista de sugestões colada no cursor (autocompletar), com a escolhida realçada; mostra até 8 e acompanha a escolhida. O app filtra as palavras e trata as teclas no `on_key`. Vazia, não aparece. |
 | `.highlight(ext, Highlight)` | Cores de código pela extensão (`"rs"`, `"py"`…). Precisa da feature `highlighter` (syntect). Temas: `Highlight::ALL`. |
 | `.style(f)` | `Fn(&Theme, Status) -> Style`. |
@@ -618,10 +655,26 @@ Teclas: setas (com Ctrl, anda por palavra), Home e End (com Ctrl, início e fim 
 | `.count_chars(f)` | `Fn(char) -> bool` | quantos caracteres passam |
 | `.find_char(f)` | `Fn(char) -> bool` | seleciona o próximo que passa. `false` se nenhum. |
 | `.find_next(termo, maiusculas)` | `&str`, `bool` | seleciona a próxima ocorrência. `false` se nenhuma. |
+| `.find_previous(termo, maiusculas)` | `&str`, `bool` | seleciona a anterior (antes da seleção); do começo, volta ao fim. |
+| `.set_cursor(linha, coluna)` | as duas contando de 1, coluna em letras | leva o cursor; fora do texto, ao mais perto |
+| `.select(de, ate)` | `(linha, coluna)` cada | seleciona; o cursor fica em `ate`. `insert` depois troca a seleção |
+| `.select_all()` | — | seleciona tudo (o "Selecionar tudo" de um menu) |
 | `.replace_next(termo, novo, maiusculas)` | — | troca a seleção atual e seleciona a próxima. `bool` |
 | `.replace_all(termo, novo, maiusculas)` | — | `usize`: quantas trocou (um passo só no desfazer) |
 
 `is_invisible(c: char) -> bool`: caractere que não aparece ou parece um espaço comum (controles, larguras zero, BOM, NBSP). Tab e quebra de linha não contam.
+
+### `terminal` e `Terminal` (feature `terminal`)
+
+`Terminal::new(TerminalSettings)` abre um shell de verdade num PTY (o motor do Alacritty); `terminal(&t)` mostra.
+Clique dá o foco; com foco, o teclado vai para o programa (Ctrl+Shift+C/V copiam e colam, Shift+PageUp/PageDown rolam).
+`t.subscription()` traz os eventos (saída nova, título, fim), `t.write(bytes)` escreve no programa, `t.selection()` e
+`t.screen_text()` leem o texto.
+
+`TerminalView`: `.size(f32)`, `.font(Font)`, `.text_color(Color)`, `.background(Color)`, `.palette([Color; 16])`,
+`.padding(f32)`, `.id(id)` (para `Task::focus`) e `.on_link(Fn(String) -> M)`: Ctrl+clique numa palavra que parece link
+(tem `://`, `/` ou `.`, como `https://…` ou `src/main.rs:42:5`) manda a palavra, sem aspas, parênteses e pontuação do
+fim. O app decide o que abrir. `palavra_em(linha, coluna)` é a mesma regra, para testar.
 
 ### `checkbox`, `toggler`, `radio` (`Toggle`)
 
@@ -633,7 +686,9 @@ radio(label, value: V, selected: Option<V>, on_select: impl Fn(V) -> M) -> Toggl
 
 `checkbox` e `toggler`: `.on_toggle(Fn(bool) -> M)` recebe o novo valor.
 `radio`: aparece marcado quando `selected == Some(value)`, e o clique manda `on_select(value)`.
-Todos: `.size(Num)` e `.color(Color)` (a cor de quando está marcado).
+Todos: `.size(Num)` e `.color(Color)` (a cor de quando está marcado). Mais: `.border_color(Color)` (aro, ou trilho da chave,
+desmarcado), `.background(Color)` (fundo da caixa e do rádio), `.text_color(Color)` (o rótulo), `.spacing(f32)` (entre a
+marca e o rótulo; padrão 8) e `.box_size(f32)` (lado da caixa e do rádio, padrão 16; altura da chave, padrão 18).
 
 ### `pick_list`
 
