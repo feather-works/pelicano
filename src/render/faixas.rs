@@ -370,14 +370,21 @@ impl Faixa<'_> {
         // texels opacos, o bilinear em bytes já é o resultado (decodificar e codificar de volta dá o
         // mesmo nível), sem a conta em linear por pixel. As colunas são as mesmas em toda linha:
         // calculadas uma vez. A borda e os texels translúcidos seguem pela conta geral.
-        if let Some(pm) = pm.filter(|_| tipo == 2.0 && cor[3] >= 1.0 && raios == [0.0; 4]) {
+        // A nítida (tipo 4) pelo mesmo caminho: os dois texels são o mesmo e o peso é 0.
+        let nitida = tipo == 4.0;
+        if let Some(pm) = pm.filter(|_| (tipo == 2.0 || nitida) && cor[3] >= 1.0 && raios == [0.0; 4]) {
             let (iw, ih) = (pm.width() as i64, pm.height() as i64);
-            // Como o `bilinear`: u = (c - dst.x) / dst.w; t = u * w - 0,5.
+            // Como o `bilinear`: u = (c - dst.x) / dst.w; t = u * w - 0,5 (a nítida: o texel de u * w).
             let eixo = |c: f32, o: f32, tam: f32, n: i64| {
+                if nitida {
+                    let i = ((c - o) / tam * n as f32).floor().clamp(0.0, (n - 1) as f32) as usize;
+                    return (i, i, 0.0);
+                }
                 let t = (c - o) / tam * n as f32 - 0.5;
                 let i = t.floor() as i64;
                 (i.clamp(0, n - 1) as usize, (i + 1).clamp(0, n - 1) as usize, t - t.floor())
             };
+            let amostrar = |pm: &Pixmap, u: f32, v: f32| if nitida { nitido(pm, u, v) } else { bilinear(pm, u, v) };
             let colunas: Vec<(usize, usize, f32)> = xs.clone().map(|x| eixo(x as f32 + 0.5, dst[0], dst[2], iw)).collect();
             // Miolo: o pixel todo dentro da imagem (cobertura 1).
             let (mx0, mx1) = ((dst[0].ceil() as i64).max(xs.start as i64), ((dst[0] + dst[2]).floor() as i64).min(xs.end as i64));
@@ -409,7 +416,7 @@ impl Faixa<'_> {
                     lentos += 1;
                     let corte = recorte(c, rec);
                     if corte > 0.0 {
-                        let s = mul(linear_pre(bilinear(pm, (c[0] - dst[0]) / dst[2], (c[1] - dst[1]) / dst[3])), cobertura(dst, raios, c));
+                        let s = mul(linear_pre(amostrar(pm, (c[0] - dst[0]) / dst[2], (c[1] - dst[1]) / dst[3])), cobertura(dst, raios, c));
                         self.misturar(x, y, mul(s, corte));
                     }
                 }
@@ -426,9 +433,11 @@ impl Faixa<'_> {
                 if corte == 0.0 {
                     continue;
                 }
-                let saida = if tipo == 2.0 {
+                let saida = if tipo == 2.0 || nitida {
                     let Some(pm) = pm else { return };
-                    mul(linear_pre(bilinear(pm, (c[0] - dst[0]) / dst[2], (c[1] - dst[1]) / dst[3])), cor[3] * cobertura(dst, raios, c))
+                    let (u, v) = ((c[0] - dst[0]) / dst[2], (c[1] - dst[1]) / dst[3]);
+                    let t = if nitida { nitido(pm, u, v) } else { bilinear(pm, u, v) };
+                    mul(linear_pre(t), cor[3] * cobertura(dst, raios, c))
                 } else {
                     let (lx, ly) = ((c[0] - dst[0]).floor() as i64, (c[1] - dst[1]).floor() as i64);
                     let t = if tex == DO_ATLAS { do_atlas(l, uv, dst, lx, ly) } else { texel(pm.expect("conferido acima"), uv[0] as i64 + lx, uv[1] as i64 + ly) };
@@ -643,6 +652,12 @@ fn texel(pm: &Pixmap, x: i64, y: i64) -> V4 {
     let i = (y as usize * pm.width() as usize + x as usize) * 4;
     let d = pm.data();
     [d[i], d[i + 1], d[i + 2], d[i + 3]].map(|v| v as f32 / 255.0)
+}
+
+/// O texel em que (u, v) cai (`u`/`v` de 0 a 1), sem suavizar: a imagem nítida.
+fn nitido(pm: &Pixmap, u: f32, v: f32) -> V4 {
+    let (w, h) = (pm.width() as f32, pm.height() as f32);
+    texel(pm, (u * w).floor().clamp(0.0, w - 1.0) as i64, (v * h).floor().clamp(0.0, h - 1.0) as i64)
 }
 
 /// Bilinear com a borda repetida (o amostrador padrão), `u`/`v` de 0 a 1.

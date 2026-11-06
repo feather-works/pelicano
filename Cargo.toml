@@ -1,6 +1,6 @@
 [package]
 name = "pelicano"
-version = "0.1.31"
+version = "0.1.32"
 description = "GUI library of the FeatherWorks suite: its own widgets, layout and window, drawn on the CPU with tiny-skia"
 authors = ["FeatherWorks"]
 edition = "2021"

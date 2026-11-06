@@ -1275,7 +1275,27 @@ impl Renderer {
     }
 
     /// Imagem sem suavizar: cada pixel dela vira um bloco (página de PDF 1:1, pixel art, zoom).
+    /// Sem transformação vai para a GPU (que estica os blocos); girada ou maior que a textura, CPU.
     pub fn draw_image_nearest(&mut self, img: &Image, r: Rect) {
+        if !self.transformacoes.last().is_none_or(|t| t.is_identity()) || img.0.width().max(img.0.height()) > self.gpu.max_textura {
+            return self.imagem_transformada(img, r, FilterQuality::Nearest);
+        }
+        let mut k = Chave::new(13);
+        k.h(img.1).r(r);
+        if self.imagens_opacas.len() > 4096 {
+            self.imagens_opacas.clear();
+        }
+        if *self.imagens_opacas.entry(img.1).or_insert_with(|| img.0.pixels().iter().all(|p| p.alpha() == 255)) {
+            self.opaco = Some(r);
+        }
+        if self.gravou(r, k) {
+            return;
+        }
+        if self.pintando_gpu {
+            let s = self.scale;
+            let (x, y, w, h) = ((r.x * s).round(), (r.y * s).round(), (r.width * s).round(), (r.height * s).round());
+            return self.imagem_gpu_nitida(img.1, &img.0, [x, y, w, h]);
+        }
         self.imagem_transformada(img, r, FilterQuality::Nearest);
     }
 

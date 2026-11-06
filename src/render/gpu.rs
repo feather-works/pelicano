@@ -139,7 +139,7 @@ impl Lista {
         .extend_from_slice(dados);
     }
 
-    /// Um retângulo texturizado (`tipo`: 0 máscara do atlas, 1 glifo colorido, 2 imagem suavizada).
+    /// Um retângulo texturizado (`tipo`: 0 máscara do atlas, 1 glifo colorido, 2 imagem suavizada, 4 imagem nítida).
     #[allow(clippy::too_many_arguments)]
     /// `uv`: onde no atlas e o índice do bitmap do glifo.
     fn textura(&mut self, textura: u64, dst: [f32; 4], uv: [f32; 3], cor: [f32; 4], raios: [f32; 4], tipo: f32, rec: &[f32; 12]) {
@@ -368,6 +368,19 @@ impl Renderer {
         }
         let op = self.opacidade;
         self.gpu.textura(id, dst, [0.0; 3], [1.0, 1.0, 1.0, op], raios, 2.0, &rec);
+    }
+
+    /// Imagem sem suavizar esticada em `dst` (pixels): cada texel vira um bloco.
+    pub(super) fn imagem_gpu_nitida(&mut self, id: u64, pm: &Arc<Pixmap>, dst: [f32; 4]) {
+        let rec = self.recorte_gpu();
+        if !cruza(dst, &rec) {
+            return;
+        }
+        if self.gpu.vistas.insert(id) {
+            self.gpu.usadas.push((id, pm.clone()));
+        }
+        let op = self.opacidade;
+        self.gpu.textura(id, dst, [0.0; 3], [1.0, 1.0, 1.0, op], [0.0; 4], 4.0, &rec);
     }
 
     /// Cada reta uma cápsula (pontas redondas: as junções saem da sobreposição). Lógicos.
@@ -1048,6 +1061,12 @@ struct GlifoOut {
     } else if q.params.x == 2.0 {
         // Imagem: suavizada (bilinear, como o `escalar` da CPU) e com os cantos.
         let t = textureSampleLevel(tex, amostra, (c - q.dst.xy) / q.dst.zw, 0.0);
+        saida = linear_pre(t) * q.cor.a * cobertura(q.dst, q.raios, c);
+    } else if q.params.x == 4.0 {
+        // Imagem nítida: o texel em que o meio do pixel cai, inteiro (pixel art esticada em blocos).
+        let tam = vec2<f32>(textureDimensions(tex));
+        let p = clamp(floor((c - q.dst.xy) / q.dst.zw * tam), vec2<f32>(0.0), tam - vec2<f32>(1.0));
+        let t = textureLoad(tex, vec2<i32>(p), 0);
         saida = linear_pre(t) * q.cor.a * cobertura(q.dst, q.raios, c);
     } else {
         // Glifo: pixel a pixel do atlas.

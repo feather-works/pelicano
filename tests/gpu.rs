@@ -98,6 +98,17 @@ fn imagem() {
     });
 }
 
+/// Imagem nítida (pixel art) esticada em blocos: a mesma na CPU, nas faixas e na GPU, e sem cair na CPU.
+#[test]
+fn imagem_nitida() {
+    let px: Vec<u8> = (0..16 * 9).flat_map(|i| [(i * 37 % 256) as u8, (i * 91 % 256) as u8, (i * 13 % 256) as u8, 255]).collect();
+    let img = Image::from_rgba(16, 9, px).expect("tamanho confere");
+    comparar("imagem nítida", Size::new(160.0, 120.0), 1.0, 2, 0.0, |r| {
+        r.draw_image_nearest(&img, Rect { x: 0.0, y: 0.0, width: 64.0, height: 36.0 });
+        r.draw_image_nearest(&img, Rect { x: 70.0, y: 40.0, width: 80.0, height: 45.0 });
+    });
+}
+
 #[test]
 fn linha_grossa() {
     comparar("linha", Size::new(200.0, 150.0), 1.0, 40, 0.01, |r| {
