@@ -24,6 +24,9 @@ impl Font {
     pub const BOLD: Font = Font { family: None, weight: 700, italic: false };
     pub const MONO: Font = Font { family: Some("monospace"), weight: 400, italic: false };
     pub const SERIF: Font = Font { family: Some("serif"), weight: 400, italic: false };
+    /// A sem serifa do sistema, mesmo depois de [`set_default_family`] trocar a padrão
+    /// (ex.: o texto das células de uma planilha, que segue o arquivo e não a interface).
+    pub const SYSTEM_SANS: Font = Font { family: Some("sans-serif"), weight: 400, italic: false };
 
     /// A família pelo nome (do sistema ou carregada com [`load_font`]).
     pub const fn with_name(nome: &'static str) -> Font {
@@ -45,17 +48,32 @@ pub(crate) fn attrs(f: Font) -> Attrs<'static> {
         None => Family::SansSerif,
         Some("monospace") => Family::Monospace,
         Some("serif") => Family::Serif,
+        Some("sans-serif") => match SANS_DO_SISTEMA.get() {
+            Some(nome) => Family::Name(nome.as_str()),
+            None => Family::SansSerif,
+        },
         Some(nome) => Family::Name(nome),
     };
     Attrs::new().weight(Weight(f.weight)).family(familia).style(if f.italic { cosmic_text::Style::Italic } else { cosmic_text::Style::Normal })
 }
 
 static FONTES_EXTRA: std::sync::Mutex<Vec<Arc<Vec<u8>>>> = std::sync::Mutex::new(Vec::new());
+static FAMILIA_PADRAO: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+/// O nome que o sistema dava à sem serifa antes de [`set_default_family`] (para [`Font::SYSTEM_SANS`]).
+static SANS_DO_SISTEMA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Registra uma fonte (TTF/OTF, ou coleção) para todas as janelas; depois é só pedir pelo nome
 /// da família com [`Font::with_name`]. Vale do próximo quadro em diante.
 pub fn load_font(bytes: impl Into<Vec<u8>>) {
     FONTES_EXTRA.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(bytes.into()));
+}
+
+/// Troca a família do texto que não pede nenhuma ([`Font::DEFAULT`], texto rico, editor) em
+/// todas as janelas, do próximo quadro em diante. Normalmente uma fonte de [`load_font`]:
+/// a interface inteira passa a usá-la, e o que faltar nela cai nas fontes do sistema.
+/// [`Font::SYSTEM_SANS`] continua sendo a sem serifa do sistema.
+pub fn set_default_family(nome: &'static str) {
+    *FAMILIA_PADRAO.lock().unwrap_or_else(|e| e.into_inner()) = Some(nome);
 }
 
 impl Default for Font {
@@ -272,6 +290,8 @@ pub struct Renderer {
     proprios: Cache<u64, Buffer>,
     /// Quantas de [`load_font`] já estão no banco.
     fontes_carregadas: usize,
+    /// A de [`set_default_family`] que já está no banco como sem serifa.
+    familia_aplicada: Option<&'static str>,
     /// [`crate::Settings::text_cache`]: os textos ficam de um quadro para o outro.
     pub(crate) cache_textos: bool,
     svgs: Cache<SvgKey, Arc<Pixmap>>,
@@ -390,6 +410,7 @@ impl Renderer {
             texts: Cache::default(),
             proprios: Cache::default(),
             fontes_carregadas: 0,
+            familia_aplicada: None,
             cache_textos: false,
             svgs: Cache::default(),
             caminhos: Cache::default(),
@@ -771,7 +792,7 @@ impl Renderer {
     /// A chave com o que muda o resultado sem estar no desenho: opacidade, fontes, camadas, recortes.
     fn chave_final(&self, mut k: Chave) -> u64 {
         // Fonte nova muda as letras de todas as janelas, sem mudar o que elas desenham.
-        k.f(self.opacidade).h(self.fontes_carregadas);
+        k.f(self.opacidade).h(self.fontes_carregadas).h(self.familia_aplicada);
         for c in &self.camadas {
             k.h(c.chave);
         }
@@ -914,6 +935,18 @@ impl Renderer {
     /// Põe no banco as fontes de [`load_font`] que ainda não estão; com fonte nova, os textos
     /// medidos com a antiga (que caiu numa substituta) saem do cache.
     fn carregar_fontes(&mut self) {
+        let familia = *FAMILIA_PADRAO.lock().unwrap_or_else(|e| e.into_inner());
+        if familia != self.familia_aplicada {
+            let db = self.fonts.db_mut();
+            let sistema = db.family_name(&cosmic_text::fontdb::Family::SansSerif).to_owned();
+            let _ = SANS_DO_SISTEMA.set(sistema);
+            if let Some(nome) = familia {
+                db.set_sans_serif_family(nome);
+            }
+            self.familia_aplicada = familia;
+            self.texts.clear();
+            self.proprios.clear();
+        }
         let extra = FONTES_EXTRA.lock().unwrap_or_else(|e| e.into_inner());
         if extra.len() == self.fontes_carregadas {
             return;

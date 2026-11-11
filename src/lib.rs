@@ -37,7 +37,7 @@ pub use futures;
 /// A alça crua da janela ([`Task::window_handle`]).
 pub use winit::raw_window_handle;
 pub use render::vetor::{FillRule, LineCap, LineJoin, Path, PathBuilder, Segment, Stroke, Transform};
-pub use render::{load_font, Changes, Font, Image, Renderer, Svg};
+pub use render::{load_font, set_default_family, Changes, Font, Image, Renderer, Svg};
 #[doc(hidden)]
 pub use render::gpu::GpuOffscreen;
 pub use controls::*;

@@ -296,11 +296,12 @@ Quebra linha sozinho na largura disponível. Sem `.color`, usa a cor herdada do 
 ### `Font`
 
 Campos `family: Option<&'static str>` (`None` = sem serifa do sistema), `weight: u16` e `italic: bool`.
-Constantes: `Font::DEFAULT` (400), `MEDIUM` (500), `SEMIBOLD` (600), `BOLD` (700), `MONO` e `SERIF`.
+Constantes: `Font::DEFAULT` (400), `MEDIUM` (500), `SEMIBOLD` (600), `BOLD` (700), `MONO`, `SERIF` e `SYSTEM_SANS` (a sem serifa do sistema).
 `Font::with_name("Liberation Serif")` pede uma família pelo nome; `.weight(700)` e `.italic()` mudam o resto.
 
 `load_font(bytes)` registra uma fonte (TTF, OTF ou coleção) para o app inteiro, a partir do próximo quadro.
 Depois é só pedir pelo nome da família com `Font::with_name`.
+`set_default_family("Nome")` torna essa família a padrão de tudo que não pede outra (`Font::DEFAULT`, texto rico, editor); o que faltar nela cai nas fontes do sistema. `Font::SYSTEM_SANS` continua sendo a sem serifa do sistema.
 
 ### `rich_text` e `span`
 
