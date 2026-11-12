@@ -49,6 +49,10 @@ Ordem: FeatherCode → FeatherDocs → FeatherPDF → FeatherSlide → FeatherSh
   imagem sem suavizar.
 - Sombra só aproximada; só o recorte arredondado mais de dentro corta os cantos.
 - Testar à mão rolar e redimensionar na GPU.
+- Feito (12/11, #7): rodada cuja instância do wgpu não tem backend (Intel Ivy Bridge no Linux: sem
+  Vulkan e com o contexto OpenGL recusado) é pulada antes do `create_surface`, que entrava em
+  pânico; a janela abre pela CPU. Conferido só simulando a instância vazia; falta a confirmação
+  de quem tem a placa, e publicar a versão para o FeatherSheet e o Launcher.
 
 ## Desempenho
 

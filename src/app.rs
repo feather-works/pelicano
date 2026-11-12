@@ -109,7 +109,8 @@ pub struct Settings {
     /// Desenha na GPU (o padrão). Sem placa de vídeo de verdade (só um rasterizador em software,
     /// como o llvmpipe), ou com `PELICANO_GPU=0`, desenha na CPU; `PELICANO_GPU=1` força a GPU.
     /// O quadro com algo que a GPU ainda não faz (camada, vidro, curva) sai na CPU sozinho.
-    /// Sem aparelho gráfico nenhum (ou `PELICANO_GPU=nenhuma`), a janela é mostrada sem wgpu.
+    /// Sem aparelho gráfico nenhum, com o driver recusando Vulkan e OpenGL (Intel Ivy Bridge no
+    /// Linux), ou com `PELICANO_GPU=nenhuma`, a janela é mostrada sem wgpu.
     pub gpu: bool,
 }
 
@@ -1597,6 +1598,13 @@ const SHADER: &str = r#"
 }
 "#;
 
+/// A rodada tem com o que trabalhar? Sem backend nenhum na instância (o driver recusou o contexto
+/// OpenGL, como na Intel Ivy Bridge), o `create_surface` do wgpu 0.19 entra em pânico em vez de
+/// devolver `Err` (pelicano#7): a rodada é pulada antes, e sem nenhuma a janela mostra pela CPU.
+fn tem_adaptador(instance: &wgpu::Instance, backends: wgpu::Backends) -> bool {
+    !instance.enumerate_adapters(backends).is_empty()
+}
+
 impl Gpu {
     /// O aparelho, escolhido para a primeira janela, e a tela dela.
     fn new(w: Arc<Window>, transparente: bool, pintar: bool) -> Result<(Self, Tela), String> {
@@ -1608,6 +1616,9 @@ impl Gpu {
         let reserva = if cfg!(windows) { wgpu::Backends::empty() } else { wgpu::Backends::GL };
         for backends in [wgpu::Backends::PRIMARY, reserva].into_iter().filter(|b| !b.is_empty()) {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..Default::default() });
+            if !tem_adaptador(&instance, backends) {
+                continue;
+            }
             let Ok(surface) = instance.create_surface(w.clone()) else { continue };
             // A placa que liga a tela (a integrada, no notebook de duas): a dedicada desenhava e copiava
             // cada quadro para a outra, e no Windows isso deixava a janela lenta. O rasterizador em
@@ -1822,6 +1833,15 @@ mod tests {
         r.record();
         widget::draw(el, &n, r, &st, &tema, cursor, false);
         r.changes()
+    }
+
+    /// Instância sem backend (Metal fora da Apple, como o OpenGL recusado da pelicano#7): a rodada
+    /// é pulada, sem chegar ao `create_surface` que entra em pânico.
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn rodada_sem_backend_e_pulada() {
+        let b = wgpu::Backends::METAL;
+        assert!(!super::tem_adaptador(&wgpu::Instance::new(wgpu::InstanceDescriptor { backends: b, ..Default::default() }), b));
     }
 
     #[test]
