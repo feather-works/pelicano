@@ -110,7 +110,9 @@ pub struct Settings {
     /// como o llvmpipe), ou com `PELICANO_GPU=0`, desenha na CPU; `PELICANO_GPU=1` força a GPU.
     /// O quadro com algo que a GPU ainda não faz (camada, vidro, curva) sai na CPU sozinho.
     /// Sem aparelho gráfico nenhum, com o driver recusando Vulkan e OpenGL (Intel Ivy Bridge no
-    /// Linux), ou com `PELICANO_GPU=nenhuma`, a janela é mostrada sem wgpu.
+    /// Linux), ou com `PELICANO_GPU=nenhuma`, a janela é mostrada sem wgpu. O mesmo vale se o wgpu
+    /// acusar erro ou perder o aparelho com o app aberto: as janelas passam para a CPU em vez de
+    /// o app fechar (a transparente fica opaca), e uma linha no stderr diz o motivo.
     pub gpu: bool,
 }
 
@@ -748,13 +750,19 @@ impl<A: App> Runtime<A> {
                     continue;
                 }
             };
-            let tela = match &self.gpu {
-                Some(g) => g.tela(w.clone(), s.transparent).map(Saida::Gpu),
+            let pronta = self.gpu.as_ref().map(|g| g.conferir(sem_panico(|| g.tela(w.clone(), s.transparent))));
+            let tela = match pronta {
+                Some(Ok(t)) => t.map(Saida::Gpu),
+                // O aparelho falhou ao ligar mais uma janela: todas passam para a CPU, esta inclusive.
+                Some(Err(e)) => {
+                    self.largar_gpu(&e);
+                    Saida::cpu(&w)
+                }
                 None if self.sem_gpu => {
                     self.renderer.gpu.max_textura = gpu::SEM_LIMITE_TEXTURA;
                     Saida::cpu(&w)
                 }
-                None => match Gpu::new(w.clone(), s.transparent, s.gpu) {
+                None => match sem_panico(|| Gpu::new(w.clone(), s.transparent, s.gpu)).and_then(|r| r) {
                     Ok((g, t)) => {
                         self.renderer.gpu.max_textura = g.device.limits().max_texture_dimension_2d;
                         self.gpu = Some(g);
@@ -1124,14 +1132,18 @@ impl<A: App> Runtime<A> {
         // Quadro perdido (superfície velha no meio do resize): pede outro, senão a janela
         // fica com o conteúdo antigo até o próximo evento.
         let t4 = t0.elapsed();
+        // `Err`: o wgpu falhou neste quadro, e as janelas passam para a CPU no fim dele.
         let foi = match (&mut j.tela, self.gpu.as_mut()) {
-            _ if nada => true,
-            (Saida::Gpu(t), Some(g)) if na_gpu => t.present_gpu(g, &mut self.renderer.gpu),
-            (Saida::Gpu(t), Some(g)) => t.present(g, &self.renderer.pixmap, self.renderer.changed_rows()),
-            (Saida::Cpu(t), _) => mostrar_cpu(t, &self.renderer.pixmap),
-            (Saida::Gpu(_), None) => true,
+            _ if nada => Ok(true),
+            (Saida::Gpu(t), Some(g)) => {
+                let linhas = self.renderer.changed_rows();
+                let r = sem_panico(|| if na_gpu { t.present_gpu(g, &mut self.renderer.gpu) } else { t.present(g, &self.renderer.pixmap, linhas) });
+                g.conferir(r)
+            }
+            (Saida::Cpu(t), _) => Ok(mostrar_cpu(t, &self.renderer.pixmap)),
+            (Saida::Gpu(_), None) => Ok(true),
         };
-        if !foi {
+        if foi != Ok(true) {
             j.tudo = true;
             w.request_redraw();
         }
@@ -1160,6 +1172,32 @@ impl<A: App> Runtime<A> {
             }
         }
         self.renderer.trocar(&mut j.quadro);
+        if let Err(e) = foi {
+            self.largar_gpu(&e);
+        }
+    }
+
+    /// O wgpu acusou erro ou perdeu o aparelho com o app aberto (pelicano#8): em vez de fechar, as
+    /// janelas passam a mostrar pela CPU, como no `PELICANO_GPU=nenhuma`. A que era transparente
+    /// fica opaca.
+    fn largar_gpu(&mut self, motivo: &str) {
+        eprintln!("[pelicano] sem aparelho gráfico ({motivo}): mostrando a janela pela CPU");
+        self.sem_gpu = true;
+        self.renderer.gpu.max_textura = gpu::SEM_LIMITE_TEXTURA;
+        for j in &mut self.janelas {
+            if matches!(j.tela, Saida::Gpu(_)) {
+                // A superfície do wgpu é solta na troca; soltar o que já quebrou não pode derrubar o app.
+                match Saida::cpu(&j.w) {
+                    Ok(t) => drop(sem_panico(|| j.tela = t)),
+                    Err(e) => eprintln!("[pelicano] a janela {:?} não passou para a CPU: {e}", j.id),
+                }
+                j.transparente = false;
+                j.tudo = true;
+                j.w.request_redraw();
+            }
+        }
+        let gpu = self.gpu.take();
+        drop(sem_panico(|| drop(gpu)));
     }
 }
 
@@ -1548,6 +1586,43 @@ struct Gpu {
     layout: wgpu::BindGroupLayout,
     /// O desenho na GPU; `None` = na CPU ([`Settings::gpu`]).
     pintor: Option<gpu::Pintor>,
+    /// O que os tratadores de erro do wgpu anotaram ([`Gpu::conferir`]).
+    falha: Falha,
+}
+
+/// O primeiro erro que o wgpu acusou fora de uma chamada nossa (erro não capturado, aparelho
+/// perdido). Os tratadores só anotam; quem age é o laço, no fim do quadro.
+#[derive(Clone, Default)]
+struct Falha(Arc<std::sync::Mutex<Option<String>>>);
+
+impl Falha {
+    fn anotar(&self, motivo: &str) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| uma_linha(motivo));
+    }
+
+    /// O resultado de uma chamada ao wgpu vira `Err` se algo foi anotado enquanto ela rodava.
+    fn conferir<T>(&self, r: Result<T, String>) -> Result<T, String> {
+        match self.0.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            Some(m) => Err(r.err().unwrap_or(m)),
+            None => r,
+        }
+    }
+}
+
+/// Roda uma chamada ao wgpu; o pânico dela vira `Err` com a mensagem. No wgpu 0.19 o
+/// `Surface::configure`, o `get_current_texture`, o `Queue::submit` e o `present` com o aparelho
+/// perdido entram em pânico direto, sem passar pelo tratador de erro (pelicano#8).
+/// shortcut: não segura nada no app compilado com `panic = "abort"`; para isso, só trocando o wgpu por um que devolva `Err`.
+fn sem_panico<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|p| match p.downcast::<String>() {
+        Ok(s) => uma_linha(&s),
+        Err(p) => p.downcast_ref::<&str>().map_or_else(|| "pânico no wgpu".to_string(), |s| uma_linha(s)),
+    })
+}
+
+/// As mensagens do wgpu vêm em várias linhas ("Caused by:"); o aviso no stderr é de uma só.
+fn uma_linha(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Por onde o quadro chega à janela.
@@ -1658,6 +1733,17 @@ impl Gpu {
         }
         let limites = limites.filter(|_| pintar).unwrap_or_else(|| wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()));
         let (device, queue) = futures::executor::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: limites }, None)).map_err(|e| e.to_string())?;
+        // O padrão do wgpu 0.19 para erro não capturado é entrar em pânico: aqui ele só é anotado.
+        let falha = Falha::default();
+        let f = falha.clone();
+        device.on_uncaptured_error(Box::new(move |e| f.anotar(&e.to_string())));
+        let f = falha.clone();
+        // `Dropped` e `ReplacedCallback` são o aparelho sendo solto por nós, não uma perda.
+        device.set_device_lost_callback(move |razao, msg| {
+            if matches!(razao, wgpu::DeviceLostReason::Unknown | wgpu::DeviceLostReason::Destroyed) {
+                f.anotar(&format!("aparelho perdido: {msg}"));
+            }
+        });
         let caps = surface.get_capabilities(&adapter);
         // A GPU mistura em espaço linear (como o Iced) e precisa de um formato "Srgb" que codifique
         // na escrita; sem ele, pinta a CPU. O quadro da CPU já vem em sRGB e passa por uma textura
@@ -1687,9 +1773,13 @@ impl Gpu {
             multiview: None,
         });
         let pintor = pintar.then(|| gpu::Pintor::new(&device, format));
-        let g = Gpu { instance, adapter, device, queue, format, pipeline, layout, pintor };
-        let t = g.configurar(surface, &w, transparente)?;
+        let g = Gpu { instance, adapter, device, queue, format, pipeline, layout, pintor, falha };
+        let t = g.conferir(g.configurar(surface, &w, transparente))?;
         Ok((g, t))
+    }
+
+    fn conferir<T>(&self, r: Result<T, String>) -> Result<T, String> {
+        self.falha.conferir(r)
     }
 
     /// A tela de mais uma janela, no mesmo aparelho.
@@ -1842,6 +1932,21 @@ mod tests {
     fn rodada_sem_backend_e_pulada() {
         let b = wgpu::Backends::METAL;
         assert!(!super::tem_adaptador(&wgpu::Instance::new(wgpu::InstanceDescriptor { backends: b, ..Default::default() }), b));
+    }
+
+    /// O que o tratador anotou, ou o pânico do wgpu, vira o `Err` que faz o laço largar o aparelho
+    /// e passar as janelas para a CPU (pelicano#8).
+    #[test]
+    fn falha_do_wgpu_vira_erro_em_vez_de_panico() {
+        let f = super::Falha::default();
+        assert_eq!(f.conferir(Ok(true)), Ok(true));
+        f.anotar("Validation Error\n\nCaused by:\n    primeiro\n");
+        f.anotar("segundo");
+        assert_eq!(f.conferir(Ok(true)), Err("Validation Error Caused by: primeiro".to_string()));
+        assert_eq!(f.conferir(Ok(true)), Ok(true), "a marca vale uma vez");
+        assert_eq!(super::sem_panico(|| -> bool { panic!("perdido {}", 1) }), Err("perdido 1".to_string()));
+        assert_eq!(super::sem_panico(|| -> bool { panic!("perdido") }), Err("perdido".to_string()));
+        assert_eq!(super::sem_panico(|| true), Ok(true));
     }
 
     #[test]

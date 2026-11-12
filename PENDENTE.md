@@ -53,6 +53,19 @@ Ordem: FeatherCode → FeatherDocs → FeatherPDF → FeatherSlide → FeatherSh
   Vulkan e com o contexto OpenGL recusado) é pulada antes do `create_surface`, que entrava em
   pânico; a janela abre pela CPU. Conferido só simulando a instância vazia; falta a confirmação
   de quem tem a placa, e publicar a versão para o FeatherSheet e o Launcher.
+- Feito (12/11, #8): erro do wgpu ou aparelho perdido com o app aberto não fecha mais o app: as
+  janelas passam para a CPU (softbuffer) e o stderr diz o motivo. O aparelho ganhou tratador de
+  erro não capturado e de aparelho perdido, mas no wgpu 0.19 o `Surface::configure`, o
+  `get_current_texture`, o `present` e o `Queue::submit` entram em pânico direto, sem passar pelo
+  tratador: essas chamadas rodam dentro de `catch_unwind` (`sem_panico`). Conferido só simulando
+  no Linux (Wayland e XWayland, Radeon): `device.destroy()`, erro de validação e `configure`
+  inválido, com uma e duas janelas. Falta:
+  - perda de verdade (suspensão, driver reiniciado) em qualquer máquina;
+  - Windows: a janela que já teve cadeia de troca do DX12 pode não aceitar o desenho do
+    softbuffer (GDI) depois da troca; conferir lá;
+  - app compilado com `panic = "abort"` continua fechando (só um wgpu que devolva `Err` resolve);
+  - a mensagem de pânico do wgpu ainda sai no stderr antes da linha do pelicano;
+  - não volta para a placa sozinho quando ela retorna: fica na CPU até reabrir o app.
 
 ## Desempenho
 
