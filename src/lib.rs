@@ -40,6 +40,7 @@ pub use render::vetor::{FillRule, LineCap, LineJoin, Path, PathBuilder, Segment,
 pub use render::{load_font, set_default_family, Changes, Font, Image, Renderer, Svg};
 #[doc(hidden)]
 pub use render::gpu::GpuOffscreen;
+pub use render::gpu::pilha::{Stack, StackAtlas, StackLines, StackPart};
 pub use controls::*;
 pub use editor::{is_invisible, text_editor, Content, TextEditor, Warning};
 pub use pickers::*;

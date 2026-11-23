@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 #[path = "faixas.rs"]
 mod faixas;
+#[path = "pilha.rs"]
+pub(crate) mod pilha;
 pub(crate) use faixas::contagem as contagem_faixas;
 
 /// Lado do atlas de glifos (RGBA: a máscara vai como branco pré-multiplicado, o emoji com as cores).
@@ -45,6 +47,12 @@ pub(crate) enum Tipo {
     Quad,
     Glifo,
     Traco,
+    /// Objetos empilhados ([`pilha`]): cada instância abre as fatias no vertex shader.
+    Pilha,
+    /// Partes empilhadas com profundidade ([`pilha::funda`]): as seguidas vão numa passada à parte, com o buffer dela.
+    PilhaFunda,
+    /// As linhas por dentro da cena funda de antes (`StackLines`): lê a profundidade dela.
+    LinhasFundas,
     /// Desfoca o que já foi desenhado: o lote leva o índice em [`Lista::vidros`].
     Vidro,
 }
@@ -85,11 +93,16 @@ pub(crate) struct Lista {
     pub(crate) quads: Vec<f32>,
     pub(crate) glifos: Vec<f32>,
     pub(crate) tracos: Vec<f32>,
+    pub(crate) pilhas: Vec<f32>,
+    pub(crate) fundas: Vec<f32>,
+    pub(crate) linhas: Vec<f32>,
     /// Na ordem do desenho: o tipo, a textura (glifos e imagens) e quantas instâncias.
     pub(crate) lotes: Vec<(Tipo, u64, u32)>,
     /// As imagens usadas no quadro, uma vez cada, pelo número que o lote leva: o [`Pintor`] sobe
     /// as que ainda não tem.
     pub(crate) usadas: Vec<(u64, Arc<Pixmap>)>,
+    /// As usadas que são versões de outras ([`Image::changed_from`]), pelo número.
+    pub(crate) versoes: Vec<(u64, crate::render::Versoes)>,
     pub(crate) vidros: Vec<Vidro>,
     vistas: HashSet<u64>,
     pub(crate) atlas: Atlas,
@@ -104,12 +117,25 @@ impl Lista {
         self.quads.clear();
         self.glifos.clear();
         self.tracos.clear();
+        self.pilhas.clear();
+        self.fundas.clear();
+        self.linhas.clear();
         self.lotes.clear();
         self.usadas.clear();
+        self.versoes.clear();
         self.vidros.clear();
         self.vistas.clear();
         self.tamanho = (w, h);
         self.fundo = fundo;
+    }
+
+    /// Anota de que imagens `img` é versão, uma vez por quadro.
+    pub(crate) fn versao(&mut self, img: &crate::Image) {
+        if let Some(v) = &img.3 {
+            if !self.versoes.iter().any(|x| x.0 == img.1) {
+                self.versoes.push((img.1, v.clone()));
+            }
+        }
     }
 
     pub(crate) fn tamanho(&self) -> (u32, u32) {
@@ -134,12 +160,23 @@ impl Lista {
             Tipo::Quad => &mut self.quads,
             Tipo::Glifo => &mut self.glifos,
             Tipo::Traco => &mut self.tracos,
+            Tipo::Pilha => &mut self.pilhas,
+            Tipo::PilhaFunda => &mut self.fundas,
+            Tipo::LinhasFundas => &mut self.linhas,
             Tipo::Vidro => unreachable!("o vidro entra por Lista::vidro"),
         }
         .extend_from_slice(dados);
     }
 
-    /// Um retângulo texturizado (`tipo`: 0 máscara do atlas, 1 glifo colorido, 2 imagem suavizada, 4 imagem nítida).
+    /// As linhas por dentro da cena funda que acabou de ser anotada.
+    pub(crate) fn linhas_fundas(&mut self, dados: &[f32]) {
+        if self.lotes.last().is_some_and(|l| l.0 == Tipo::PilhaFunda) {
+            self.por(Tipo::LinhasFundas, 0, dados);
+        }
+    }
+
+    /// Um retângulo texturizado (`tipo`: 0 máscara do atlas, 1 glifo colorido, 2 imagem suavizada, 4 imagem nítida,
+    /// 5 e 6 imagem transformada nítida e suavizada).
     #[allow(clippy::too_many_arguments)]
     /// `uv`: onde no atlas e o índice do bitmap do glifo.
     fn textura(&mut self, textura: u64, dst: [f32; 4], uv: [f32; 3], cor: [f32; 4], raios: [f32; 4], tipo: f32, rec: &[f32; 12]) {
@@ -167,6 +204,22 @@ const _: fn() = || {
     fn ok<T: Send + Sync>() {}
     ok::<Lista>();
 };
+
+#[cfg(test)]
+mod testes {
+    use crate::{Color, Image, Point, Rect, Renderer, Size, Transform};
+
+    /// Os pedaços da mesma imagem (as fatias de um objeto empilhado) vão num lote só: uma chamada de desenho.
+    #[test]
+    fn pedacos_num_lote_so() {
+        let img = Image::from_rgba(16, 8, vec![200; 16 * 8 * 4]).expect("tamanho confere");
+        let pecas: Vec<(Rect, Transform)> = (0..2).map(|i| (Rect { x: i as f32 * 8.0, y: 0.0, width: 8.0, height: 8.0 }, Transform::rotate_around(30.0, Point::new(4.0, 4.0)).then(Transform::translate(10.0 + i as f32 * 20.0, 10.0)))).collect();
+        let mut r = Renderer::new();
+        r.capture_bands(Size::new(64.0, 40.0), 1.0, Color::BLACK, |r| r.draw_image_pieces_nearest(&img, &pecas)).expect("na lista");
+        assert_eq!(r.gpu.lotes.len(), 1);
+        assert_eq!(r.gpu.glifos.len(), 2 * super::GLIFO);
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Glifo {
@@ -298,8 +351,13 @@ pub(crate) fn srgb(v: f32) -> f32 {
 }
 
 impl Renderer {
+    /// O recorte de agora, cortado no quadro: o que cai fora dele (um mapa com zoom maior que a janela) nem vira
+    /// instância.
     fn recorte_gpu(&self) -> [f32; 12] {
-        self.clips.last().map_or(SEM_RECORTE, |c| c.gpu)
+        let mut r = self.clips.last().map_or(SEM_RECORTE, |c| c.gpu);
+        let (w, h) = self.gpu.tamanho;
+        (r[0], r[1], r[2], r[3]) = (r[0].max(0.0), r[1].max(0.0), r[2].min(w as f32), r[3].min(h as f32));
+        r
     }
 
     /// O `fill_quad` na GPU: a sombra é uma instância à parte, embaixo.
@@ -383,6 +441,52 @@ impl Renderer {
         self.gpu.textura(id, dst, [0.0; 3], [1.0, 1.0, 1.0, op], [0.0; 4], 4.0, &rec);
     }
 
+    /// Imagem levada pela transformação `t` (de texels para pixels): um quadrilátero qualquer. A instância
+    /// leva a caixa dele na tela e a volta (pixel para texel): `raios` = sx, ky, kx, sy; `uv` = tx, ty.
+    pub(super) fn imagem_gpu_transformada(&mut self, id: u64, pm: &Arc<Pixmap>, t: tiny_skia::Transform, nitida: bool) {
+        let Some(volta) = t.invert() else { return };
+        let Some(b) = tiny_skia::Rect::from_xywh(0.0, 0.0, pm.width() as f32, pm.height() as f32).and_then(|c| c.transform(t)) else { return };
+        let dst = [b.left().floor() - 1.0, b.top().floor() - 1.0, b.width().ceil() + 3.0, b.height().ceil() + 3.0];
+        let rec = self.recorte_gpu();
+        if !cruza(dst, &rec) {
+            return;
+        }
+        if self.gpu.vistas.insert(id) {
+            self.gpu.usadas.push((id, pm.clone()));
+        }
+        let op = self.opacidade;
+        let inv = [volta.sx, volta.ky, volta.kx, volta.sy];
+        self.gpu.textura(id, dst, [volta.tx, volta.ty, 0.0], [1.0, 1.0, 1.0, op], inv, if nitida { 5.0 } else { 6.0 }, &rec);
+    }
+
+    /// A imagem vai para a GPU com o quadro (uma vez, por mais que seja desenhada).
+    pub(super) fn imagem_gpu_usada(&mut self, id: u64, pm: &Arc<Pixmap>) {
+        if self.gpu.vistas.insert(id) {
+            self.gpu.usadas.push((id, pm.clone()));
+        }
+    }
+
+    /// Só o retângulo `sub` (x0, y0, x1, y1 em texels) da imagem, levado por `t` (texels da imagem
+    /// inteira para pixels), nítido: o tipo 5 com o recorte em `uv.zw` e `params.yz`. Quem chama já pôs a
+    /// imagem em `usadas` (uma vez para todas as peças).
+    pub(super) fn imagem_gpu_peca(&mut self, id: u64, t: tiny_skia::Transform, sub: [f32; 4]) {
+        let Some(volta) = t.invert() else { return };
+        let Some(b) = tiny_skia::Rect::from_ltrb(sub[0], sub[1], sub[2], sub[3]).and_then(|c| c.transform(t)) else { return };
+        let dst = [b.left().floor() - 1.0, b.top().floor() - 1.0, b.width().ceil() + 3.0, b.height().ceil() + 3.0];
+        let rec = self.recorte_gpu();
+        if !cruza(dst, &rec) {
+            return;
+        }
+        let mut d = [0.0; GLIFO];
+        d[..4].copy_from_slice(&dst);
+        d[4..8].copy_from_slice(&[volta.tx, volta.ty, sub[0], sub[1]]);
+        d[8..12].copy_from_slice(&[1.0, 1.0, 1.0, self.opacidade]);
+        d[12..16].copy_from_slice(&[volta.sx, volta.ky, volta.kx, volta.sy]);
+        d[16..19].copy_from_slice(&[5.0, sub[2], sub[3]]);
+        d[20..].copy_from_slice(&rec);
+        self.gpu.por(Tipo::Glifo, id, &d);
+    }
+
     /// Cada reta uma cápsula (pontas redondas: as junções saem da sobreposição). Lógicos.
     pub(super) fn traco_gpu(&mut self, retas: impl Iterator<Item = (Point, Point)>, largura: f32, cor: Color) {
         let (s, rec) = (self.scale, self.recorte_gpu());
@@ -457,8 +561,9 @@ impl Renderer {
 /// segura imagens e caminhos enormes são os limites de área de cada desenho.
 pub(crate) const SEM_LIMITE_TEXTURA: u32 = 16384;
 
-/// Quanto as texturas das imagens podem ocupar na GPU antes de soltar as que não estão na tela.
-const TEXTURAS_MAX: usize = 256 << 20;
+/// Quanto as texturas das imagens podem ocupar na GPU antes de soltar as que não estão na tela. Um jogo
+/// com quadros de 17 MB, chão de 50 MB e uma centena de atlas de objetos empilhados passa de 300 MB.
+const TEXTURAS_MAX: usize = 512 << 20;
 
 /// Os pipelines e o que fica na GPU de um quadro para o outro (atlas, texturas das imagens).
 /// Um só para todas as janelas, como o `Renderer`.
@@ -466,21 +571,33 @@ pub(crate) struct Pintor {
     quad: wgpu::RenderPipeline,
     glifo: wgpu::RenderPipeline,
     traco: wgpu::RenderPipeline,
+    pilha: wgpu::RenderPipeline,
+    pilha_funda: wgpu::RenderPipeline,
+    linhas: wgpu::RenderPipeline,
+    camada_fundo: wgpu::BindGroupLayout,
+    /// O buffer de profundidade das passadas fundas, o grupo dele para as linhas e o tamanho (feito no primeiro quadro
+    /// que tem uma).
+    fundo: Option<(wgpu::TextureView, wgpu::BindGroup, (u32, u32))>,
     globais: wgpu::Buffer,
     grupo: wgpu::BindGroup,
     camada_textura: wgpu::BindGroupLayout,
     amostrador: wgpu::Sampler,
     atlas: wgpu::Texture,
     grupo_atlas: wgpu::BindGroup,
-    buffers: [Option<wgpu::Buffer>; 3],
+    buffers: [Option<wgpu::Buffer>; 6],
     /// Pelo número da imagem (ou da rasterização do SVG): a textura, o último quadro em que apareceu
     /// e os bytes dela.
-    texturas: HashMap<u64, (wgpu::BindGroup, u64, usize)>,
+    /// a textura de cada imagem: o grupo, o último quadro em que foi usada, os bytes e a imagem (que,
+    /// liberada, solta a textura)
+    texturas: HashMap<u64, (wgpu::BindGroup, u64, usize, std::sync::Weak<Pixmap>, wgpu::Texture)>,
     quadro: u64,
     borrar: wgpu::RenderPipeline,
     formato: wgpu::TextureFormat,
     /// Instâncias dos passes do vidro: os parâmetros de cada passe e a volta (um glifo do tipo 3).
     buffers_vidro: [Option<wgpu::Buffer>; 2],
+    /// De onde os pedaços das imagens em versões ([`Image::changed_from`]) sobem: um buffer só por quadro, em vez de
+    /// uma cópia (e um buffer de passagem) por retângulo.
+    pedacos: Option<wgpu::Buffer>,
     /// Cópia da área (tamanho cheio) e as duas reduzidas que os passes alternam, com o tamanho de cada.
     copias: Option<Copias>,
 }
@@ -493,7 +610,7 @@ const BORRAR: usize = 8;
 impl Pintor {
     /// `format`: o do alvo, um "Srgb" (a mistura é em espaço linear).
     pub(crate) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let modulo = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("pelicano"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
+        let modulo = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("pelicano"), source: wgpu::ShaderSource::Wgsl(format!("{SHADER}{}{}", pilha::SHADER, pilha::funda::SHADER).into()) });
         let camada_globais = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None }],
@@ -501,7 +618,7 @@ impl Pintor {
         let camada_textura = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
             ],
         });
@@ -528,11 +645,14 @@ impl Pintor {
         let quad = pipeline(&so_globais, "vs_quad", "fs_quad", (QUAD / 4) as u32);
         let glifo = pipeline(&com_textura, "vs_glifo", "fs_glifo", (GLIFO / 4) as u32);
         let traco = pipeline(&so_globais, "vs_traco", "fs_traco", (TRACO / 4) as u32);
+        let pilha = pilha::pipeline(device, &modulo, &com_textura, format);
+        let pilha_funda = pilha::funda::pipeline_funda(device, &modulo, &com_textura, format);
+        let (linhas, camada_fundo) = pilha::funda::pipeline_linhas(device, &camada_globais, format);
         let borrar = pipeline_em(format.remove_srgb_suffix(), &com_textura, "vs_borrar", "fs_borrar", (BORRAR / 4) as u32);
         let amostrador = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
         let atlas = textura(device, ATLAS, ATLAS);
         let grupo_atlas = grupo_textura(device, &camada_textura, &atlas, &amostrador);
-        Pintor { quad, glifo, traco, globais, grupo, camada_textura, amostrador, atlas, grupo_atlas, buffers: [None, None, None], texturas: HashMap::new(), quadro: 0, borrar, formato: format, buffers_vidro: [None, None], copias: None }
+        Pintor { quad, glifo, traco, pilha, pilha_funda, linhas, camada_fundo, fundo: None, globais, grupo, camada_textura, amostrador, atlas, grupo_atlas, buffers: [None, None, None, None, None, None], texturas: HashMap::new(), quadro: 0, borrar, formato: format, buffers_vidro: [None, None], copias: None, pedacos: None }
     }
 
     /// Pinta a lista em `alvo` (limpo com o fundo) e envia. `alvo` tem o tamanho da lista; o vidro
@@ -555,28 +675,61 @@ impl Pintor {
                 wgpu::Extent3d { width: g.w, height: g.h, depth_or_array_layers: 1 },
             );
         }
+        let mut pedacos: Vec<(u64, Arc<Pixmap>, [u32; 4])> = vec![];
         for (id, pm) in l.usadas.drain(..) {
             let quadro = self.quadro;
-            let e = self.texturas.entry(id).or_insert_with(|| {
-                let t = textura(device, pm.width(), pm.height());
-                queue.write_texture(
-                    wgpu::ImageCopyTexture { texture: &t, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                    pm.data(),
-                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4 * pm.width()), rows_per_image: Some(pm.height()) },
-                    wgpu::Extent3d { width: pm.width(), height: pm.height(), depth_or_array_layers: 1 },
-                );
-                (grupo_textura(device, &self.camada_textura, &t, &self.amostrador), quadro, pm.data().len())
-            });
-            e.1 = quadro;
+            if !self.texturas.contains_key(&id) {
+                let (w, h) = (pm.width(), pm.height());
+                // Uma versão de outra: a textura da mais nova que ainda está aqui (e não é desenhada neste quadro)
+                // passa a ser desta, e só o que mudou desde ela sobe.
+                let versoes = l.versoes.iter().find(|v| v.0 == id).map(|v| &*v.1).unwrap_or(&[]);
+                let achou = versoes.iter().position(|v| self.texturas.get(&v.0).is_some_and(|e| e.1 != quadro && e.4.width() == w && e.4.height() == h));
+                let e = match achou {
+                    Some(k) => {
+                        let e = self.texturas.remove(&versoes[k].0).expect("achada acima");
+                        for r in versoes[..=k].iter().flat_map(|v| v.1.iter()) {
+                            let [x, y] = [r[0].min(w), r[1].min(h)];
+                            let [rw, rh] = [r[2].min(w - x), r[3].min(h - y)];
+                            if rw > 0 && rh > 0 {
+                                pedacos.push((id, pm.clone(), [x, y, rw, rh]));
+                            }
+                        }
+                        e
+                    }
+                    None => {
+                        let t = textura(device, w, h);
+                        subir(queue, &t, &pm);
+                        (grupo_textura(device, &self.camada_textura, &t, &self.amostrador), quadro, pm.data().len(), Arc::downgrade(&pm), t)
+                    }
+                };
+                self.texturas.insert(id, (e.0, quadro, e.2, Arc::downgrade(&pm), e.4));
+            }
+            if let Some(e) = self.texturas.get_mut(&id) {
+                e.1 = quadro;
+            }
         }
-        // Imagem que sumiu da tela por um segundo (ou foi liberada) solta a textura.
-        // Passando de TEXTURAS_MAX (uma imagem nova por quadro: zoom de PDF, resize), só as deste quadro.
+        // Imagem que sumiu da tela por um segundo ou foi liberada (o quadro de um jogo, novo a cada
+        // vez) solta a textura. Passando de
+        // TEXTURAS_MAX (uma imagem nova por quadro: zoom de PDF, resize), solta as usadas há mais tempo
+        // até caber: soltar todas as que não são deste quadro fazia subir de novo, a cada quadro, as
+        // que se revezam na tela (as poses de um bicho).
         let q = self.quadro;
-        let manter = if self.texturas.values().map(|e| e.2).sum::<usize>() > TEXTURAS_MAX { 0 } else { 60 };
-        self.texturas.retain(|_, e| e.1 + manter >= q);
+        self.texturas.retain(|_, e| e.1 == q || (e.1 + 60 >= q && e.3.strong_count() > 0));
+        let mut total: usize = self.texturas.values().map(|e| e.2).sum();
+        if total > TEXTURAS_MAX {
+            let mut velhas: Vec<(u64, u64, usize)> = self.texturas.iter().filter(|e| e.1 .1 < q).map(|(id, e)| (e.1, *id, e.2)).collect();
+            velhas.sort_unstable();
+            for (_, id, n) in velhas {
+                if total <= TEXTURAS_MAX {
+                    break;
+                }
+                self.texturas.remove(&id);
+                total -= n;
+            }
+        }
         let (w, h) = l.tamanho;
         queue.write_buffer(&self.globais, 0, bytes(&[w as f32, h as f32, 0.0, 0.0]));
-        for (i, v) in [&l.quads, &l.glifos, &l.tracos].into_iter().enumerate() {
+        for (i, v) in [&l.quads, &l.glifos, &l.tracos, &l.pilhas, &l.fundas, &l.linhas].into_iter().enumerate() {
             let b = bytes(v);
             if b.is_empty() {
                 continue;
@@ -595,15 +748,25 @@ impl Pintor {
             self.preparar_vidros(device, queue, l);
         }
         let mut enc = device.create_command_encoder(&Default::default());
-        let mut inicio = [0u32; 3];
+        self.subir_pedacos(device, queue, &mut enc, &pedacos);
+        let mut inicio = [0u32; 6];
+        // As fundas seguidas vão numa passada só delas, com o buffer de profundidade (as outras passadas não o veem).
+        if l.lotes.iter().any(|x| x.0 == Tipo::PilhaFunda) && self.fundo.as_ref().is_none_or(|f| f.2 != (w, h)) {
+            let t = device.create_texture(&wgpu::TextureDescriptor { label: Some("fundo"), size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: pilha::funda::FORMATO_FUNDO, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
+            let vista = t.create_view(&Default::default());
+            let grupo = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("fundo"), layout: &self.camada_fundo, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&vista) }] });
+            self.fundo = Some((vista, grupo, (w, h)));
+        }
         let mut de = 0;
         loop {
-            let ate = l.lotes[de..].iter().position(|x| x.0 == Tipo::Vidro).map_or(l.lotes.len(), |p| de + p);
+            let funda = l.lotes.get(de).is_some_and(|x| x.0 == Tipo::PilhaFunda);
+            let ate = l.lotes[de..].iter().position(|x| matches!(x.0, Tipo::Vidro | Tipo::LinhasFundas) || (x.0 == Tipo::PilhaFunda) != funda).map_or(l.lotes.len(), |p| de + p);
             let load = if de == 0 { wgpu::LoadOp::Clear(limpo) } else { wgpu::LoadOp::Load };
+            let fundo = self.fundo.as_ref().filter(|_| funda).map(|f| wgpu::RenderPassDepthStencilAttachment { view: &f.0, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None });
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: alvo, resolve_target: None, ops: wgpu::Operations { load, store: wgpu::StoreOp::Store } })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: fundo,
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
@@ -616,28 +779,97 @@ impl Pintor {
                         Tipo::Quad => &self.quad,
                         Tipo::Glifo => &self.glifo,
                         Tipo::Traco => &self.traco,
-                        Tipo::Vidro => unreachable!("o vidro separa os passes"),
+                        Tipo::Pilha => &self.pilha,
+                        Tipo::PilhaFunda => &self.pilha_funda,
+                        Tipo::Vidro | Tipo::LinhasFundas => unreachable!("o vidro e as linhas separam os passes"),
                     });
                     pass.set_vertex_buffer(0, self.buffers[i].as_ref().expect("tem instâncias").slice(..));
                 }
-                if tipo == Tipo::Glifo && atual != Some((tipo, tex)) {
+                if matches!(tipo, Tipo::Glifo | Tipo::Pilha | Tipo::PilhaFunda) && atual != Some((tipo, tex)) {
                     let g = if tex == DO_ATLAS { &self.grupo_atlas } else { &self.texturas[&tex].0 };
                     pass.set_bind_group(1, g, &[]);
                 }
                 atual = Some((tipo, tex));
-                pass.draw(0..4, inicio[i]..inicio[i] + n);
+                let vertices = match tipo {
+                    Tipo::Pilha => pilha::vertices(&l.pilhas[inicio[i] as usize * pilha::PILHA..(inicio[i] + n) as usize * pilha::PILHA]),
+                    Tipo::PilhaFunda => pilha::funda::vertices_fundas(&l.fundas[inicio[i] as usize * pilha::funda::FUNDA..(inicio[i] + n) as usize * pilha::funda::FUNDA]),
+                    _ => 4,
+                };
+                pass.draw(0..vertices, inicio[i]..inicio[i] + n);
                 inicio[i] += n;
             }
             drop(pass);
             if ate == l.lotes.len() {
                 break;
             }
-            if vidro {
-                self.desfocar(&mut enc, alvo, alvo_tex, l, l.lotes[ate].1 as usize);
+            if l.lotes[ate].0 == Tipo::Vidro {
+                if vidro {
+                    self.desfocar(&mut enc, alvo, alvo_tex, l, l.lotes[ate].1 as usize);
+                }
+                de = ate + 1;
+            } else if l.lotes[ate].0 == Tipo::LinhasFundas {
+                // uma passada só para as linhas: lê a profundidade que a cena funda deixou
+                let i = Tipo::LinhasFundas as usize;
+                if let (Some(f), Some(b)) = (&self.fundo, &self.buffers[i]) {
+                    let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("linhas fundas"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: alvo, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.linhas);
+                    pass.set_bind_group(0, &self.grupo, &[]);
+                    pass.set_bind_group(1, &f.1, &[]);
+                    pass.set_vertex_buffer(0, b.slice(..));
+                    pass.draw(0..3, inicio[i]..inicio[i] + 1);
+                }
+                inicio[i] += 1;
+                de = ate + 1;
+            } else {
+                de = ate;
             }
-            de = ate + 1;
+            if de == l.lotes.len() {
+                break;
+            }
         }
         queue.submit([enc.finish()]);
+    }
+
+    /// Os `pedacos` (o número da imagem, ela e o retângulo dela) todos num buffer só, linha a linha no alinhamento que a
+    /// cópia pede, e de lá cada um para a sua textura.
+    fn subir_pedacos(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, pedacos: &[(u64, Arc<Pixmap>, [u32; 4])]) {
+        let linha = |w: u32| (4 * w).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) as u64;
+        let total: u64 = pedacos.iter().map(|p| linha(p.2[2]) * p.2[3] as u64).sum();
+        let Some(tamanho) = std::num::NonZeroU64::new(total) else { return };
+        if self.pedacos.as_ref().is_none_or(|b| b.size() < total) {
+            let size = total.next_power_of_two().max(1 << 20);
+            self.pedacos = Some(device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }));
+        }
+        let buf = self.pedacos.as_ref().expect("criado acima");
+        {
+            let Some(mut destino) = queue.write_buffer_with(buf, 0, tamanho) else { return };
+            let mut de = 0usize;
+            for (_, pm, [x, y, w, h]) in pedacos {
+                let (pw, passo, n) = (pm.width() as usize, linha(*w) as usize, 4 * *w as usize);
+                for k in 0..*h as usize {
+                    let i = ((*y as usize + k) * pw + *x as usize) * 4;
+                    destino[de + k * passo..][..n].copy_from_slice(&pm.data()[i..i + n]);
+                }
+                de += passo * *h as usize;
+            }
+        }
+        let mut de = 0u64;
+        for (id, _, [x, y, w, h]) in pedacos {
+            let offset = de;
+            de += linha(*w) * *h as u64;
+            let Some(t) = self.texturas.get(id).map(|e| &e.4) else { continue };
+            enc.copy_buffer_to_texture(
+                wgpu::ImageCopyBuffer { buffer: buf, layout: wgpu::ImageDataLayout { offset, bytes_per_row: Some(linha(*w) as u32), rows_per_image: Some(*h) } },
+                wgpu::ImageCopyTexture { texture: t, mip_level: 0, origin: wgpu::Origin3d { x: *x, y: *y, z: 0 }, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
+            );
+        }
     }
 
     /// As texturas do tamanho do maior vidro e as instâncias de todos os passes do quadro.
@@ -767,6 +999,16 @@ fn textura(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     })
+}
+
+/// A imagem `pm` inteira para a textura `t`, do mesmo tamanho.
+fn subir(queue: &wgpu::Queue, t: &wgpu::Texture, pm: &Pixmap) {
+    queue.write_texture(
+        wgpu::ImageCopyTexture { texture: t, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        pm.data(),
+        wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4 * pm.width()), rows_per_image: Some(pm.height()) },
+        wgpu::Extent3d { width: pm.width(), height: pm.height(), depth_or_array_layers: 1 },
+    );
 }
 
 fn grupo_textura(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, t: &wgpu::Texture, a: &wgpu::Sampler) -> wgpu::BindGroup {
@@ -1068,6 +1310,25 @@ struct GlifoOut {
         let p = clamp(floor((c - q.dst.xy) / q.dst.zw * tam), vec2<f32>(0.0), tam - vec2<f32>(1.0));
         let t = textureLoad(tex, vec2<i32>(p), 0);
         saida = linear_pre(t) * q.cor.a * cobertura(q.dst, q.raios, c);
+    } else if q.params.x >= 5.0 {
+        // Imagem transformada: o meio do pixel volta para a imagem pela inversa; a borda suavizada pela
+        // distância (em pixels) até cada lado, como a cobertura da CPU. Um pedaço (`draw_image_pieces_nearest`)
+        // traz o retângulo dele, de `uv.zw` a `params.yz`; sem pedaço `params.y` é zero e vale a imagem toda.
+        let tam = vec2<f32>(textureDimensions(tex));
+        let lo = q.uv.zw;
+        let hi = select(tam, q.params.yz, q.params.y > 0.0);
+        let p = vec2<f32>(q.raios.x * c.x + q.raios.z * c.y + q.uv.x, q.raios.y * c.x + q.raios.w * c.y + q.uv.y);
+        let k = vec2<f32>(length(q.raios.xz), length(q.raios.yw));
+        let d = min(p - lo, hi - p) / max(k, vec2<f32>(1e-6));
+        let cob = clamp(d.x + 0.5, 0.0, 1.0) * clamp(d.y + 0.5, 0.0, 1.0);
+        if cob <= 0.0 { discard; }
+        var t: vec4<f32>;
+        if q.params.x == 5.0 {
+            t = textureLoad(tex, vec2<i32>(clamp(floor(p), lo, hi - vec2<f32>(1.0))), 0);
+        } else {
+            t = textureSampleLevel(tex, amostra, p / tam, 0.0);
+        }
+        saida = linear_pre(t) * q.cor.a * cob;
     } else {
         // Glifo: pixel a pixel do atlas.
         let t = textureLoad(tex, vec2<i32>(q.uv.xy + floor(c - q.dst.xy)), 0);

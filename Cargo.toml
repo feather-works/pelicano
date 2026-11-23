@@ -72,3 +72,7 @@ path = "examples/caderno/main.rs"
 [target.'cfg(windows)'.dependencies]
 # Quantas linhas a roda do mouse rola por clique (a configuração do Windows).
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }
+
+# O motor de objetos empilhados (sprite stacking) que usa o pelicano.
+[workspace]
+members = ["pilha"]

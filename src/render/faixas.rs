@@ -1,6 +1,6 @@
 //! A [`Lista`] pintada na CPU: o mesmo que o `SHADER` faz, pixel a pixel, dividida em faixas de
 //! linhas, uma thread cada. Serve quando não há GPU (ou ela não pinta) e o quadro cabe na lista.
-use super::{Lista, Tipo, DO_ATLAS, GLIFO, QUAD, TRACO};
+use super::{pilha, Lista, Tipo, DO_ATLAS, GLIFO, QUAD, TRACO};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use tiny_skia::Pixmap;
@@ -171,8 +171,13 @@ impl Faixa<'_> {
     }
 
     fn lista(&mut self, l: &Lista, texturas: &HashMap<u64, &Pixmap>) {
-        let (mut q, mut g, mut t) = (0, 0, 0);
+        let (mut q, mut g, mut t, mut p, mut f, mut li) = (0, 0, 0, 0, 0, 0);
+        // a profundidade das fundas seguidas (cada sequência começa vazia, como a passada da GPU)
+        let mut fundo: Option<Vec<f32>> = None;
         for &(tipo, tex, n) in &l.lotes {
+            if !matches!(tipo, Tipo::PilhaFunda | Tipo::LinhasFundas) {
+                fundo = None;
+            }
             for _ in 0..n {
                 match tipo {
                     Tipo::Quad => {
@@ -186,6 +191,42 @@ impl Faixa<'_> {
                     Tipo::Traco => {
                         self.traco(&l.tracos[t * TRACO..(t + 1) * TRACO]);
                         t += 1;
+                    }
+                    Tipo::Pilha => {
+                        if let Some(pm) = texturas.get(&tex) {
+                            let d = &l.pilhas[p * pilha::PILHA..(p + 1) * pilha::PILHA];
+                            let area = [self.x0, self.y0, self.x1, self.y1];
+                            pilha::pintar(d, pm, area, |x, y, cor| {
+                                let corte = recorte([x as f32 + 0.5, y as f32 + 0.5], &d[32..44]);
+                                self.misturar(x, y, mul(linear_pre([cor[0], cor[1], cor[2], 1.0]), cor[3] * corte));
+                            });
+                        }
+                        p += 1;
+                    }
+                    Tipo::PilhaFunda => {
+                        if let Some(pm) = texturas.get(&tex) {
+                            let d = &l.fundas[f * pilha::funda::FUNDA..(f + 1) * pilha::funda::FUNDA];
+                            let area = [self.x0, self.y0, self.x1, self.y1];
+                            let z = fundo.get_or_insert_with(|| vec![f32::MIN; ((self.x1 - self.x0) * (self.y1 - self.y0)) as usize]);
+                            pilha::funda::pintar_funda(d, pm, area, z, |x, y, cor| {
+                                let corte = recorte([x as f32 + 0.5, y as f32 + 0.5], &d[32..44]);
+                                self.misturar(x, y, mul(linear_pre([cor[0], cor[1], cor[2], 1.0]), cor[3] * corte));
+                            });
+                        }
+                        f += 1;
+                    }
+                    Tipo::LinhasFundas => {
+                        let d = &l.linhas[li * pilha::funda::LINHAS..(li + 1) * pilha::funda::LINHAS];
+                        if let Some(z) = &fundo {
+                            let (w, h) = ((self.x1 - self.x0) as usize, (self.y1 - self.y0) as usize);
+                            let cor = [d[0], d[1], d[2], d[3]];
+                            let mut pontos = Vec::new();
+                            pilha::funda::linhas_cpu(z, w, h, d[4], d[5] as u32, |x, y| pontos.push((x, y)));
+                            for (x, y) in pontos {
+                                self.misturar(self.x0 + x as u32, self.y0 + y as u32, cor);
+                            }
+                        }
+                        li += 1;
                     }
                     // A lista com vidro não vem para as faixas (`App::redraw`, `capture_bands`).
                     Tipo::Vidro => {}
@@ -433,7 +474,10 @@ impl Faixa<'_> {
                 if corte == 0.0 {
                     continue;
                 }
-                let saida = if tipo == 2.0 || nitida {
+                let saida = if tipo >= 5.0 {
+                    let Some(pm) = pm else { return };
+                    mul(linear_pre(transformada(pm, raios, uv, [q[17], q[18]], c, tipo == 5.0)), cor[3])
+                } else if tipo == 2.0 || nitida {
                     let Some(pm) = pm else { return };
                     let (u, v) = ((c[0] - dst[0]) / dst[2], (c[1] - dst[1]) / dst[3]);
                     let t = if nitida { nitido(pm, u, v) } else { bilinear(pm, u, v) };
@@ -658,6 +702,24 @@ fn texel(pm: &Pixmap, x: i64, y: i64) -> V4 {
 fn nitido(pm: &Pixmap, u: f32, v: f32) -> V4 {
     let (w, h) = (pm.width() as f32, pm.height() as f32);
     texel(pm, (u * w).floor().clamp(0.0, w - 1.0) as i64, (v * h).floor().clamp(0.0, h - 1.0) as i64)
+}
+
+/// A imagem transformada no pixel de meio `c` (o tipo 5/6 do `SHADER`): `inv` e `t` levam o pixel ao texel,
+/// e a distância até a borda, em pixels, dá a cobertura. Um pedaço da imagem vai de `t[2..4]` a `fim`
+/// (`fim[0]` zero: a imagem toda).
+fn transformada(pm: &Pixmap, inv: V4, t: V4, fim: [f32; 2], c: [f32; 2], nitida: bool) -> V4 {
+    let (w, h) = (pm.width() as f32, pm.height() as f32);
+    let (x0, y0) = (t[2], t[3]);
+    let (x1, y1) = if fim[0] > 0.0 { (fim[0], fim[1]) } else { (w, h) };
+    let (u, v) = (inv[0] * c[0] + inv[2] * c[1] + t[0], inv[1] * c[0] + inv[3] * c[1] + t[1]);
+    let (kx, ky) = (inv[0].hypot(inv[2]).max(1e-6), inv[1].hypot(inv[3]).max(1e-6));
+    let cob = (((u - x0).min(x1 - u) / kx + 0.5).clamp(0.0, 1.0)) * (((v - y0).min(y1 - v) / ky + 0.5).clamp(0.0, 1.0));
+    if cob <= 0.0 {
+        return [0.0; 4];
+    }
+    let (u, v) = (u.clamp(x0, x1 - 0.5), v.clamp(y0, y1 - 0.5));
+    let s = if nitida { nitido(pm, u / w, v / h) } else { bilinear(pm, u / w, v / h) };
+    mul(s, cob)
 }
 
 /// Bilinear com a borda repetida (o amostrador padrão), `u`/`v` de 0 a 1.
