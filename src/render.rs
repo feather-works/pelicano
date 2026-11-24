@@ -91,7 +91,14 @@ fn novo_id() -> u64 {
 
 /// Imagem já decodificada, compartilhada barato entre quadros.
 #[derive(Clone)]
-pub struct Image(Arc<Pixmap>, u64);
+pub struct Image(Arc<Pixmap>, u64, bool, Option<Versoes>);
+
+/// De que imagens esta é uma versão ([`Image::changed_from`]): da mais nova para a mais velha, o número de cada uma e
+/// os retângulos (x, y, largura, altura em pixels) que mudaram dela para a seguinte.
+pub(crate) type Versoes = Arc<[(u64, Arc<[[u32; 4]]>)]>;
+
+/// Quantas versões para trás a GPU procura uma textura para reaproveitar.
+const VERSOES: usize = 4;
 
 impl Image {
     /// Pixels RGBA8 sem pré-multiplicar, linha a linha. `None` se o tamanho não bate.
@@ -99,19 +106,69 @@ impl Image {
         if rgba.len() as u64 != width as u64 * height as u64 * 4 {
             return None;
         }
-        for p in rgba.chunks_exact_mut(4) {
-            let a = p[3] as u16;
-            for c in &mut p[..3] {
-                *c = ((*c as u16 * a + 127) / 255) as u8;
-            }
+        // Toda opaca (o quadro inteiro de um jogo): pré-multiplicar não muda nada, e o desenho
+        // já fica sabendo que é opaca sem varrer os pixels de novo.
+        // Grande (o quadro de um jogo, 17 MB), em 4 pedaços ao mesmo tempo: a varredura é só ler a memória.
+        let partes = if rgba.len() >= 1 << 22 { std::thread::available_parallelism().map_or(1, |n| n.get()).min(4) } else { 1 };
+        let por = rgba.len().div_ceil(partes * 256).max(1) * 256;
+        let opaca = if partes == 1 {
+            toda_opaca(&rgba)
+        } else {
+            std::thread::scope(|e| {
+                let feitos: Vec<_> = rgba.chunks(por).map(|p| e.spawn(move || toda_opaca(p))).collect();
+                feitos.into_iter().map(|f| f.join().unwrap_or(false)).fold(true, |a, b| a & b)
+            })
+        };
+        if !opaca && partes == 1 {
+            pre_multiplicar(&mut rgba);
+        } else if !opaca {
+            std::thread::scope(|e| {
+                for p in rgba.chunks_mut(por) {
+                    e.spawn(move || pre_multiplicar(p));
+                }
+            });
         }
-        Some(Image(Arc::new(Pixmap::from_vec(rgba, tiny_skia::IntSize::from_wh(width, height)?)?), novo_id()))
+        Some(Image(Arc::new(Pixmap::from_vec(rgba, tiny_skia::IntSize::from_wh(width, height)?)?), novo_id(), opaca, None))
+    }
+    /// Pixels RGBA8 já pré-multiplicados (cor ≤ alfa), linha a linha, guardados como vêm: sem a varredura de
+    /// [`Image::from_rgba`]. Para a camada que o app já pré-multiplica enquanto passa por ela; a imagem fica marcada
+    /// como não opaca. `None` se o tamanho não bate.
+    pub fn from_premultiplied_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Option<Self> {
+        if rgba.len() as u64 != width as u64 * height as u64 * 4 {
+            return None;
+        }
+        Some(Image(Arc::new(Pixmap::from_vec(rgba, tiny_skia::IntSize::from_wh(width, height)?)?), novo_id(), false, None))
     }
     pub fn from_png(bytes: &[u8]) -> Option<Self> {
-        Pixmap::decode_png(bytes).ok().map(|p| Image(Arc::new(p), novo_id()))
+        Pixmap::decode_png(bytes).ok().map(|p| {
+            let opaca = p.pixels().iter().all(|c| c.alpha() == 255);
+            Image(Arc::new(p), novo_id(), opaca, None)
+        })
+    }
+    /// Esta imagem é a `antes` com só os retângulos `changed` (x, y, largura, altura em pixels) diferentes: na GPU a
+    /// textura de `antes` (ou de uma das versões logo antes dela) passa a ser desta e só esses retângulos sobem, em
+    /// vez da imagem inteira numa textura nova. Para a camada de um jogo refeita a cada quadro em poucos lugares.
+    /// `antes` não deve ser desenhada depois desta (se for, sobe inteira de novo); de tamanho diferente, nada muda.
+    pub fn changed_from(mut self, antes: &Image, changed: &[[u32; 4]]) -> Image {
+        if antes.0.width() == self.0.width() && antes.0.height() == self.0.height() {
+            let velhas = antes.3.as_deref().unwrap_or(&[]).iter().take(VERSOES - 1).cloned();
+            self.3 = Some(std::iter::once((antes.1, Arc::from(changed))).chain(velhas).collect());
+        }
+        self
     }
     pub fn size(&self) -> Size {
         Size::new(self.0.width() as f32, self.0.height() as f32)
+    }
+    /// Os pixels de volta (RGBA8 pré-multiplicados), se ninguém mais segura esta imagem (nem a tela, nem a fila
+    /// da GPU); senão a própria imagem. Para quem faz uma imagem grande por quadro reaproveitar a memória em vez de
+    /// pedir outra ao sistema (cada página nova custa uma falta de página).
+    pub fn into_rgba(self) -> Result<Vec<u8>, Image> {
+        Arc::try_unwrap(self.0).map(Pixmap::take).map_err(|p| Image(p, self.1, self.2, self.3))
+    }
+    /// Os pixels RGBA8 pré-multiplicados, linha a linha (numa imagem opaca, os mesmos que vieram): para quem
+    /// ainda lê a imagem que mandou desenhar não precisar guardar outra cópia.
+    pub fn rgba(&self) -> &[u8] {
+        self.0.data()
     }
     /// Cor RGBA8 sem pré-multiplicar do pixel `(x, y)`; `None` fora da imagem.
     /// Para ler cores sem o app guardar uma segunda cópia dos pixels.
@@ -119,6 +176,93 @@ impl Image {
         let c = self.0.pixel(x, y)?.demultiply();
         Some([c.red(), c.green(), c.blue(), c.alpha()])
     }
+}
+
+/// Todos os alfas 255? Em blocos de 64 pixels, sem sair no meio do bloco: o compilador vetoriza o E dos alfas (o
+/// `all` ponto a ponto não vetorizava e custava ~3 ms num quadro de 2880×1536).
+fn toda_opaca(rgba: &[u8]) -> bool {
+    let blocos = rgba.chunks_exact(4 * 64);
+    let resto = blocos.remainder();
+    resto.chunks_exact(4).all(|p| p[3] == 255) && blocos.into_iter().all(|b| b.chunks_exact(4).fold(255u8, |m, p| m & p[3]) == 255)
+}
+
+/// Pré-multiplica no lugar. A camada de um jogo (o que mexe sobre o chão) é quase toda vazia ou cheia: só o meio faz
+/// a conta, e o bloco de 64 pixels todo zerado ou todo opaco passa direto (as duas contas vetorizam).
+fn pre_multiplicar(rgba: &mut [u8]) {
+    for b in rgba.chunks_mut(4 * 64) {
+        if b.iter().fold(0u8, |m, &c| m | c) == 0 || b.chunks_exact(4).fold(255u8, |m, p| m & p[3]) == 255 {
+            continue;
+        }
+        for p in b.chunks_exact_mut(4) {
+            match p[3] {
+                255 => {}
+                0 => p.copy_from_slice(&[0; 4]),
+                a => {
+                    for c in &mut p[..3] {
+                        *c = ((*c as u16 * a as u16 + 127) / 255) as u8;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn imagem_sabe_se_e_opaca() {
+    let opaca = Image::from_rgba(2, 1, vec![10, 20, 30, 255, 200, 100, 0, 255]).unwrap();
+    assert!(opaca.2);
+    assert_eq!(opaca.pixel(1, 0), Some([200, 100, 0, 255]));
+    let meio = Image::from_rgba(2, 1, vec![10, 20, 30, 255, 200, 100, 0, 128]).unwrap();
+    assert!(!meio.2);
+    // grande (passa pelos blocos de 64): um só pixel transparente no meio de um bloco ainda conta
+    let mut grande = vec![255u8; 300 * 4];
+    assert!(Image::from_rgba(300, 1, grande.clone()).unwrap().2);
+    grande[100 * 4 + 3] = 0;
+    assert!(!Image::from_rgba(300, 1, grande).unwrap().2);
+}
+
+#[test]
+fn camada_pre_multiplica_so_o_que_precisa() {
+    // um bloco vazio, um cheio e um com meio transparente e um vazio com cor (que zera)
+    let mut px = vec![0u8; 64 * 4];
+    px.extend((0..64).flat_map(|_| [9, 8, 7, 255]));
+    px.extend([200, 100, 50, 128, 1, 2, 3, 0]);
+    let i = Image::from_rgba(px.len() as u32 / 4, 1, px).unwrap();
+    assert_eq!(i.0.data()[..4], [0; 4]);
+    assert_eq!(i.0.data()[64 * 4..64 * 4 + 4], [9, 8, 7, 255]);
+    assert_eq!(i.0.data()[128 * 4..], [100, 50, 25, 128, 0, 0, 0, 0]);
+}
+
+#[test]
+fn ja_pre_multiplicada_fica_como_veio() {
+    let px = vec![100, 50, 25, 128, 9, 8, 7, 255, 0, 0, 0, 0];
+    let i = Image::from_premultiplied_rgba(3, 1, px.clone()).unwrap();
+    assert!(!i.2);
+    assert_eq!(i.rgba(), &px[..]);
+    assert_eq!(i.pixel(1, 0), Some([9, 8, 7, 255]));
+    assert!(Image::from_premultiplied_rgba(2, 1, px).is_none(), "o tamanho não bate");
+}
+
+#[test]
+fn into_rgba_so_sem_outra_copia() {
+    let i = Image::from_rgba(1, 1, vec![1, 2, 3, 255]).unwrap();
+    let outra = i.clone();
+    let i = i.into_rgba().expect_err("a outra cópia ainda segura");
+    drop(outra);
+    assert_eq!(i.into_rgba().ok(), Some(vec![1, 2, 3, 255]));
+}
+
+#[test]
+fn imagem_grande_confere_em_pedacos() {
+    // 2048×600 (4,9 MB, em pedaços): um só pixel meio transparente no último pedaço
+    let (w, h) = (2048u32, 600u32);
+    let mut px = vec![255u8; (w * h * 4) as usize];
+    assert!(Image::from_rgba(w, h, px.clone()).unwrap().2);
+    let n = px.len() - 4 * 10;
+    px[n..n + 4].copy_from_slice(&[200, 100, 50, 128]);
+    let i = Image::from_rgba(w, h, px).unwrap();
+    assert!(!i.2);
+    assert_eq!(i.0.data()[n..n + 4], [100, 50, 25, 128]);
 }
 
 #[test]
@@ -306,7 +450,6 @@ pub struct Renderer {
     ocultos_validos: bool,
     /// A parte opaca do próximo desenho, posta por quem desenha logo antes do `gravou`.
     opaco: Option<Rect>,
-    imagens_opacas: HashMap<u64, bool>,
     shadows: Cache<ShadowKey, Pixmap>,
     imagens: Cache<(u64, u32, u32), Pixmap>,
     clips: Vec<Clip>,
@@ -418,7 +561,6 @@ impl Renderer {
             ocultos: Default::default(),
             ocultos_validos: false,
             opaco: None,
-            imagens_opacas: HashMap::new(),
             shadows: Cache::default(),
             imagens: Cache::default(),
             clips: Vec::new(),
@@ -830,6 +972,12 @@ impl Renderer {
 
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// Se este quadro vai para a GPU (que mistura as cores em espaço linear) e não para o pixmap
+    /// (que mistura em sRGB, como o tiny-skia).
+    pub fn on_gpu(&self) -> bool {
+        self.pintando_gpu
     }
 
     fn buffer(&mut self, text: &str, size: f32, font: Font, max_width: Option<f32>, lh: f32) -> &Buffer {
@@ -1266,10 +1414,7 @@ impl Renderer {
         let mut k = Chave::new(3);
         k.h(img.1).r(r).h(radius.map(f32::to_bits));
         // Imagem nova a cada quadro (vídeo, página refeita no zoom) não acumula.
-        if self.imagens_opacas.len() > 4096 {
-            self.imagens_opacas.clear();
-        }
-        if radius.iter().all(|v| *v == 0.0) && *self.imagens_opacas.entry(img.1).or_insert_with(|| img.0.pixels().iter().all(|p| p.alpha() == 255)) {
+        if radius.iter().all(|v| *v == 0.0) && img.2 {
             self.opaco = Some(r);
         }
         if self.gravou(r, k) {
@@ -1278,6 +1423,7 @@ impl Renderer {
         if self.pintando_gpu {
             let s = self.scale;
             let (x, y, w, h) = ((r.x * s).round(), (r.y * s).round(), (r.width * s).round(), (r.height * s).round());
+            self.gpu.versao(img);
             return self.imagem_gpu(img.1, &img.0, [x, y, w, h], radius.map(|v| v * s));
         }
         let tela = r;
@@ -1308,17 +1454,14 @@ impl Renderer {
     }
 
     /// Imagem sem suavizar: cada pixel dela vira um bloco (página de PDF 1:1, pixel art, zoom).
-    /// Sem transformação vai para a GPU (que estica os blocos); girada ou maior que a textura, CPU.
+    /// Vai para a GPU (que estica os blocos), também girada; maior que a textura, CPU.
     pub fn draw_image_nearest(&mut self, img: &Image, r: Rect) {
         if !self.transformacoes.last().is_none_or(|t| t.is_identity()) || img.0.width().max(img.0.height()) > self.gpu.max_textura {
             return self.imagem_transformada(img, r, FilterQuality::Nearest);
         }
         let mut k = Chave::new(13);
         k.h(img.1).r(r);
-        if self.imagens_opacas.len() > 4096 {
-            self.imagens_opacas.clear();
-        }
-        if *self.imagens_opacas.entry(img.1).or_insert_with(|| img.0.pixels().iter().all(|p| p.alpha() == 255)) {
+        if img.2 {
             self.opaco = Some(r);
         }
         if self.gravou(r, k) {
@@ -1327,14 +1470,18 @@ impl Renderer {
         if self.pintando_gpu {
             let s = self.scale;
             let (x, y, w, h) = ((r.x * s).round(), (r.y * s).round(), (r.width * s).round(), (r.height * s).round());
+            self.gpu.versao(img);
             return self.imagem_gpu_nitida(img.1, &img.0, [x, y, w, h]);
         }
         self.imagem_transformada(img, r, FilterQuality::Nearest);
     }
 
     /// A imagem esticada em `r` pela transformação inteira (a do usuário, a escala, a camada).
+    /// Na GPU vai como um quadrilátero (os 4 cantos transformados), se couber numa textura.
     fn imagem_transformada(&mut self, img: &Image, r: Rect, filtro: FilterQuality) {
-        self.falta("imagem transformada ou sem suavizar");
+        if img.0.width().max(img.0.height()) > self.gpu.max_textura {
+            self.falta("imagem maior que a textura");
+        }
         let mut k = Chave::new(12);
         k.h(img.1).r(r).h(matches!(filtro, FilterQuality::Nearest));
         let t = self.transformacoes.last().copied().unwrap_or_default();
@@ -1352,11 +1499,71 @@ impl Renderer {
         let s = self.scale;
         let usuario = self.transformacoes.last().copied().unwrap_or_default().0;
         let t = Transform::from_row(r.width / iw, 0.0, 0.0, r.height / ih, r.x, r.y).post_concat(usuario).post_translate(-self.origem.x, -self.origem.y).post_scale(s, s);
+        if self.pintando_gpu {
+            self.gpu.versao(img);
+            return self.imagem_gpu_transformada(img.1, &img.0, t, matches!(filtro, FilterQuality::Nearest));
+        }
         let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
         let caixa = tiny_skia::Rect::from_xywh(0.0, 0.0, iw, ih).and_then(|c| c.transform(t));
         let mask = clip_mask(&mut self.clips, pw, ph, s, caixa);
         let pp = PixmapPaint { opacity: self.opacidade, quality: filtro, ..Default::default() };
         self.pixmap.draw_pixmap(0, 0, img.0.as_ref().as_ref(), &pp, t, mask);
+    }
+
+    /// Vários pedaços de `img` sem suavizar, cada um levado pela sua transformação (dos texels do
+    /// pedaço, 0 até a largura dele, para os pontos lógicos, antes da do `push_transform`): as fatias
+    /// de um objeto empilhado, os sprites de um atlas. É um desenho só (uma chave na comparação de
+    /// quadros) e, na GPU, um lote só enquanto a imagem não muda. `pecas`: (retângulo na imagem, em texels; transformação).
+    pub fn draw_image_pieces_nearest(&mut self, img: &Image, pecas: &[(Rect, crate::Transform)]) {
+        if pecas.is_empty() {
+            return;
+        }
+        if img.0.width().max(img.0.height()) > self.gpu.max_textura {
+            self.falta("imagem maior que a textura");
+        }
+        let usuario = self.transformacoes.last().copied().unwrap_or_default().0;
+        let mut k = Chave::new(14);
+        k.h(img.1);
+        // As peças entram na chave dobradas num número só (multiplica e gira, como o FxHash): o SipHash
+        // de cada float era um terço do quadro com milhares de fatias.
+        let mut dobra = 0u64;
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for (src, t) in pecas {
+            let t = t.0.post_concat(usuario);
+            for v in [src.x, src.y, src.width, src.height, t.sx, t.ky, t.kx, t.sy, t.tx, t.ty] {
+                dobra = (dobra.rotate_left(5) ^ v.to_bits() as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+            }
+            for (cx, cy) in [(0.0, 0.0), (src.width, 0.0), (0.0, src.height), (src.width, src.height)] {
+                let (x, y) = (t.sx * cx + t.kx * cy + t.tx, t.ky * cx + t.sy * cy + t.ty);
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+            }
+        }
+        k.h(dobra);
+        if self.gravando {
+            self.gravou(Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }, k);
+            return;
+        }
+        if self.oculto(k) {
+            return;
+        }
+        let s = self.scale;
+        let (pw, ph) = (self.pixmap.width(), self.pixmap.height());
+        if self.pintando_gpu {
+            self.gpu.versao(img);
+            self.imagem_gpu_usada(img.1, &img.0);
+        }
+        for (src, t) in pecas {
+            // dos texels da imagem inteira para os pixels do quadro
+            let t = Transform::from_translate(-src.x, -src.y).post_concat(t.0).post_concat(usuario).post_translate(-self.origem.x, -self.origem.y).post_scale(s, s);
+            if self.pintando_gpu {
+                self.imagem_gpu_peca(img.1, t, [src.x, src.y, src.x + src.width, src.y + src.height]);
+                continue;
+            }
+            let Some(r) = tiny_skia::Rect::from_xywh(src.x, src.y, src.width, src.height) else { continue };
+            let mask = clip_mask(&mut self.clips, pw, ph, s, r.transform(t));
+            let padrao = tiny_skia::Pattern::new(img.0.as_ref().as_ref(), SpreadMode::Pad, FilterQuality::Nearest, self.opacidade, Transform::identity());
+            self.pixmap.fill_rect(r, &Paint { shader: padrao, ..Default::default() }, t, mask);
+        }
     }
 
     /// SVG em `r`; com `color`, troca a cor de tudo mantendo o alfa (ícones de um traço só).

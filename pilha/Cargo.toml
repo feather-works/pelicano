@@ -1,0 +1,9 @@
+[package]
+name = "pilha"
+version = "0.1.0"
+description = "Motor de objetos empilhados (sprite stacking) sobre o pelicano: volume, modelo, instâncias e câmera"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+pelicano = { path = ".." }

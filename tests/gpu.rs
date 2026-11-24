@@ -109,6 +109,49 @@ fn imagem_nitida() {
     });
 }
 
+/// Imagem girada e escalada (o chão de um mapa que gira): vai para a GPU como um quadrilátero, nítida e suavizada.
+#[test]
+fn imagem_transformada() {
+    let px: Vec<u8> = (0..16 * 9).flat_map(|i| [(i * 37 % 256) as u8, (i * 91 % 256) as u8, (i * 13 % 256) as u8, 255]).collect();
+    let img = Image::from_rgba(16, 9, px).expect("tamanho confere");
+    comparar("imagem transformada", Size::new(160.0, 120.0), 1.5, 8, 0.02, |r| {
+        r.push_transform(Transform::from_row(1.2, 0.3, -0.5, 0.8, 0.0, 0.0).then(Transform::rotate_around(25.0, Point::new(60.0, 50.0))));
+        r.draw_image_nearest(&img, Rect { x: 20.0, y: 10.0, width: 64.0, height: 36.0 });
+        r.pop_transform();
+        r.push_transform(Transform::rotate_around(-40.0, Point::new(120.0, 80.0)));
+        r.draw_image(&img, Rect { x: 90.0, y: 60.0, width: 48.0, height: 27.0 }, [0.0; 4]);
+        r.pop_transform();
+    });
+}
+
+/// Pedaços de um atlas, cada um girado e achatado (as fatias de um objeto empilhado): só o pedaço
+/// aparece (sem vazar os vizinhos do atlas), igual nas três pinturas. O lote único: `gpu::testes`.
+#[test]
+fn pedacos_de_imagem() {
+    // 4 pedaços de 8×8 lado a lado, cada um de uma cor com um furo transparente no meio
+    let px: Vec<u8> = (0..32 * 8)
+        .flat_map(|i| {
+            let (x, y) = (i % 32, i / 32);
+            let furo = (3..5).contains(&(x % 8)) && (3..5).contains(&y);
+            let cor = [[220, 40, 40], [40, 200, 60], [50, 80, 230], [240, 200, 30]][x / 8];
+            if furo { [0; 4] } else { [cor[0], cor[1], cor[2], 255] }
+        })
+        .collect();
+    let img = Image::from_rgba(32, 8, px).expect("tamanho confere");
+    let pecas: Vec<(Rect, Transform)> = (0..4)
+        .map(|i| {
+            let src = Rect { x: i as f32 * 8.0, y: 0.0, width: 8.0, height: 8.0 };
+            let t = Transform::rotate_around(20.0 + i as f32 * 25.0, Point::new(4.0, 4.0)).then(Transform::scale(5.0, 3.0)).then(Transform::translate(20.0 + i as f32 * 30.0, 50.0 - i as f32 * 6.0));
+            (src, t)
+        })
+        .collect();
+    comparar("pedaços de imagem", Size::new(160.0, 120.0), 1.5, 8, 0.02, |r| {
+        r.push_transform(Transform::rotate_around(10.0, Point::new(80.0, 60.0)));
+        r.draw_image_pieces_nearest(&img, &pecas);
+        r.pop_transform();
+    });
+}
+
 #[test]
 fn linha_grossa() {
     comparar("linha", Size::new(200.0, 150.0), 1.0, 40, 0.01, |r| {
@@ -239,4 +282,148 @@ fn imagem_um_para_um_igual_ao_geral() {
         // Os cantos mudam com o raio de 0,001 que força o caminho geral: até 8 pixels.
         diferenca(&format!("imagem 1:1 em {x},{y}"), &geral, &rapido, 1, 8.0 / (120.0 * 90.0));
     }
+}
+
+/// Objetos empilhados (`draw_stacks`): uma bola com orelhas e uma caixa, girados, inclinados, com
+/// contorno, dentro de um recorte e de uma transformação; igual nas três pinturas.
+#[test]
+fn pilhas() {
+    let paleta = [[[58, 38, 42]; 3], [[250, 190, 120], [230, 150, 60], [170, 100, 40]], [[240, 240, 230], [210, 210, 200], [150, 150, 140]]];
+    let (lado, fatias) = (16, 24);
+    let bola = StackAtlas::new(lado, fatias, 0.5, 1, &paleta, |x, y, z| {
+        let (x, y, z) = (x as f32 + 0.5 - 8.0, y as f32 + 0.5 - 8.0, (z as f32 + 0.5) * 0.5 - 6.0);
+        let orelha = z > 3.0 && z < 6.0 && (x.abs() - 3.5).abs() < 6.0 - z && y.abs() < 1.5;
+        if x * x + y * y + z * z <= 36.0 || orelha {
+            (if y > 3.0 { 2 } else { 1 }, [x, y, z])
+        } else {
+            (0, [0.0; 3])
+        }
+    });
+    let caixa = StackAtlas::new(lado, fatias, 0.5, 1, &paleta, |x, y, z| ((x > 3 && x < 12 && y > 5 && y < 11 && z < 16) as u8 * 2, [0.0, 0.0, 1.0]));
+    let cena = |r: &mut Renderer| {
+        r.push_clip(Rect { x: 4.0, y: 4.0, width: 150.0, height: 110.0 }, [0.0; 4]);
+        r.push_transform(Transform::translate(3.0, 2.0));
+        for (i, giro) in [0.0f32, 1.3, 2.6, 4.2].into_iter().enumerate() {
+            let st = Stack { at: Point::new(25.0 + i as f32 * 35.0, 70.0), yaw: giro, pitch: 0.9, scale: 1.7, sway: (1.0, 0.0), lift: i as f32, outline_step: 4, light: [-0.51, 0.5, 0.7], tones: Stack::TONES, tint: Stack::NO_TINT, palette: 0 };
+            r.draw_stacks(&caixa, &[Stack { at: Point::new(st.at.x + 8.0, 40.0), outline_step: 0, ..st }]);
+            r.draw_stacks(&bola, &[st]);
+        }
+        r.pop_transform();
+        r.pop_clip();
+    };
+    comparar("pilhas", Size::new(160.0, 120.0), 1.5, 8, 0.02, cena);
+    // e desenhou mesmo: os tons de luz, base e sombra do laranja e o contorno aparecem
+    let px = Renderer::new().capture_bands(Size::new(160.0, 120.0), 1.5, FUNDO, cena).expect("na lista");
+    for cor in [[250, 190, 120], [230, 150, 60], [170, 100, 40], [58, 38, 42]] {
+        let n = px.chunks(4).filter(|p| p[..3] == cor).count();
+        assert!(n > 20, "{cor:?}: só {n} pixels");
+    }
+}
+
+/// A pilha com `palette` pinta com a outra paleta do mesmo atlas (contorno e material), na GPU igual à CPU.
+#[test]
+fn pilha_troca_de_paleta() {
+    let paleta = [[[58, 38, 42]; 3], [[250, 190, 120], [230, 150, 60], [170, 100, 40]], [[255, 255, 255]; 3], [[120, 190, 250], [60, 150, 230], [40, 100, 170]]];
+    let bola = StackAtlas::new(16, 24, 0.5, 1, &paleta, |x, y, z| {
+        let (x, y, z) = (x as f32 + 0.5 - 8.0, y as f32 + 0.5 - 8.0, (z as f32 + 0.5) * 0.5 - 6.0);
+        (if x * x + y * y + z * z <= 36.0 { 1 } else { 0 }, [x, y, z])
+    });
+    let cena = |r: &mut Renderer| {
+        for (i, palette) in [0, 2].into_iter().enumerate() {
+            let st = Stack { at: Point::new(40.0 + i as f32 * 60.0, 80.0), yaw: 0.7, pitch: 0.9, scale: 2.0, sway: (0.0, 0.0), lift: 0.0, outline_step: 4, light: [-0.51, 0.5, 0.7], tones: Stack::TONES, tint: Stack::NO_TINT, palette };
+            r.draw_stacks(&bola, &[st]);
+        }
+    };
+    comparar("pilha_paleta", Size::new(160.0, 120.0), 1.5, 8, 0.02, cena);
+    let px = Renderer::new().capture_bands(Size::new(160.0, 120.0), 1.5, FUNDO, cena).expect("na lista");
+    let conta = |cor: [u8; 3], x0: usize, x1: usize| px.chunks(4).enumerate().filter(|(i, p)| (x0..x1).contains(&(i % 240)) && p[..3] == cor).count();
+    // a da esquerda com a paleta 0, a da direita com a 2 (azul e contorno branco)
+    for (cor, x0, x1) in [([230, 150, 60], 0, 120), ([58, 38, 42], 0, 120), ([60, 150, 230], 120, 240), ([255, 255, 255], 120, 240)] {
+        assert!(conta(cor, x0, x1) > 20, "{cor:?} em {x0}..{x1}: só {}", conta(cor, x0, x1));
+    }
+    assert_eq!(conta([230, 150, 60], 120, 240), 0, "a da direita não usa a paleta 0");
+}
+
+/// Uma versão de outra imagem ([`Image::changed_from`]) sobe só o que mudou na mesma textura: sai igual à CPU, e o
+/// que mudou fora dos retângulos declarados fica como estava (prova que a textura foi reaproveitada). Pulando uma
+/// versão (não desenhada), os retângulos das duas sobem.
+#[test]
+fn imagem_em_versoes() {
+    fn desenhar(img: &Image) -> impl Fn(&mut Renderer) + '_ {
+        move |r| r.draw_image_nearest(img, Rect { x: 0.0, y: 0.0, width: 64.0, height: 48.0 })
+    }
+    let Some(mut g) = GpuOffscreen::new() else {
+        eprintln!("sem adaptador gráfico, pulando");
+        return;
+    };
+    let tam = Size::new(64.0, 48.0);
+    let (w, h) = (64u32, 48u32);
+    let cor = |px: &mut Vec<u8>, [x0, y0, x1, y1]: [u32; 4], c: [u8; 4]| {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = ((y * w + x) * 4) as usize;
+                px[i..i + 4].copy_from_slice(&c);
+            }
+        }
+    };
+    let mut px: Vec<u8> = (0..w * h).flat_map(|i| [(i % 64 * 4) as u8, (i / 64 * 5) as u8, 90, 255]).collect();
+    let mut r = Renderer::new();
+    let a = Image::from_rgba(w, h, px.clone()).unwrap();
+    let ga = g.capture(&mut r, tam, 1.0, FUNDO, desenhar(&a)).unwrap();
+    // b muda em dois lugares, mas só declara o primeiro
+    cor(&mut px, [4, 4, 20, 12], [255, 0, 0, 255]);
+    let so_declarado = px.clone();
+    cor(&mut px, [40, 30, 60, 40], [0, 255, 0, 255]);
+    let b = Image::from_rgba(w, h, px.clone()).unwrap().changed_from(&a, &[[4, 4, 16, 8]]);
+    let gb = g.capture(&mut r, tam, 1.0, FUNDO, desenhar(&b)).unwrap();
+    let esperado = Image::from_rgba(w, h, so_declarado).unwrap();
+    let ge = g.capture(&mut r, tam, 1.0, FUNDO, desenhar(&esperado)).unwrap();
+    assert_ne!(ga, gb, "o retângulo declarado subiu");
+    assert_eq!(gb, ge, "só o retângulo declarado subiu (a textura de a foi reaproveitada)");
+    // c vem de d, que vem de b e nunca foi desenhada: os retângulos de d e de c sobem na textura de b
+    cor(&mut px, [0, 40, 10, 48], [0, 0, 255, 255]);
+    let d = Image::from_rgba(w, h, px.clone()).unwrap().changed_from(&b, &[[40, 30, 20, 10]]);
+    cor(&mut px, [30, 0, 34, 4], [255, 255, 0, 255]);
+    let c = Image::from_rgba(w, h, px.clone()).unwrap().changed_from(&d, &[[0, 40, 10, 8], [30, 0, 4, 4]]);
+    let gc = g.capture(&mut r, tam, 1.0, FUNDO, desenhar(&c)).unwrap();
+    let faixas = r.capture_bands(tam, 1.0, FUNDO, desenhar(&c)).unwrap();
+    diferenca("imagem em versões", &faixas, &gc, 0, 0.0);
+    // em pedaços (os ladrilhos de um jogo) a versão também sobe só o que mudou
+    cor(&mut px, [50, 2, 60, 8], [255, 0, 255, 255]);
+    let f = Image::from_rgba(w, h, px.clone()).unwrap().changed_from(&c, &[[50, 2, 10, 6]]);
+    let pecas = |img: &Image| {
+        let img = img.clone();
+        move |r: &mut Renderer| r.draw_image_pieces_nearest(&img, &[(Rect { x: 0.0, y: 0.0, width: 64.0, height: 48.0 }, Transform::IDENTITY)])
+    };
+    let gf = g.capture(&mut r, tam, 1.0, FUNDO, pecas(&f)).unwrap();
+    let faixas = r.capture_bands(tam, 1.0, FUNDO, pecas(&f)).unwrap();
+    diferenca("imagem em versões, em pedaços", &faixas, &gf, 0, 0.0);
+}
+
+/// As partes com profundidade (`draw_stack_parts_lined`): um corpo e um braço girado na frente dele, com as linhas por
+/// dentro; o pipeline cria na placa e desenha igual à CPU.
+#[test]
+fn pilhas_fundas_com_linhas() {
+    let paleta = [[[58, 38, 42]; 3], [[250, 190, 120], [230, 150, 60], [170, 100, 40]], [[240, 240, 230], [210, 210, 200], [150, 150, 140]]];
+    let corpo = StackAtlas::new(16, 24, 0.5, 1, &paleta, |x, y, z| {
+        let (x, y, z) = (x as f32 + 0.5 - 8.0, y as f32 + 0.5 - 8.0, (z as f32 + 0.5) * 0.5 - 6.0);
+        ((x * x + y * y + z * z <= 36.0) as u8, [x, y, z])
+    });
+    let braco = StackAtlas::new(16, 24, 0.5, 1, &paleta, |x, y, z| ((x >= 10 && x < 13 && y >= 7 && y < 10 && z < 20) as u8 * 2, [0.0, 1.0, 0.3]));
+    let cena = |r: &mut Renderer| {
+        let partes: Vec<(&StackAtlas, StackPart)> = [0.0f32, 1.9]
+            .into_iter()
+            .enumerate()
+            .flat_map(|(i, giro)| {
+                let st = Stack { at: Point::new(45.0 + i as f32 * 70.0, 80.0), yaw: giro, pitch: 0.9, scale: 2.0, sway: (0.0, 0.0), lift: 0.0, outline_step: 4, light: [-0.51, 0.5, 0.7], tones: Stack::TONES, tint: Stack::NO_TINT, palette: 0 };
+                [(&corpo, StackPart::still(st)), (&braco, StackPart { stack: st, rot: StackPart::rot_x(1.1), pivot: [3.5, 0.0, 9.0], offset: [0.0, 2.0, 0.0] })]
+            })
+            .collect();
+        r.draw_stack_parts_lined(&partes, StackLines { color: [20, 10, 10], threshold: 2.0, width: 1.0 });
+    };
+    comparar("pilhas_fundas", Size::new(160.0, 120.0), 1.5, 8, 0.03, cena);
+    // e as linhas por dentro aparecem
+    let px = Renderer::new().capture_bands(Size::new(160.0, 120.0), 1.5, FUNDO, cena).expect("na lista");
+    let n = px.chunks(4).filter(|p| p[..3] == [20, 10, 10]).count();
+    assert!(n > 10, "só {n} pixels de linha");
 }
